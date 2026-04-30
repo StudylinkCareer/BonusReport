@@ -52,6 +52,7 @@ class CaseInput:
       - Office & slots: who gets paid
       - Dates: drives D1.R12 advance/carry-over logic
       - Prior payments: drives D1.R12 (what's already been paid this case)
+      - Addon items: drives addon_bonus (multi-school etc.)
     """
 
     # --- Identity (audit only) ---
@@ -99,6 +100,15 @@ class CaseInput:
     # Key: (slot_label, staff_id) — e.g. ("counsellor", 12)
     # Value: đồng already paid to that person on this case in prior months
     prior_payments_by_slot: dict[tuple[str, int], int] = field(default_factory=dict)
+
+    # --- Addon items (drives addon_bonus) ---
+    # List of (service_fee_id, count) tuples. Each entry points to a row in
+    # ref_service_fee with category='ADDON'. The engine multiplies the
+    # row's per-slot signing bonus by `count` to get the addon amount.
+    # Empty list = no addons on this case (the common case today).
+    # Using IDs (not codes) so service_codes can be renamed without
+    # touching CaseInput data — same pattern as package_service_fee_id.
+    addon_items: list[tuple[int, int]] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
