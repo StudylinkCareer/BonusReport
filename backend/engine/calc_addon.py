@@ -1,13 +1,25 @@
 """
 Add-on bonus calculation.
 
-Stacks ON TOP of tier_bonus + package_bonus when a case carries one or
-more "ADDON" service fees (e.g. multi-school enrolment, partner add-on
-referrals).
+Stacks ON TOP of tier_bonus, package_bonus, priority_bonus, etc. — all
+extra services sold on a case generate additive bonuses.
 
-Lookup table: ref_service_fee with category='ADDON'.
-  counsellor_signing_bonus / co_signing_bonus → unit rate per slot
-  case.addon_items                            → list of (id, count) tuples
+Lookup table: ref_service_fee. Accepts rows where category is in:
+  - 'ADDON'        — schema-formal add-on rows (currently no production
+                     data uses this category)
+  - 'SERVICE_FEE'  — admin tasks (visa renewal, guardian change, etc.).
+                     Most are CO-only with counsellor=0; the engine
+                     respects whatever amounts the row carries.
+  - 'CONTRACT'     — contract-style add-ons (e.g. GUARDIAN_AU_ADDON,
+                     REFERRAL_LOVELY_COFFEE, OUT_SYSTEM_FULL_AUS).
+
+Per policy:
+  - Bonuses are ADDITIVE: a case with a tier bonus + a package + two
+    service fees pays all of them. No "fire and exit" — every service
+    sold earns its own bonus.
+  - The 50/50 presales split applies to the counsellor's TOTAL bonus
+    (tier + package + priority + addon + flat_local), so addon naturally
+    flows through that split when presales is on the case.
 
 For each addon item:
   amount_for_slot = unit_rate_for_slot × count
@@ -17,14 +29,6 @@ Slot eligibility:
   case_officer  → eligible (sums co_signing_bonus × count)
   presales / vp → not eligible (always 0)
 
-Notes for future:
-  - The current 09_SERVICE_FEE_RATES has ZERO rows in category='ADDON'.
-    The schema CHECK constraint allows it, the VBA v6.2 introduced
-    handling for it, but no real ADDON rows have been seeded yet. This
-    calc is rails-only until that happens.
-  - Multi-school cases today are still handled via SERVICE_FEE rows
-    (EXTRA_SCHOOL) which fire at the tier_bonus level, not here.
-
 Per architecture.md §6.
 """
 
@@ -33,6 +37,11 @@ from __future__ import annotations
 from datetime import date
 
 from .models import CaseInput, ReferenceData, Slot
+
+
+# Categories accepted by this calc. Anything else in case.addon_items
+# is a data bug and surfaces as AddonNotAddonCategoryError.
+_ALLOWED_CATEGORIES = frozenset({'ADDON', 'SERVICE_FEE', 'CONTRACT'})
 
 
 # ---------------------------------------------------------------------------
@@ -45,9 +54,10 @@ class AddonServiceFeeNotFoundError(LookupError):
 
 class AddonNotAddonCategoryError(LookupError):
     """
-    An addon_items entry references a row where category != 'ADDON'.
-    Surfaces upstream data bugs (e.g. someone put a PACKAGE id in
-    addon_items by mistake).
+    An addon_items entry references a row whose category isn't in
+    {ADDON, SERVICE_FEE, CONTRACT}. Most likely a PACKAGE row was
+    misrouted here — packages should go via package_service_fee_id,
+    not addon_items.
     """
 
 
@@ -91,10 +101,11 @@ def calc_addon_bonus(
 
     Raises:
       AddonServiceFeeNotFoundError if an id doesn't resolve.
-      AddonNotAddonCategoryError if a row's category != 'ADDON'.
+      AddonNotAddonCategoryError if a row's category isn't in
+        {ADDON, SERVICE_FEE, CONTRACT}.
       AddonInactiveOrExpiredError if a row is inactive or out of range.
     """
-    # Empty list → 0 (the common case today).
+    # Empty list → 0.
     if not case.addon_items:
         return 0, {'applied': False, 'reason': 'no_addon_items'}
 
@@ -126,12 +137,14 @@ def calc_addon_bonus(
                 f"service_fee_id={service_fee_id} which is not in "
                 f"ref.service_fees."
             )
-        if row.get('category') != 'ADDON':
+
+        category = row.get('category')
+        if category not in _ALLOWED_CATEGORIES:
             raise AddonNotAddonCategoryError(
                 f"case_id={case.case_id} addon_items references "
                 f"service_fee_id={service_fee_id} but its category is "
-                f"{row.get('category')!r}, not 'ADDON'. Did the data "
-                f"layer mistakenly put a non-addon row in addon_items?"
+                f"{category!r}. Allowed: {sorted(_ALLOWED_CATEGORIES)}. "
+                f"PACKAGE rows should be routed via package_service_fee_id."
             )
         if not row.get('is_active', True):
             raise AddonInactiveOrExpiredError(
@@ -151,6 +164,7 @@ def calc_addon_bonus(
         items_audit.append({
             'service_fee_id': service_fee_id,
             'service_code': row.get('service_code'),
+            'category': category,
             'count': count,
             'unit_rate': unit_rate,
             'line_amount': line_amount,
