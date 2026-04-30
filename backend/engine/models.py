@@ -147,6 +147,7 @@ class ReferenceData:
     priority_targets: dict[int, dict] = field(default_factory=dict)
     service_fees: dict[int, dict] = field(default_factory=dict)
     rates: dict[int, dict] = field(default_factory=dict)
+    local_enrolment_bonuses: dict[int, dict] = field(default_factory=dict)
     status_splits: dict[str, dict] = field(default_factory=dict)
     sub_agents: dict[int, dict] = field(default_factory=dict)
 
