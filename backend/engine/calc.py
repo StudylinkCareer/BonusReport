@@ -15,6 +15,7 @@ Per architecture.md §6.
 
 from __future__ import annotations
 
+from .calc_tier import calc_tier_bonus
 from .models import (
     BonusPayment,
     CaseInput,
@@ -53,10 +54,15 @@ def _iter_filled_slots(case: CaseInput):
 # Per-column calc stubs — to be replaced module by module
 # ---------------------------------------------------------------------------
 
-def _tier_bonus(case: CaseInput, slot_label: str, slot: Slot, ref: ReferenceData) -> int:
-    """Rate-card base bonus. TODO: implement in engine/calc_tier.py."""
-    return 0
-
+def _tier_bonus(
+    case: CaseInput,
+    slot_label: str,
+    slot: Slot,
+    ctx: RunContext,
+    ref: ReferenceData,
+) -> tuple[int, dict]:
+    """Rate-card base bonus. Returns (amount, audit_dict)."""
+    return calc_tier_bonus(case, slot, slot_label, ctx, ref)
 
 def _package_bonus(case: CaseInput, slot_label: str, slot: Slot, ref: ReferenceData) -> int:
     """Premium package uplift. TODO: implement in engine/calc_package.py."""
@@ -130,7 +136,7 @@ def calculate_case(
     payments: list[BonusPayment] = []
 
     for slot_label, slot in _iter_filled_slots(case):
-        tier = _tier_bonus(case, slot_label, slot, ref)
+        tier, tier_audit = _tier_bonus(case, slot_label, slot, ctx, ref)
         package = _package_bonus(case, slot_label, slot, ref)
         addon = _addon_bonus(case, slot_label, slot, ref)
         priority = _priority_bonus(case, slot_label, slot, ref)
@@ -164,8 +170,8 @@ def calculate_case(
                 advance_offset=offset,
                 gross_bonus=gross,
                 net_payable=net,
-                calc_notes="STUB — column calcs not yet implemented",
-                audit_json={"stub": True},
+                calc_notes=f"tier={tier_audit['tier']} bucket={tier_audit['country_bucket']}; other columns stubbed",
+                audit_json={"tier": tier_audit, "stub_other": True},
             )
         )
 
