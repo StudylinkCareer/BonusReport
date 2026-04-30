@@ -8,7 +8,9 @@ rows — one per filled slot.
 Per-column calc functions live in their own modules:
   calc_tier.py        — tier_bonus (rate-card base)
   calc_flat_local.py  — flat_local_enrolment_bonus (VN-domestic etc.)
-  calc_*.py (TODO)    — package, addon, priority, presales
+  calc_priority.py    — priority_bonus (uplift on tier_bonus)
+  calc_package.py     — package_bonus (Superior/Premium/etc. signing bonus)
+  calc_*.py (TODO)    — addon, presales
 
 The orchestrator stays thin: pull values, sum them, build the
 BonusPayment record, attach audit. Real calc logic lives elsewhere.
@@ -19,6 +21,8 @@ Per architecture.md §6.
 from __future__ import annotations
 
 from .calc_flat_local import calc_flat_local_bonus, is_local_enrolment_case
+from .calc_package import calc_package_bonus
+from .calc_priority import calc_priority_bonus
 from .calc_tier import calc_tier_bonus
 from .models import (
     BonusPayment,
@@ -69,9 +73,14 @@ def _tier_bonus(
     return calc_tier_bonus(case, slot, slot_label, ctx, ref)
 
 
-def _package_bonus(case: CaseInput, slot_label: str, slot: Slot, ref: ReferenceData) -> int:
-    """Premium package uplift. TODO: implement in engine/calc_package.py."""
-    return 0
+def _package_bonus(
+    case: CaseInput,
+    slot_label: str,
+    slot: Slot,
+    ref: ReferenceData,
+) -> tuple[int, dict]:
+    """Package signing bonus (Superior/Premium/etc.). Returns (amount, audit)."""
+    return calc_package_bonus(case, slot, slot_label, ref)
 
 
 def _addon_bonus(case: CaseInput, slot_label: str, slot: Slot, ref: ReferenceData) -> int:
@@ -79,9 +88,21 @@ def _addon_bonus(case: CaseInput, slot_label: str, slot: Slot, ref: ReferenceDat
     return 0
 
 
-def _priority_bonus(case: CaseInput, slot_label: str, slot: Slot, ref: ReferenceData) -> int:
-    """Priority-partner uplift. TODO: implement in engine/calc_priority.py."""
-    return 0
+def _priority_bonus(
+    case: CaseInput,
+    slot_label: str,
+    slot: Slot,
+    tier_bonus: int,
+    ctx: RunContext,
+    ref: ReferenceData,
+) -> tuple[int, dict]:
+    """
+    Priority-partner uplift.
+
+    Multiplicative on tier_bonus, so we pass tier_bonus in as input
+    rather than recomputing here. Returns (amount, audit).
+    """
+    return calc_priority_bonus(case, slot, slot_label, tier_bonus, ctx, ref)
 
 
 def _presales_share_taken(
@@ -136,8 +157,8 @@ def calculate_case(
     Calculate bonus payments for one case.
 
     Returns one BonusPayment per filled slot. With remaining stubs in
-    place, package/addon/priority/presales return 0 — but tier and
-    flat_local are now real.
+    place, addon/presales return 0 — but tier, flat_local, priority,
+    and package are now real.
     """
     payments: list[BonusPayment] = []
 
@@ -157,9 +178,11 @@ def calculate_case(
         else:
             tier, tier_audit = _tier_bonus(case, slot_label, slot, ctx, ref)
 
-        package = _package_bonus(case, slot_label, slot, ref)
+        package, package_audit = _package_bonus(case, slot_label, slot, ref)
         addon = _addon_bonus(case, slot_label, slot, ref)
-        priority = _priority_bonus(case, slot_label, slot, ref)
+        priority, priority_audit = _priority_bonus(
+            case, slot_label, slot, tier, ctx, ref,
+        )
         flat_local, flat_local_audit = _flat_local_enrolment_bonus(
             case, slot_label, slot, ref,
         )
@@ -194,12 +217,16 @@ def calculate_case(
                 net_payable=net,
                 calc_notes=(
                     f"local_enrolment={is_local}; "
-                    f"tier_audit={tier_audit}; "
-                    f"flat_local_audit={flat_local_audit}; "
-                    "package/addon/priority/presales stubbed"
+                    f"tier={tier}; "
+                    f"package={package} ({package_audit.get('reason') or package_audit.get('service_code')}); "
+                    f"priority={priority} ({priority_audit.get('reason') or priority_audit.get('partner_name')}); "
+                    f"flat_local={flat_local}; "
+                    "addon/presales stubbed"
                 ),
                 audit_json={
                     "tier": tier_audit,
+                    "package": package_audit,
+                    "priority": priority_audit,
                     "flat_local": flat_local_audit,
                     "stub_other": True,
                 },

@@ -112,12 +112,19 @@ class RunContext:
 
     enrolments_by_staff_office: weighted enrolment counts for the month.
     Key is (staff_id, office_id) to handle staff who work across offices.
+
     targets_by_staff_office: monthly enrolment targets, same key shape.
+
+    enrolments_by_priority_partner_ytd: YTD enrolment counts per priority
+    partner for the run year. Key is priority_partner_id. Drives the
+    achievement factor in priority_bonus calc (1.0 if YTD ≥ annual
+    target, else 0.5).
     """
     year: int
     month: int
-    enrolments_by_staff_office: dict[tuple[int, int], int]   # weighted count
+    enrolments_by_staff_office: dict[tuple[int, int], int]
     targets_by_staff_office: dict[tuple[int, int], int]
+    enrolments_by_priority_partner_ytd: dict[int, int] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
