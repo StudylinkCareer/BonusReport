@@ -22,7 +22,6 @@ share/python-wheels/
 *.egg
 MANIFEST
 DocumentReview/
-backend/tests/
 backend/docs/DocumentReview/
 
 # Virtual environments
