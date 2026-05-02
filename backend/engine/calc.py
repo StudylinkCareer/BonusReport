@@ -12,12 +12,19 @@ Per-column calc functions live in their own modules:
   calc_package.py     — package_bonus (Superior/Premium/etc. signing bonus)
   calc_addon.py       — addon_bonus (multi-school, etc.)
   calc_presales.py    — presales_share_taken (50/50 split with counsellor)
+  payment_timing.py   — status splits, deferral, clawback (Phase 6c)
 
-Two-pass calculation:
+Three-pass calculation:
   Pass 1: per-slot bonuses (everything except presales share).
   Pass 2: presales split — needs counsellor total from Pass 1.
+  Pass 3: payment timing — splits, withholds, deferrals, clawback.
 
 Per architecture.md §6.
+
+CHANGES IN THIS REVISION (Phase 6c):
+  - Added Pass 3: apply_payment_timing for each constructed BonusPayment.
+  - BonusPayment construction now initializes timing fields to 0 / False;
+    Pass 3 fills them in.
 """
 
 from __future__ import annotations
@@ -37,6 +44,7 @@ from .models import (
     RunContext,
     Slot,
 )
+from .payment_timing import apply_payment_timing
 
 
 # ---------------------------------------------------------------------------
@@ -119,11 +127,6 @@ def _advance_offset(case: CaseInput, slot_label: str, slot: Slot) -> int:
     return case.prior_payments_by_slot.get((slot_label, slot.staff_id), 0)
 
 
-def _net_payable(gross: int, advance_offset: int) -> int:
-    """Floor at zero — never claw back via a negative payment."""
-    return max(0, gross - advance_offset)
-
-
 # ---------------------------------------------------------------------------
 # Orchestrator
 # ---------------------------------------------------------------------------
@@ -136,10 +139,9 @@ def calculate_case(
     """
     Calculate bonus payments for one case.
 
-    Returns one BonusPayment per filled slot. All six columns are now
-    real: tier, package, addon, priority, flat_local, presales_share.
+    Returns one BonusPayment per filled slot, with all six gross columns
+    plus payment-timing fields (withheld, unlocked, clawback, etc.) populated.
     """
-    # Local-enrolment classification is per-case, so compute once here.
     is_local = is_local_enrolment_case(case, ref)
 
     # ----- PASS 1: per-slot bonuses (everything except presales share) -----
@@ -173,7 +175,7 @@ def calculate_case(
             flat_local_audit=flat_local_audit,
         ))
 
-    # ----- PASS 2: find the counsellor's total bonus, then apply presales -----
+    # ----- PASS 2: counsellor total → presales split -----
     counsellor_total_bonus = 0
     for r in pass1:
         if r.slot_label == 'counsellor':
@@ -182,7 +184,7 @@ def calculate_case(
             )
             break
 
-    # ----- Build the final BonusPayments -----
+    # ----- Build pre-timing BonusPayments, then apply Pass 3 -----
     payments: list[BonusPayment] = []
     for r in pass1:
         presales_share, presales_audit = calc_presales_share(
@@ -192,44 +194,53 @@ def calculate_case(
         gross_pre_share = r.tier + r.package + r.addon + r.priority + r.flat_local
         gross = gross_pre_share - presales_share
         offset = _advance_offset(case, r.slot_label, r.slot)
-        net = _net_payable(gross, offset)
 
         assert r.slot.staff_id is not None  # filtered by _iter_filled_slots
 
-        payments.append(
-            BonusPayment(
-                case_id=case.case_id,
-                staff_id=r.slot.staff_id,
-                staff_name=r.slot.staff_name or "",
-                role_id=r.slot.role_id or 0,
-                slot_label=r.slot_label,
-                tier_bonus=r.tier,
-                package_bonus=r.package,
-                addon_bonus=r.addon,
-                priority_bonus=r.priority,
-                presales_share_taken=presales_share,
-                flat_local_enrolment_bonus=r.flat_local,
-                advance_offset=offset,
-                gross_bonus=gross,
-                net_payable=net,
-                calc_notes=(
-                    f"local_enrolment={is_local}; "
-                    f"tier={r.tier}; "
-                    f"package={r.package} ({r.package_audit.get('reason') or r.package_audit.get('service_code')}); "
-                    f"addon={r.addon} ({r.addon_audit.get('reason') or 'sum of items'}); "
-                    f"priority={r.priority} ({r.priority_audit.get('reason') or r.priority_audit.get('partner_name')}); "
-                    f"flat_local={r.flat_local}; "
-                    f"presales_share={presales_share} ({presales_audit.get('reason') or presales_audit.get('sign_meaning')})"
-                ),
-                audit_json={
-                    "tier": r.tier_audit,
-                    "package": r.package_audit,
-                    "addon": r.addon_audit,
-                    "priority": r.priority_audit,
-                    "flat_local": r.flat_local_audit,
-                    "presales": presales_audit,
-                },
-            )
+        # Pre-timing BonusPayment: gross calculated, timing fields zeroed.
+        # Pass 3 (apply_payment_timing) fills in the timing fields and
+        # computes net_payable with all timing rules applied.
+        pre_timing = BonusPayment(
+            case_id=case.case_id,
+            staff_id=r.slot.staff_id,
+            staff_name=r.slot.staff_name or "",
+            role_id=r.slot.role_id or 0,
+            slot_label=r.slot_label,
+            tier_bonus=r.tier,
+            package_bonus=r.package,
+            addon_bonus=r.addon,
+            priority_bonus=r.priority,
+            presales_share_taken=presales_share,
+            flat_local_enrolment_bonus=r.flat_local,
+            advance_offset=offset,
+            gross_bonus=gross,
+            # Timing fields — Pass 3 fills these in.
+            withheld_amount=0,
+            unlocked_amount=0,
+            clawback_applied=0,
+            bank_transfer_required=False,
+            net_payable=0,  # Pass 3 computes this
+            calc_notes=(
+                f"local_enrolment={is_local}; "
+                f"tier={r.tier}; "
+                f"package={r.package} ({r.package_audit.get('reason') or r.package_audit.get('service_code')}); "
+                f"addon={r.addon} ({r.addon_audit.get('reason') or 'sum of items'}); "
+                f"priority={r.priority} ({r.priority_audit.get('reason') or r.priority_audit.get('partner_name')}); "
+                f"flat_local={r.flat_local}; "
+                f"presales_share={presales_share} ({presales_audit.get('reason') or presales_audit.get('sign_meaning')})"
+            ),
+            audit_json={
+                "tier": r.tier_audit,
+                "package": r.package_audit,
+                "addon": r.addon_audit,
+                "priority": r.priority_audit,
+                "flat_local": r.flat_local_audit,
+                "presales": presales_audit,
+            },
         )
+
+        # ----- PASS 3: apply payment timing -----
+        final = apply_payment_timing(case, pre_timing, ctx, ref)
+        payments.append(final)
 
     return payments

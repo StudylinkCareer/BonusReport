@@ -6,6 +6,12 @@ during calculation. Money is stored as int (đồng, no decimals).
 Percentages are stored as Decimal for precision.
 
 Per architecture.md §6.3.
+
+CHANGES IN THIS REVISION (Phase 6c — payment timing):
+  - RunContext: added clawback_balances_by_staff and prior_withholdings_by_case_staff
+  - ReferenceData: added departure_rules, complaint_deductions, contract_target_tiers
+  - BonusPayment: added withheld_amount, unlocked_amount, clawback_applied,
+                  bank_transfer_required
 """
 
 from __future__ import annotations
@@ -96,18 +102,19 @@ class CaseInput:
     course_status: str | None
     file_closed_date: date | None
 
+    # --- Carry-over rate locking (Phase 6c) ---
+    # When ref_status_split.is_carry_over=Y, calc_tier uses this locked rate
+    # instead of doing a fresh lookup. Per Q3.4 (policy review):
+    # "carry-over rate locks at original calculation period." The data layer
+    # populates this when copying forward a case from a prior month's run.
+    prior_month_rate: int | None = None
+
     # --- Prior payments (D1.R12) ---
     # Key: (slot_label, staff_id) — e.g. ("counsellor", 12)
     # Value: đồng already paid to that person on this case in prior months
     prior_payments_by_slot: dict[tuple[str, int], int] = field(default_factory=dict)
 
     # --- Addon items (drives addon_bonus) ---
-    # List of (service_fee_id, count) tuples. Each entry points to a row in
-    # ref_service_fee with category='ADDON'. The engine multiplies the
-    # row's per-slot signing bonus by `count` to get the addon amount.
-    # Empty list = no addons on this case (the common case today).
-    # Using IDs (not codes) so service_codes can be renamed without
-    # touching CaseInput data — same pattern as package_service_fee_id.
     addon_items: list[tuple[int, int]] = field(default_factory=list)
 
 
@@ -126,15 +133,28 @@ class RunContext:
     targets_by_staff_office: monthly enrolment targets, same key shape.
 
     enrolments_by_priority_partner_ytd: YTD enrolment counts per priority
-    partner for the run year. Key is priority_partner_id. Drives the
-    achievement factor in priority_bonus calc (1.0 if YTD ≥ annual
-    target, else 0.5).
+    partner for the run year. Key is priority_partner_id.
+
+    NEW (Phase 6c — payment timing):
+      clawback_balances_by_staff: §I.5.3 running clawback owed by each staff
+        coming into this run. Key is staff_id, value is đồng owed (>= 0).
+        Engine reads, applies to current-month payable, writes new balance
+        to tx_clawback_balance.
+
+      prior_withholdings_by_case_staff: amounts withheld in prior runs that
+        should release this month under is_carry_over rules. Key is
+        (case_id, staff_id), value is đồng. Loaded by data layer from
+        tx_bonus_payment.withheld_amount in earlier runs.
     """
     year: int
     month: int
     enrolments_by_staff_office: dict[tuple[int, int], int]
     targets_by_staff_office: dict[tuple[int, int], int]
     enrolments_by_priority_partner_ytd: dict[int, int] = field(default_factory=dict)
+
+    # Phase 6c additions
+    clawback_balances_by_staff: dict[int, int] = field(default_factory=dict)
+    prior_withholdings_by_case_staff: dict[tuple[int, int], int] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -149,12 +169,8 @@ class ReferenceData:
     Loaded once per run by the data layer (backend/data/). The engine
     never touches the database — it only reads from this snapshot.
 
-    Dict-based for O(1) lookups. Concrete fields will be added as each
-    engine module is built; placeholders here keep the import surface
-    stable.
+    Dict-based for O(1) lookups.
     """
-    # Populated by data layer in later phases. Each dict maps a primary
-    # key to a row dict (or a typed sub-record once we formalise them).
     institutions: dict[int, dict] = field(default_factory=dict)
     countries: dict[int, dict] = field(default_factory=dict)
     offices: dict[int, dict] = field(default_factory=dict)
@@ -167,6 +183,12 @@ class ReferenceData:
     local_enrolment_bonuses: dict[int, dict] = field(default_factory=dict)
     status_splits: dict[str, dict] = field(default_factory=dict)
     sub_agents: dict[int, dict] = field(default_factory=dict)
+    calculation_params: dict[str, dict] = field(default_factory=dict)
+
+    # Phase 6c additions
+    departure_rules: dict[int, dict] = field(default_factory=dict)
+    complaint_deductions: dict[str, dict] = field(default_factory=dict)
+    contract_target_tiers: dict[int, dict] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -182,6 +204,20 @@ class BonusPayment:
     finance see exactly how the gross_bonus was assembled — every
     figure is independently testable.
 
+    Payment timing math (Phase 6c):
+      base_payable_this_run = gross_bonus × split_pct (from ref_status_split)
+      withheld_amount      = portion held back this run (current-enrolled,
+                             post-resignation deferral, etc.)
+      unlocked_amount      = portion released this run from prior holds
+                             (carry-over from previous month)
+      clawback_applied     = §I.5.3 clawback consumed this month from
+                             running balance
+      net_payable = base_payable_this_run
+                  - withheld_amount        (held for future runs)
+                  + unlocked_amount        (released from prior runs)
+                  - clawback_applied
+                  - advance_offset         (D1.R12 prior payment)
+
     calc_notes: human-readable explanation of how this row was built.
     audit_json: full lookup trace (which rate row, which split row,
     which priority partner, etc.) for debugging and reconciliation.
@@ -193,7 +229,7 @@ class BonusPayment:
     role_id: int
     slot_label: str                              # "counsellor", "case_officer", etc.
 
-    # Decomposed bonus columns (all đồng)
+    # Decomposed bonus columns (all đồng) — pre-timing
     tier_bonus: int                              # rate-card base
     package_bonus: int                           # gói dịch vụ premium
     addon_bonus: int                             # multi-school, referrals, etc.
@@ -205,8 +241,15 @@ class BonusPayment:
     advance_offset: int                          # subtracted if prior payment exists
 
     # Totals
-    gross_bonus: int                             # sum of components before retention
-    net_payable: int                             # what actually pays out this month
+    gross_bonus: int                             # sum of components before timing
+
+    # Phase 6c additions — payment timing
+    withheld_amount: int                         # held back this run
+    unlocked_amount: int                         # released this run (prior holds)
+    clawback_applied: int                        # §I.5.3 clawback this run
+    bank_transfer_required: bool                 # clawback couldn't be offset
+
+    net_payable: int                             # final amount paid this month
 
     # Audit
     calc_notes: str                              # human-readable trail
