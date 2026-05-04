@@ -1,0 +1,7 @@
+# Development dependencies. Includes everything in requirements.txt
+# plus tools only needed for testing/development.
+# Install with: pip install -r requirements-dev.txt
+
+-r requirements.txt
+
+pytest==9.0.3
