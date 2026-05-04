@@ -109,6 +109,16 @@ class CaseInput:
     # populates this when copying forward a case from a prior month's run.
     prior_month_rate: int | None = None
 
+    # --- CO_SUB subscheme override (item 3 from post-Phase-6 backlog) ---
+    # Pattern Y: per-case override for the CO_SUB subscheme. Normally the
+    # engine resolves the subscheme from ref_staff_target for the
+    # (staff_id, role_id, office_id, year, month) combination. If this
+    # field is set, it takes precedence — useful when a CO_SUB processes
+    # a case under a subscheme different from their normal one for the
+    # month, without requiring a ref_staff_target update.
+    # Valid values: 'ENROL_ONLY_VISA_ONLY', 'ENROL_PLUS_VISA', or None.
+    co_sub_subscheme_override: str | None = None
+
     # --- Prior payments (D1.R12) ---
     # Key: (slot_label, staff_id) — e.g. ("counsellor", 12)
     # Value: đồng already paid to that person on this case in prior months
@@ -189,6 +199,15 @@ class ReferenceData:
     departure_rules: dict[int, dict] = field(default_factory=dict)
     complaint_deductions: dict[str, dict] = field(default_factory=dict)
     contract_target_tiers: dict[int, dict] = field(default_factory=dict)
+
+    # Item 3 — Sub-agent CO scheme.
+    # Full ref_staff_target rows, indexed by row id. The
+    # resolve_co_sub_subscheme helper scans this for the matching
+    # (staff_id, role_id, office_id, year, month) tuple and reads
+    # the row's co_sub_subscheme. We don't pre-index by tuple
+    # because there are only ~hundreds of rows; linear scan is
+    # microseconds. Add an index in the data layer if it ever matters.
+    staff_targets: dict[int, dict] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------

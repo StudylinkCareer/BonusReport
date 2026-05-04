@@ -13,13 +13,20 @@ Design rules:
     default. Silent defaults hide data-integrity bugs.
   - Returns full row dicts so callers can record the matched row in
     audit_json.
+
+CHANGES IN THIS REVISION (item 3 — sub-agent CO scheme):
+  - resolve_co_sub_subscheme(): new helper that looks up the
+    subscheme for a given (staff, role, office, year, month) tuple.
+    Used by calc_tier when slot.role_id is CO_SUB.
+  - CoSubSubschemeNotFoundError: raised when the lookup finds no
+    matching ref_staff_target row.
 """
 
 from __future__ import annotations
 
 from datetime import date
 
-from .models import ReferenceData
+from .models import CaseInput, ReferenceData
 
 
 # ---------------------------------------------------------------------------
@@ -37,6 +44,20 @@ class AmbiguousRateError(LookupError):
     The UNIQUE constraint in the schema should prevent this, but we
     check defensively so any future schema change that breaks
     uniqueness fails loudly here instead of producing wrong bonuses.
+    """
+
+
+class CoSubSubschemeNotFoundError(LookupError):
+    """
+    A CO_SUB slot has no resolvable subscheme.
+
+    Either:
+      - case.co_sub_subscheme_override is unset (or None), AND
+      - no ref_staff_target row exists for the given
+        (staff_id, role_id, office_id, year, month) tuple.
+
+    Fix: insert the missing ref_staff_target row, or set
+    case.co_sub_subscheme_override on the CaseInput.
     """
 
 
@@ -127,3 +148,80 @@ def lookup_rate(
         )
 
     return matches[0]
+
+
+# ---------------------------------------------------------------------------
+# CO_SUB subscheme resolution (item 3)
+# ---------------------------------------------------------------------------
+
+def resolve_co_sub_subscheme(
+    case: CaseInput,
+    *,
+    staff_id: int,
+    role_id: int,
+    office_id: int,
+    year: int,
+    month: int,
+    ref: ReferenceData,
+) -> str:
+    """
+    Resolve the CO_SUB subscheme for a given slot in a given run-month.
+
+    Resolution order (Pattern Y):
+      1. If case.co_sub_subscheme_override is set, use it directly.
+         This is the per-case override hatch — operator asserts the
+         subscheme on the input CSV/form when the database doesn't
+         reflect reality for this specific case.
+      2. Otherwise scan ref.staff_targets for a row matching
+         (staff_id, role_id, office_id, year, month) and read the
+         co_sub_subscheme column.
+      3. If neither yields a value, raise CoSubSubschemeNotFoundError.
+
+    Args:
+        case:       CaseInput (only co_sub_subscheme_override is read).
+        staff_id:   The CO_SUB staff member.
+        role_id:    Should be the CO_SUB role id. Pass it explicitly
+                    rather than assume — keeps the helper composable.
+        office_id:  Case office (where the work was done).
+        year:       Run year.
+        month:      Run month.
+        ref:        ReferenceData snapshot (reads staff_targets).
+
+    Returns:
+        'ENROL_ONLY_VISA_ONLY' or 'ENROL_PLUS_VISA'.
+
+    Raises:
+        CoSubSubschemeNotFoundError: no override and no matching row.
+    """
+    # 1. Per-case override wins.
+    if case.co_sub_subscheme_override is not None:
+        return case.co_sub_subscheme_override
+
+    # 2. Look up ref_staff_target.
+    for row in ref.staff_targets.values():
+        if row.get('staff_id') != staff_id:
+            continue
+        if row.get('role_id') != role_id:
+            continue
+        if row.get('office_id') != office_id:
+            continue
+        if row.get('year') != year:
+            continue
+        if row.get('month') != month:
+            continue
+        subscheme = row.get('co_sub_subscheme')
+        if subscheme is not None:
+            return subscheme
+        # Found the row but the column is null — treat same as not found.
+        # CO_SUB rows in ref_staff_target should always have a subscheme.
+        break
+
+    # 3. Hard fail.
+    raise CoSubSubschemeNotFoundError(
+        f"No CO_SUB subscheme resolvable for "
+        f"staff_id={staff_id}, role_id={role_id}, "
+        f"office_id={office_id}, year={year}, month={month}, "
+        f"and case.co_sub_subscheme_override is None. "
+        f"Fix: insert ref_staff_target row, or set "
+        f"case.co_sub_subscheme_override."
+    )

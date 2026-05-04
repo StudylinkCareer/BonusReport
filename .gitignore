@@ -1,56 +1,58 @@
-@"
-# Python
+# =============================================================================
+# .gitignore for StudylinkCareer/BonusReport
+# =============================================================================
+
+# ----- Python -----
 __pycache__/
 *.py[cod]
-*`$py.class
+*$py.class
 *.so
 .Python
 *.egg-info/
 .eggs/
+*.egg
+MANIFEST
 build/
 dist/
 develop-eggs/
 downloads/
 eggs/
-lib/
-lib64/
 parts/
 sdist/
 var/
 wheels/
 share/python-wheels/
-*.egg
-MANIFEST
-DocumentReview/
-backend/docs/DocumentReview/
 
-# Virtual environments
+# ----- Virtual environments -----
 venv/
 .venv/
 env/
-.env
 ENV/
 env.bak/
 venv.bak/
-
-# Backend nested venv (legacy)
 backend/venv/
 
-# Environment variables
+# ----- Environment variables (CRITICAL — DB credentials live here) -----
 .env
-.env.local
-.env.*.local
+.env.*
+!.env.example
 *.env
 
-# IDEs
+# ----- IDEs / editors -----
 .vscode/
 .idea/
 *.swp
 *.swo
 *~
-.DS_Store
 
-# Testing
+# ----- OS files -----
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# ----- Testing / coverage -----
 .pytest_cache/
 .coverage
 htmlcov/
@@ -61,38 +63,32 @@ coverage.xml
 *.py,cover
 .hypothesis/
 
-# Jupyter
+# ----- Jupyter -----
 .ipynb_checkpoints
 
-# Frontend (Node/React)
+# ----- Frontend (Node/React) -----
 node_modules/
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 .pnpm-debug.log*
-dist/
-build/
 .next/
 .nuxt/
 .cache/
 
-# Logs
+# ----- Logs -----
 *.log
 logs/
+backend/logs/
 
-# OS files
-Thumbs.db
-ehthumbs.db
-Desktop.ini
-`$RECYCLE.BIN/
-
-# Database
+# ----- Local databases -----
 *.db
 *.sqlite
 *.sqlite3
 
-# Project-specific
+# ----- Project-specific scratch -----
 Supporting Content/
+DocumentReview/
+backend/docs/DocumentReview/
 *.bak
 *.tmp
-"@ | Set-Content C:\Users\rhod_\Documents\BonusReport\Application\.gitignore -Encoding UTF8

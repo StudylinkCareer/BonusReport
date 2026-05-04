@@ -1,0 +1,18 @@
+python -m tools.extract_distinct_values --input-dir "C:\Users\rhod_\Documents\Bonus Engine Support\Input Files Original" --output "output\distinct_values_for_review.xlsx" --pattern "*report of closed file in*.xlsx"
+
+Scanning 54 file(s) under C:\Users\rhod_\Documents\Bonus Engine Support\Input Files Original...
+
+  Files scanned: 54
+  Output: output\distinct_values_for_review.xlsx
+
+  Distinct value counts per column:
+    F  Client Type                      11 distinct
+    G  Country of Study                 14 distinct
+    H  Refer Source Agent               70 distinct
+    I  System Type                       8 distinct
+    J  Application Report Status        24 distinct
+    L  Institution Name                126 distinct
+    O  Counsellor Name                   8 distinct
+    P  Case Officer Name                12 distinct
+
+PS C:\Users\rhod_\Documents\BonusReport\Application\backend> start output\distinct_values_for_review.xlsx

@@ -9,7 +9,7 @@ Resolves the rate-card base bonus for one slot on one case by:
 
 Per architecture.md §6.
 
-CHANGES IN THIS REVISION (Phase 6c):
+CHANGES IN THIS REVISION (Phase 6c + item 3):
   - Carry-over rate locking: when ref_status_split.is_carry_over=Y AND
     case.prior_month_rate is set, return the locked rate instead of doing
     a fresh ref_rate lookup. Per Q3.4 (POLICY_MODEL.md Chunk 3): the rate
@@ -19,12 +19,17 @@ CHANGES IN THIS REVISION (Phase 6c):
     AND the institution is OUT_SYSTEM_MA / OUT_SYSTEM_GROUP, use the
     400k flat-fee rate (read from ref_calculation_param) instead of
     the standard rate. Per Decision 1.
+  - CO_SUB subscheme (item 3): when slot.role is CO_SUB, resolve the
+    subscheme via case.co_sub_subscheme_override OR ref_staff_target,
+    and pass it to lookup_rate. CO_SUB rate rows are keyed by subscheme;
+    other roles ignore it. Hard fail if neither override nor target row
+    is available.
 """
 
 from __future__ import annotations
 
 from .classifiers import classify_country_bucket, classify_tier
-from .lookups import lookup_rate
+from .lookups import lookup_rate, resolve_co_sub_subscheme
 from .models import CaseInput, ReferenceData, RunContext, Slot
 
 
@@ -122,11 +127,27 @@ def calc_tier_bonus(
             f"fee_paid_date — cannot determine rate effective date."
         )
 
+    # Resolve CO_SUB subscheme if applicable (item 3) ----------------------
+    # Only CO_SUB rates are keyed by co_sub_subscheme. For all other roles
+    # we pass None. For CO_SUB we resolve via override-or-lookup pattern.
+    co_sub_subscheme: str | None = None
+    role_row = ref.roles.get(slot.role_id, {})
+    if role_row.get('code') == 'CO_SUB':
+        co_sub_subscheme = resolve_co_sub_subscheme(
+            case,
+            staff_id=slot.staff_id,
+            role_id=slot.role_id,
+            office_id=case.office_id,
+            year=ctx.year,
+            month=ctx.month,
+            ref=ref,
+        )
+
     row = lookup_rate(
         ref,
         office_id=case.office_id,
         role_id=slot.role_id,
-        co_sub_subscheme=None,  # TODO: item 3 — sub-agent CO scheme
+        co_sub_subscheme=co_sub_subscheme,
         country_bucket=country_bucket,
         tier=tier,
         as_of_date=as_of,
@@ -135,6 +156,7 @@ def calc_tier_bonus(
     audit = {
         'country_bucket': country_bucket,
         'tier': tier,
+        'co_sub_subscheme': co_sub_subscheme,
         'as_of_date': as_of.isoformat(),
         'rate_row_id': row.get('id'),
         'rate_amount': row['amount'],

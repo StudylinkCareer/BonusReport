@@ -62,8 +62,10 @@ RATES = {
         "country_bucket": "TARGET", "tier": "MEET_LOW",
         "amount": 1_000_000,
         "effective_from": date(2024, 1, 1), "effective_to": None},
-    # CO_SUB at MEET_LOW = 800k (lower than CO_DIR by convention)
-    4: {"id": 4, "office_id": 1, "role_id": 4, "co_sub_subscheme": None,
+    # CO_SUB at MEET_LOW = 800k (lower than CO_DIR by convention).
+    # Subscheme matches what scenario 9 overrides on the case.
+    4: {"id": 4, "office_id": 1, "role_id": 4,
+        "co_sub_subscheme": "ENROL_ONLY_VISA_ONLY",
         "country_bucket": "TARGET", "tier": "MEET_LOW",
         "amount": 800_000,
         "effective_from": date(2024, 1, 1), "effective_to": None},
@@ -167,6 +169,7 @@ def _make_case(
     co_staff_id: int = 20,
     co_staff_name: str = "Quan Hoàng Yến",
     prior_month_rate: int | None = None,
+    co_sub_override: str | None = None,
 ) -> CaseInput:
     return CaseInput(
         case_id=case_id, contract_id=f"C{case_id:03d}",
@@ -191,6 +194,7 @@ def _make_case(
         visa_received_date=None, enrolled_date=None,
         course_start_date=None, course_status=None, file_closed_date=None,
         prior_month_rate=prior_month_rate,
+        co_sub_subscheme_override=co_sub_override,
     )
 
 
@@ -555,6 +559,7 @@ ctx = _make_ctx()
 case = _make_case(
     9, status_code="VISA_ONLY",
     co_role=4, co_staff_id=40, co_staff_name="Lê Thị Trường An",
+    co_sub_override="ENROL_ONLY_VISA_ONLY",
 )
 payments = calculate_case(case, ctx, ref)
 
