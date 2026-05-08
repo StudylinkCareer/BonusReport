@@ -22,7 +22,7 @@ sys.modules["backend"] = _backend_pkg
 
 import tempfile
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
 
 from backend.data.connection import get_connection
 from backend.importer.orchestrator import run_file
@@ -30,6 +30,10 @@ from backend.importer.orchestrator import run_file
 
 app = FastAPI(title="BonusReport API")
 
+
+# ---------------------------------------------------------------------------
+# Health
+# ---------------------------------------------------------------------------
 
 @app.get("/api/health")
 def health() -> dict:
@@ -43,6 +47,10 @@ def health() -> dict:
         raise HTTPException(status_code=503, detail=f"DB unreachable: {e}")
     return {"status": "ok", "db": "ok"}
 
+
+# ---------------------------------------------------------------------------
+# Staff list
+# ---------------------------------------------------------------------------
 
 @app.get("/api/staff")
 def list_staff() -> list[dict]:
@@ -68,6 +76,63 @@ def list_staff() -> list[dict]:
             cur.execute(sql)
             return [dict(row) for row in cur.fetchall()]
 
+
+# ---------------------------------------------------------------------------
+# Cases for review (one staff, one period)
+# ---------------------------------------------------------------------------
+
+@app.get("/api/cases")
+def list_cases(
+    staff_id: int = Query(..., description="ref_staff.id"),
+    year: int = Query(..., ge=2020, le=2030),
+    month: int = Query(..., ge=1, le=12),
+) -> list[dict]:
+    """
+    Cases for one staff member in one (year, month).
+
+    Includes any case where the staff appears in ANY role
+    (counsellor, case officer, or VP).
+    """
+    sql = """
+        SELECT
+            c.id,
+            c.contract_id,
+            c.student_name,
+            c.application_status,
+            c.application_date,
+            c.enrolment_date,
+            c.visa_date,
+            c.run_year,
+            c.run_month,
+            c.import_status,
+            c.created_at,
+            inst.canonical_name       AS institution_name,
+            cn.name                   AS country_name,
+            counsellor.canonical_name AS counsellor_name,
+            co.canonical_name         AS case_officer_name
+        FROM tx_case c
+        LEFT JOIN ref_institution inst       ON c.institution_id        = inst.id
+        LEFT JOIN dim_country     cn         ON c.country_id            = cn.id
+        LEFT JOIN ref_staff       counsellor ON c.counsellor_staff_id   = counsellor.id
+        LEFT JOIN ref_staff       co         ON c.case_officer_staff_id = co.id
+        WHERE c.run_year  = %s
+          AND c.run_month = %s
+          AND (
+                c.counsellor_staff_id   = %s
+             OR c.case_officer_staff_id = %s
+             OR c.vp_staff_id           = %s
+          )
+        ORDER BY c.contract_id
+    """
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, (year, month, staff_id, staff_id, staff_id))
+            return [dict(row) for row in cur.fetchall()]
+
+
+# ---------------------------------------------------------------------------
+# CRM Excel upload → importer pipeline
+# ---------------------------------------------------------------------------
 
 @app.post("/api/imports")
 async def upload_import(
