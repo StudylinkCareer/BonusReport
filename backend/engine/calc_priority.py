@@ -1,110 +1,178 @@
 """
-Priority partner bonus calculation.
+Priority List bonus calculation — at-enrolment half (Reading Y).
 
-Formula (per VBA_modCalc and 01_POLICY_SUMMARY in the engine workbook):
+# Formula
 
-    priority_bonus = tier_bonus × bonus_pct × achievement_factor
+    priority_bonus = tier_bonus × bonus_pct × 0.5
 
 Where:
-  bonus_pct          → annual % from ref_priority_target for the run year
-  achievement_factor → 1.0 if YTD enrolments ≥ annual target, else 0.5
+  bonus_pct  → from ref_priority_target.bonus_pct, or
+               junction.bonus_pct_override if the junction row carries
+               a per-institution promotional rate
+  0.5        → the "at-enrolment half" — half the full priority
+               entitlement, paid unconditionally when a student
+               enrols at a priority partner.
 
-Institution → priority partner is via either:
-  - ref_institution.priority_partner_id           (direct match, e.g. Monash)
-  - ref_institution.aggregate_priority_partner_id (bucket, e.g. "Other Navitas AU")
+# Two halves of priority — Reading Y
 
-If the institution has neither, the case is not a priority case and
-priority_bonus is 0. If bonus_pct is 0 for the year (all of 2025), the
-result is 0 — but the lookup still runs to give an audit trail.
+Per Priority_2024_final_v2.pdf footnote:
+  "Individual bonus paid 50% at enrolment, 50% after KPI reached
+   for each partner"
 
-The 50%-at-enrolment / 50%-at-KPI-achievement payment-timing rule lives
-in the payment timing layer, not here. This calc returns the *full*
-annual amount the case has earned given current achievement.
+Two independent payment triggers:
 
-Per architecture.md §6.
+  At-enrolment 50% (THIS MODULE)
+    Pays for every enrolment at a priority partner, regardless of
+    whether the partner KPI is ever reached during the year.
+    Calculated and paid case-by-case, in the month the case enrols.
+
+  Post-KPI 50% (separate year-end module — not yet built)
+    Pays at year-end for partners whose annual KPI was reached.
+    For partners whose KPI was NOT reached, the at-enrolment half
+    paid throughout the year is clawed back via the existing
+    company clawback procedure.
+
+The at-enrolment half here is therefore PROVISIONAL: it pays now,
+on expectation that KPI will be reached. If KPI is missed by year-end,
+year-end logic will reverse it.
+
+# Effectivity date
+
+Priority lookup uses the run period (date(ctx.year, ctx.month, 1)),
+not the contract signing date. Priority is structurally annual —
+bonus_pct, targets, and YTD buckets are all keyed by year. A contract
+signed late in year N enrolling in N+1 should be rated at year N+1's
+priority terms.
+
+# Status splits do NOT apply to priority
+
+Per §3 of the main policy, Current-Enrolled cases have tier bonus
+withheld 50/50 (50% at enrolment, 50% at visa). Priority is exempt:
+it has its own payment timing structure (50/50 at enrolment / KPI),
+not visa-contingent. payment_timing.py handles the exemption by
+splitting gross_bonus into a "splittable" portion (everything else)
+and a "passthrough" portion (priority).
 """
 
 from __future__ import annotations
 
+from datetime import date
 from decimal import Decimal
 
 from .models import CaseInput, ReferenceData, RunContext, Slot
 
 
 # ---------------------------------------------------------------------------
+# Role → channel mapping
+# ---------------------------------------------------------------------------
+
+_DIRECT_ROLE_CODES = frozenset({'COUNS_DIR', 'CO_DIR'})
+_SUB_ROLE_CODES = frozenset({'CO_SUB'})
+
+
+# At-enrolment fraction. The other 50% is the post-KPI half, paid by
+# year-end logic if the partner KPI is reached, or clawed back otherwise.
+_AT_ENROLMENT_FRACTION = Decimal('0.5')
+
+
+def _role_channel(role_code: str | None) -> str | None:
+    """
+    Map a role code to the channel it counts toward.
+
+    Returns 'direct', 'sub', or None (slot doesn't earn priority).
+    Year-end logic uses the recorded channel to decide which target
+    the case counted toward when checking KPI achievement.
+    """
+    if role_code in _DIRECT_ROLE_CODES:
+        return 'direct'
+    if role_code in _SUB_ROLE_CODES:
+        return 'sub'
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Exceptions
 # ---------------------------------------------------------------------------
 
-class PriorityPartnerNotFoundError(LookupError):
-    """
-    The institution refers to a priority_partner_id (or aggregate_id)
-    that doesn't exist in ref.priority_partners. Means data is broken
-    upstream.
-    """
+class PriorityListNotFoundError(LookupError):
+    """A junction row points to a priority_list_id that doesn't exist."""
 
 
 class PriorityTargetNotFoundError(LookupError):
-    """
-    A priority partner exists but has no ref_priority_target row for
-    ctx.year. Most likely a data-load gap — the calc can't proceed
-    without knowing the partner's annual target and bonus_pct.
-    """
+    """A priority list has no active ref_priority_target row at the run period."""
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Junction membership helpers
 # ---------------------------------------------------------------------------
 
-def _resolve_priority_partner_id(institution: dict) -> tuple[int | None, str | None]:
-    """
-    Returns (priority_partner_id, link_kind) for the institution.
-
-    link_kind is 'direct' if matched via priority_partner_id, 'aggregate'
-    if matched via aggregate_priority_partner_id, or None if neither.
-    The direct link wins if both are set (shouldn't happen in clean
-    data, but we choose the more specific link).
-    """
-    direct = institution.get('priority_partner_id')
-    if direct is not None:
-        return direct, 'direct'
-    aggregate = institution.get('aggregate_priority_partner_id')
-    if aggregate is not None:
-        return aggregate, 'aggregate'
-    return None, None
+def _active_at(row: dict, as_of: date) -> bool:
+    """True if row's effective range covers as_of."""
+    if row.get('effective_from') is not None and row['effective_from'] > as_of:
+        return False
+    if row.get('effective_to') is not None and row['effective_to'] < as_of:
+        return False
+    return True
 
 
-def _lookup_priority_target(
+def _resolve_junction(
+    institution_id: int,
+    case_date: date,
     ref: ReferenceData,
-    priority_partner_id: int,
-    year: int,
+) -> tuple[dict | None, str]:
+    """
+    Find the active priority-list junction row for an institution.
+
+    Returns (junction_row, reason_tag).
+    """
+    matches = [
+        jct for jct in ref.priority_list_institutions.values()
+        if jct['institution_id'] == institution_id
+        and _active_at(jct, case_date)
+    ]
+
+    if not matches:
+        return None, 'not_priority'
+    if len(matches) == 1:
+        return matches[0], 'single_match'
+
+    non_agg = []
+    for jct in matches:
+        list_row = ref.priority_lists.get(jct['priority_list_id'])
+        if list_row is not None and not list_row.get('is_aggregate', False):
+            non_agg.append(jct)
+
+    if len(non_agg) == 1:
+        return non_agg[0], 'preferred_non_aggregate'
+    if len(non_agg) > 1:
+        return non_agg[0], 'first_of_many_non_aggregate'
+
+    return matches[0], 'first_of_many_aggregate'
+
+
+def _lookup_active_target(
+    ref: ReferenceData,
+    priority_list_id: int,
+    as_of: date,
 ) -> dict:
-    """
-    Find the single ref_priority_target row for (partner, year).
-
-    Schema's UNIQUE (priority_partner_id, year) constraint guarantees
-    at most one row, so we don't bother with an ambiguity check.
-    """
-    for row in ref.priority_targets.values():
-        if row['priority_partner_id'] != priority_partner_id:
-            continue
-        if row['year'] != year:
-            continue
-        return row
-    raise PriorityTargetNotFoundError(
-        f"No ref_priority_target for partner_id={priority_partner_id}, "
-        f"year={year}."
-    )
-
-
-def _achievement_factor(ytd_enrolments: int, annual_target: int) -> Decimal:
-    """1.0 if hit, 0.5 otherwise. Decimal for clean arithmetic."""
-    if ytd_enrolments >= annual_target:
-        return Decimal('1.0')
-    return Decimal('0.5')
+    """Find the active ref_priority_target row for a list at a date."""
+    matches = [
+        row for row in ref.priority_targets.values()
+        if row['priority_list_id'] == priority_list_id
+        and _active_at(row, as_of)
+    ]
+    if not matches:
+        raise PriorityTargetNotFoundError(
+            f"No active ref_priority_target for priority_list_id={priority_list_id} "
+            f"at {as_of.isoformat()}."
+        )
+    if len(matches) > 1:
+        matches.sort(key=lambda r: r['effective_from'], reverse=True)
+    return matches[0]
 
 
 # ---------------------------------------------------------------------------
-# Main calc
+# Main calc — at-enrolment half (Reading Y)
 # ---------------------------------------------------------------------------
 
 def calc_priority_bonus(
@@ -116,78 +184,94 @@ def calc_priority_bonus(
     ref: ReferenceData,
 ) -> tuple[int, dict]:
     """
-    Calculate the priority partner bonus for one slot on one case.
+    Calculate the at-enrolment 50% priority bonus for one slot on one case.
 
-    Args:
-        case:        CaseInput.
-        slot:        Filled slot (staff_id is not None).
-        slot_label:  'counsellor' | 'case_officer' | 'presales' | 'vp'.
-                     Currently unused — every filled slot earns priority
-                     proportionally to its tier_bonus. Kept for symmetry
-                     with other calc_* signatures.
-        tier_bonus:  The slot's tier_bonus amount, in đồng. Caller must
-                     pass this in — priority is multiplicative on top.
-        ctx:         RunContext (drives YTD enrolments and run year).
-        ref:         ReferenceData snapshot.
+    Pays unconditionally for any priority-eligible case at a priority
+    partner. No threshold gate — KPI achievement governs only the
+    SECOND half (post-KPI), handled by separate year-end logic.
 
-    Returns:
-        (amount_dong, audit_record). Amount is 0 if the institution
-        isn't a priority partner, or if bonus_pct is 0 for the year.
-        Audit record always populated.
+    Returns (amount, audit). Audit always includes enough to let
+    year-end logic reverse or top up this case.
     """
-    # If there's no tier_bonus, priority is also 0 (multiplicative).
     if tier_bonus == 0:
         return 0, {'applied': False, 'reason': 'tier_bonus_zero'}
 
-    # Resolve institution → priority partner.
     institution = ref.institutions.get(case.institution_id)
     if institution is None:
         return 0, {'applied': False, 'reason': 'institution_not_found'}
 
-    partner_id, link_kind = _resolve_priority_partner_id(institution)
-    if partner_id is None:
+    role_code = ref.roles.get(slot.role_id, {}).get('code') if slot.role_id else None
+    channel = _role_channel(role_code)
+    if channel is None:
+        return 0, {
+            'applied': False,
+            'reason': 'role_not_priority_eligible',
+            'role_code': role_code,
+        }
+
+    # Priority effectivity = run period (annual semantics).
+    case_date = date(ctx.year, ctx.month, 1)
+
+    jct, jct_reason = _resolve_junction(case.institution_id, case_date, ref)
+    if jct is None:
         return 0, {'applied': False, 'reason': 'institution_not_priority'}
 
-    partner = ref.priority_partners.get(partner_id)
-    if partner is None:
-        raise PriorityPartnerNotFoundError(
-            f"institution_id={case.institution_id} links to "
-            f"priority_partner_id={partner_id} (via {link_kind}), but no "
-            f"row exists in ref.priority_partners. Data integrity bug."
+    list_id = jct['priority_list_id']
+    list_row = ref.priority_lists.get(list_id)
+    if list_row is None:
+        raise PriorityListNotFoundError(
+            f"institution_id={case.institution_id} junction (id={jct.get('id')}) "
+            f"points to priority_list_id={list_id}, but no row exists in "
+            f"ref.priority_lists. Data integrity bug."
         )
 
-    # Look up the annual target + bonus_pct for the run year.
-    target_row = _lookup_priority_target(ref, partner_id, ctx.year)
-    bonus_pct = Decimal(str(target_row['bonus_pct']))
-    annual_target = target_row['total_target']
+    target_row = _lookup_active_target(ref, list_id, case_date)
 
-    # Short-circuit when bonus_pct is 0 (e.g. all of 2025).
+    # Effective bonus_pct: junction override wins.
+    if jct.get('bonus_pct_override') is not None:
+        bonus_pct = Decimal(str(jct['bonus_pct_override']))
+        bonus_pct_source = 'junction_override'
+    else:
+        bonus_pct = Decimal(str(target_row['bonus_pct']))
+        bonus_pct_source = 'list_target'
+
     if bonus_pct == 0:
         return 0, {
             'applied': False,
             'reason': 'bonus_pct_zero',
-            'partner_id': partner_id,
-            'partner_name': partner.get('name'),
-            'link_kind': link_kind,
-            'year': ctx.year,
+            'list_id': list_id,
+            'list_name': list_row.get('canonical_name'),
+            'bonus_pct_source': bonus_pct_source,
+            'junction_resolution': jct_reason,
+            'role_code': role_code,
+            'channel': channel,
         }
 
-    # Achievement factor based on YTD enrolments for this partner.
-    ytd = ctx.enrolments_by_priority_partner_ytd.get(partner_id, 0)
-    af = _achievement_factor(ytd, annual_target)
-
-    amount = int(Decimal(tier_bonus) * bonus_pct * af)
+    amount = int(Decimal(tier_bonus) * bonus_pct * _AT_ENROLMENT_FRACTION)
 
     audit = {
         'applied': True,
-        'partner_id': partner_id,
-        'partner_name': partner.get('name'),
-        'link_kind': link_kind,
-        'year': ctx.year,
-        'bonus_pct': str(bonus_pct),
-        'annual_target': annual_target,
-        'ytd_enrolments': ytd,
-        'achievement_factor': str(af),
+        # Identification — year-end logic uses these to find this row.
+        'list_id': list_id,
+        'list_name': list_row.get('canonical_name'),
+        'is_aggregate': list_row.get('is_aggregate'),
+        'group_id': list_row.get('group_id'),
+        'junction_id': jct.get('id'),
+        'junction_resolution': jct_reason,
+        # Channel that this case counted toward (year-end checks the
+        # corresponding channel target for KPI achievement).
+        'role_code': role_code,
+        'channel': channel,
+        # Pricing inputs — used to recompute or clawback.
         'tier_bonus_input': tier_bonus,
+        'bonus_pct': str(bonus_pct),
+        'bonus_pct_source': bonus_pct_source,
+        'at_enrolment_fraction': str(_AT_ENROLMENT_FRACTION),
+        # KPI status at time of payment — informational. Year-end logic
+        # re-evaluates against final-year YTD, doesn't trust this snapshot.
+        'kpi_status_at_payment': 'pending_year_end',
+        'half_kind': 'at_enrolment',
+        'case_date': case_date.isoformat(),
+        'case_date_source': 'run_period',
     }
     return amount, audit

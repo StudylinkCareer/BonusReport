@@ -9,6 +9,24 @@ Two kinds of tests:
 
 Run from project root:
     python -m pytest backend/tests/test_transformer.py -v
+
+PHASE 7 NOTE:
+    The earlier version of this file tested an asterisk-parsing helper
+    (`_parse_institution_field`) and its associated integration tests
+    that derived partner routing from `*` / `**` markers in the
+    Institution Name field. That whole approach was retired in Phase 7
+    in favour of pure alias lookup against `ref_institution_alias`.
+    Asterisks are now just text inside aliases. Partner-routing for
+    engine logic is derived from `ref_institution_agreement` at run
+    time, not from importer parsing.
+
+    Tests removed:
+      * 8 unit tests for `_parse_institution_field`
+      * 5 integration tests under "New asterisk semantics"
+
+    The remaining tests (happy path, Refer Source Agent cascade, SCRAP
+    triggers, missing-required-fields, role-from-staff, incentive
+    amount) all remain valid under the Phase 7 model.
 """
 
 from datetime import datetime
@@ -19,13 +37,11 @@ from backend.data.connection import get_connection
 from backend.importer.reader import RawRow
 from backend.importer.transformer import (
     _parse_incentive,
-    _parse_institution_field,
     _parse_system_type,
     transform_row,
     STATUS_OK,
     STATUS_SCRAP,
     STATUS_UNRESOLVED,
-    STATUS_UNRESOLVED_PARTNER,
     STATUS_WARN_MISMATCH,
     SOURCE_NONE,
     SOURCE_OFFICE_ONLY,
@@ -36,24 +52,8 @@ from backend.importer.transformer import (
 
 
 # ---------------------------------------------------------------------------
-# Unit tests — institution field parsing
+# Unit tests — pure-Python helpers
 # ---------------------------------------------------------------------------
-
-@pytest.mark.parametrize("text, expected", [
-    ("The University of Adelaide",                  ("The University of Adelaide", 0, None)),
-    ("Eynesbury College * - Navitas",               ("Eynesbury College", 1, "Navitas")),
-    ("SAIBT *",                                     ("SAIBT", 1, None)),
-    ("Edith Cowan College*",                        ("Edith Cowan College", 1, None)),
-    ("Some College **",                             ("Some College", 2, None)),
-    ("The University of Melbourne**",               ("The University of Melbourne", 2, None)),
-    ("Some College ** - Adventus",                  ("Some College", 2, "Adventus")),
-    ("  Padded Name  ",                             ("Padded Name", 0, None)),
-    ("",                                            (None, 0, None)),
-    (None,                                          (None, 0, None)),
-])
-def test_parse_institution_field(text, expected):
-    assert _parse_institution_field(text) == expected
-
 
 @pytest.mark.parametrize("text, expected", [
     ("Trong hệ thống", "IN"),
@@ -128,67 +128,17 @@ def test_happy_path_in_system(cursor):
     assert record.country_id is not None
     assert record.institution_id is not None
     assert record.case_office_id is not None
-    assert record.counsellor_staff_id is not None
-    assert record.counsellor_role_id is not None
+    # _build_row() uses Phạm Thị Lợi (CO_SUB) for both columns; per the
+    # CO_SUB slot rule, counsellor is cleared and case_officer is filled.
+    assert record.counsellor_staff_id is None
+    assert record.counsellor_role_id is None
+    assert record.case_officer_staff_id is not None
+    assert record.case_officer_role_id == 18  # ROLE_ID_CO_SUB
     assert notes == []
 
 
 # ---------------------------------------------------------------------------
-# New asterisk semantics
-# ---------------------------------------------------------------------------
-
-def test_single_asterisk_with_navitas_suffix_resolves_partner(cursor):
-    """`*` + suffix → partner, with optional verification against partner_institution."""
-    raw = _build_row(**{"Institution Name": "Eynesbury College * - Navitas"})
-    record, notes = transform_row(cursor, raw, run_year=2025, run_month=4)
-    assert record is not None
-    assert record.referring_partner_id is not None
-    assert record.referring_source_type == SOURCE_PARTNER
-
-
-def test_single_asterisk_with_unknown_partner_marks_unresolved(cursor):
-    raw = _build_row(**{"Institution Name": "Some College * - NotARealPartner"})
-    record, notes = transform_row(cursor, raw, run_year=2025, run_month=4)
-    assert record is not None
-    assert record.referring_partner_id is None
-    assert any(n.warning_type == "UNRESOLVED_PARTNER_SUFFIX" for n in notes)
-    assert record.import_status == STATUS_UNRESOLVED
-
-
-def test_bare_asterisk_with_known_institution_auto_resolves(cursor):
-    """Bare `*` on Edith Cowan College should auto-resolve to Navitas
-    (Phase 6i seeded that link)."""
-    raw = _build_row(**{"Institution Name": "Edith Cowan College*"})
-    record, notes = transform_row(cursor, raw, run_year=2025, run_month=4)
-    assert record is not None
-    if record.institution_id is not None:
-        # If the institution resolves and has exactly one Navitas link, auto-resolve succeeds.
-        assert record.referring_partner_id is not None
-        assert record.referring_source_type == SOURCE_PARTNER
-
-
-def test_double_asterisk_means_out_of_system(cursor):
-    """`**` → no partner involvement at all. source_type = NONE."""
-    raw = _build_row(**{"Institution Name": "The University of Melbourne**"})
-    record, notes = transform_row(cursor, raw, run_year=2025, run_month=4)
-    assert record is not None
-    assert record.referring_partner_id is None
-    assert record.referring_source_type == SOURCE_NONE
-    # Should NOT be flagged UNRESOLVED-PARTNER under the new rules
-    assert record.import_status != STATUS_UNRESOLVED_PARTNER
-
-
-def test_double_asterisk_with_suffix_still_means_out_of_system(cursor):
-    """Even with a stray ' - X' suffix, ** stays out-of-system per the new rule."""
-    raw = _build_row(**{"Institution Name": "Some College ** - Adventus"})
-    record, notes = transform_row(cursor, raw, run_year=2025, run_month=4)
-    assert record is not None
-    assert record.referring_source_type == SOURCE_NONE
-    assert record.referring_partner_id is None
-
-
-# ---------------------------------------------------------------------------
-# Refer Source Agent cascade (asterisk_count == 0)
+# Refer Source Agent cascade
 # ---------------------------------------------------------------------------
 
 def test_blank_refer_source_is_office_only(cursor):
@@ -251,13 +201,19 @@ def test_unresolvable_country_returns_none(cursor):
 # Role-from-staff-not-column
 # ---------------------------------------------------------------------------
 
-def test_role_id_comes_from_ref_staff_not_column(cursor):
+def test_co_sub_staff_only_populates_case_officer_slot(cursor):
+    """CO_SUB staff always go to case_officer slot, never counsellor slot.
+    Phạm Thị Lợi (CO_SUB) appears in both columns of _build_row(); after
+    transform, only case_officer should be filled."""
     raw = _build_row()
     record, notes = transform_row(cursor, raw, run_year=2025, run_month=4)
     assert record is not None
-    assert record.counsellor_staff_id == record.case_officer_staff_id
-    assert record.counsellor_role_id == record.case_officer_role_id
-    assert record.counsellor_role_id is not None
+    # Counsellor slot must be empty for CO_SUB staff
+    assert record.counsellor_staff_id is None
+    assert record.counsellor_role_id is None
+    # Case officer slot has the CO_SUB staff
+    assert record.case_officer_staff_id is not None
+    assert record.case_officer_role_id == 18  # ROLE_ID_CO_SUB
 
 
 # ---------------------------------------------------------------------------

@@ -1,0 +1,98 @@
+# Distinct asterisk-bearing Institution Name values found
+# in all closed-file reports in /mnt/project/.
+# Count: 94 distinct, 303 occurrences.
+
+[ 10x] La Trobe College Melbourne * - Navitas
+[ 10x] Toronto Metropolitan University International College (TMUIC) * - Navitas
+[  9x] Melbourne Language Centre (MLC) *
+[  9x] North Park University * - Wellspring
+[  8x] Auburn University at Montgomery *
+[  8x] Griffith College * - Navitas
+[  7x] International Language Academy * - ILAC
+[  7x] Wright State University * - GEEBEE
+[  6x] Deakin College * - Navitas
+[  6x] Minnesota State University - Mankato * - EduCo
+[  6x] Saginaw Valley State University* - Wellspring
+[  6x] Southern Institute of Technology (SIT) * - GEEBEE
+[  5x] Deakin College *
+[  5x] Edith Cowan College*
+[  5x] Flinders University * - Can-Achieve
+[  5x] Ozford Institute of Higher Education **
+[  5x] The University of Melbourne**
+[  5x] The Woodstock Academy * - GE
+[  5x] University of Illinois at Chicago * / Shorelight
+[  5x] University of South Florida * - GEEBEE
+[  5x] Western New England University *
+[  4x] Eynesbury College * - Navitas
+[  4x] Flinders University **
+[  4x] Front Cooking School * - Acknowledge Education
+[  4x] IL Texas Private High School * - GE
+[  4x] Southwestern Academy * - GE
+[  4x] Tallulah Falls School * - GE
+[  4x] University of Prince Edward Island * - GEEBEE
+[  4x] University of Tennessee - Knoxville * - GEEBEE
+[  4x] Victoria University - Sydney City Centre *
+[  4x] Victoria University - VU **
+[  4x] Western Michigan University * - GEEBEE
+[  3x] CELUSA * - Navitas
+[  3x] California State University, Fullerton * - GEEBEE
+[  3x] California State University, Fullerton * - Kings Education
+[  3x] College of Central Florida * - Adventus
+[  3x] Douglas College **
+[  3x] Fryeburg Academy * - GE
+[  3x] International College of Manitoba (ICM) * - Navitas
+[  3x] Louisiana State University * - Shorelight Education
+[  3x] Millersville University * - Wellspring
+[  3x] Queensland University of Technology **
+[  3x] Red Rocks Community College (RRCC) **
+[  3x] SAIBT - South Australian Institute of Business and Technology * - Navitas
+[  3x] SRH International College * - Navitas
+[  3x] San Jose State University * - GEEBEE
+[  3x] Stott's Colleges *
+[  3x] Swinburne University of Technology - Sarawak **
+[  3x] TAFE International Western Australia (TIWA) * - Link2Uni
+[  3x] University of Dayton *
+[  2x] British University Vietnam (BUV) **
+[  2x] Capilano University * - GEEBEE
+[  2x] Capilano University * - GEEBEE Education
+[  2x] Maur Hill Mount Academy * - Educatius
+[  2x] Monroe College * - GEEBEE
+[  2x] Saint Leo University * - Adventus
+[  2x] Southern Alberta Institute of Technology (SAIT) * - Adventus
+[  2x] Springwood School * - Golden Education
+[  2x] TAFE International Western Australia (TIWA) *
+[  2x] The MacDuffie School * - Educatius
+[  2x] The University of Adelaide College * - Kaplan
+[  2x] The University of Sydney **
+[  2x] Toronto Metropolitan University (TMU) * - Adventus
+[  2x] Toronto Metropolitan University International College *
+[  2x] University Christian School **
+[  2x] University of Calgary **
+[  2x] University of Canberra College * - Navitas
+[  2x] University of Massachusetts Lowell ** - Navitas
+[  2x] University of Toledo * - Wellspring
+[  2x] Vancouver Community College **
+[  2x] Victoria University * - ECA
+[  2x] Victoria University - Melbourne **
+[  2x] Western Sydney University - Sydney City Campus *
+[  2x] Western Sydney University - Sydney City Campus * - Navitas
+[  1x] California State University  - East Bay **
+[  1x] Cape Breton Language Centre (CBLC) *
+[  1x] Cape Breton University *
+[  1x] Embry-Riddle Aeronautical  University *- EduCo/ USA
+[  1x] Kenston Forest School * - GE
+[  1x] Langara College *
+[  1x] Louisiana State University *
+[  1x] Murdoch College * - Kaplan
+[  1x] Perth International College of English (P.I.C.E) **
+[  1x] Salem State University**
+[  1x] Saxion University of Applied Sciences **
+[  1x] Stanley College **
+[  1x] TasTAFE (GETI) **
+[  1x] Torrens University Australia ** - Laureate
+[  1x] University of Central Florida *
+[  1x] University of Dayton * - Shorelight
+[  1x] University of Galway **
+[  1x] University of Regina (UR) **
+[  1x] University of Waikato College * - Navitas
+[  1x] Wakefield School **

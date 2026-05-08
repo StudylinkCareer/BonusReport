@@ -136,7 +136,7 @@ def _make_ctx(
         year=year, month=month,
         enrolments_by_staff_office={(10, 1): 2, (20, 1): 2, (40, 1): 2},
         targets_by_staff_office={(10, 1): 2, (20, 1): 2, (40, 1): 2},
-        enrolments_by_priority_partner_ytd={},
+        enrolments_by_priority_list_ytd={},
         clawback_balances_by_staff=clawback_balances or {},
         prior_withholdings_by_case_staff=prior_withholdings or {},
     )

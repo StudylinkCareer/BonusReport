@@ -75,7 +75,7 @@ def _make_ref() -> ReferenceData:
         countries=COUNTRIES,
         institutions=INSTITUTIONS,
         rates=RATES,
-        priority_partners=PRIORITY_PARTNERS,
+        priority_lists=PRIORITY_PARTNERS,
         priority_targets=PRIORITY_TARGETS,
         status_splits=TIMING_NEUTRAL_STATUS_SPLITS,
         roles=TIMING_TEST_ROLES,
@@ -88,8 +88,8 @@ def _make_ctx(*, ytd_for_partner: dict[int, int]) -> RunContext:
     return RunContext(
         year=2024, month=6,
         enrolments_by_staff_office={(10, 1): 2},
-        targets_by_staff_office={(10, 1): 2},
-        enrolments_by_priority_partner_ytd=ytd_for_partner,
+        targets_by_staff_office={(10, 1): 2},   
+        enrolments_by_priority_list_ytd=ytd_for_partner,
     )
 
 

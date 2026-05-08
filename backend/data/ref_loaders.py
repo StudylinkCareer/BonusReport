@@ -20,15 +20,17 @@ Why explicit columns?
   - Selective: tables like ref_institution have alias-related columns
     we don't want pulled into ReferenceData.
 
-This file will grow. We start with three loaders today and add the
-rest in subsequent batches:
-  Batch 1 (done): institutions, countries, offices
-  Batch 2 (done): roles, staff, rates
-  Batch 3 (done): priority_partners, priority_targets, status_splits
-  Batch 4 (done): service_fees, local_enrolment_bonuses,
-                  calculation_params, departure_rules,
-                  complaint_deductions, contract_target_tiers,
-                  staff_targets
+Schema baselines:
+  - Phase7prep_v2 (deployed): ref_priority_partner -> ref_priority_list,
+    ref_priority_partner_institution -> ref_priority_list_institution,
+    new ref_priority_group, ref_partner_classification, ref_partner_flat_rate.
+  - Phase7prep_v2_extension (deployed): ref_partner_institution renamed and
+    reshaped as ref_institution_agreement (agreement_type, kpi_weight,
+    nullable partner_id); ref_institution.classification dropped;
+    ref_institution_agreement and ref_partner gained effective_from/to;
+    ref_priority_list_institution gained bonus_pct_override / weight_override.
+  - Phase 14a (DD-§I.6): ref_status_split gained is_visa_only_paid column;
+    added to STATUS_SPLIT_SELECT below so the engine sees the new flag.
 """
 
 from __future__ import annotations
@@ -118,24 +120,145 @@ def load_offices(conn: psycopg.Connection) -> dict[int, dict]:
 # ---------------------------------------------------------------------------
 
 # Engine consumers:
-#   - calc_priority reads priority_partner_id and aggregate_priority_partner_id
-#     to decide whether the case earns a priority bonus uplift.
-#   - calc_tier reads classification (e.g. 'OUT_SYSTEM_MASTER_AGENT') for
-#     the Phase 6c fees_paid_non_enrolled override.
-#   - audit/display: canonical_name, country_id
+#   - calc_priority joins via ref_priority_list_institution rather than
+#     reading direct columns from this table (the old priority_partner_id
+#     and aggregate_priority_partner_id columns were dropped in Phase7prep_v2).
+#   - audit/display: canonical_name, country_id.
+#   - merged_into_id is needed if any consumer wants to dereference
+#     superseded rows; verification_status is informational.
+#
+# DROPPED in Phase7prep_v2_extension: classification.
+#   In-system / out-of-system status is now derived from active agreements
+#   in ref_institution_agreement at a given case date.
 INSTITUTION_COLUMNS = (
     "id",
     "canonical_name",
     "country_id",
-    "classification",
-    "priority_partner_id",
-    "aggregate_priority_partner_id",
+    "verification_status",
+    "merged_into_id",
 )
 
 
 def load_institutions(conn: psycopg.Connection) -> dict[int, dict]:
     """Load ref_institution into {institution_id: {col: val, ...}}."""
     sql = f"SELECT {', '.join(INSTITUTION_COLUMNS)} FROM ref_institution"
+    with conn.cursor() as cur:
+        cur.execute(sql)
+        return _rows_by_id(cur)
+
+
+# ---------------------------------------------------------------------------
+# ref_institution_agreement
+# ---------------------------------------------------------------------------
+
+# Engine consumers:
+#   - The "is this institution in-system at this date" question is answered
+#     by checking for any active agreement row at the case date.
+#   - Routing (DIRECT vs VIA_PARTNER + which partner) drives:
+#       * fees_paid_non_enrolled override (was: classification == OUT_SYSTEM_MASTER_AGENT;
+#         now: agreement_type == 'VIA_PARTNER' AND partner has MASTER_AGENT classification)
+#       * KPI weighting (kpi_weight column directly).
+#   - effective_from/to gate validity.
+INSTITUTION_AGREEMENT_COLUMNS = (
+    "id",
+    "institution_id",
+    "agreement_type",
+    "partner_id",
+    "kpi_weight",
+    "effective_from",
+    "effective_to",
+)
+
+
+def load_institution_agreements(conn: psycopg.Connection) -> dict[int, dict]:
+    """Load ref_institution_agreement into {agreement_id: {col: val, ...}}."""
+    sql = f"SELECT {', '.join(INSTITUTION_AGREEMENT_COLUMNS)} FROM ref_institution_agreement"
+    with conn.cursor() as cur:
+        cur.execute(sql)
+        return _rows_by_id(cur)
+
+
+# ---------------------------------------------------------------------------
+# ref_partner
+# ---------------------------------------------------------------------------
+
+# Engine consumers:
+#   - calc_priority and calc_tier resolve a partner's GROUP/MASTER_AGENT
+#     classification via ref_partner_classification; this loader provides
+#     the partner identity (name) and validity dates only.
+#   - effective_from/to gate validity at the StudyLink↔partner level.
+#
+# Note: ref_partner uses 'name' (not 'canonical_name') for historical reasons.
+PARTNER_COLUMNS = (
+    "id",
+    "name",
+    "classification",
+    "is_active",
+    "effective_from",
+    "effective_to",
+)
+
+
+def load_partners(conn: psycopg.Connection) -> dict[int, dict]:
+    """Load ref_partner into {partner_id: {col: val, ...}}."""
+    sql = f"SELECT {', '.join(PARTNER_COLUMNS)} FROM ref_partner"
+    with conn.cursor() as cur:
+        cur.execute(sql)
+        return _rows_by_id(cur)
+
+
+# ---------------------------------------------------------------------------
+# ref_partner_classification
+# ---------------------------------------------------------------------------
+
+# Engine consumers:
+#   - calc_priority reads category to distinguish GROUP / MASTER_AGENT_OOS
+#     / MASTER_AGENT_GENUINE and select the right bonus path.
+#   - calc_tier reads kpi_weight (1.0 for GROUP, 0.7 for MA) to weight
+#     enrolment counting against targets.
+#   - bonus_model carries a key indicating which bonus algorithm to apply
+#     for cases routed via this partner (FLAT vs PRIORITY_LIST etc).
+PARTNER_CLASSIFICATION_COLUMNS = (
+    "id",
+    "partner_id",
+    "category",
+    "kpi_weight",
+    "bonus_model",
+    "effective_from",
+    "effective_to",
+)
+
+
+def load_partner_classifications(conn: psycopg.Connection) -> dict[int, dict]:
+    """Load ref_partner_classification into {row_id: {col: val, ...}}."""
+    sql = f"SELECT {', '.join(PARTNER_CLASSIFICATION_COLUMNS)} FROM ref_partner_classification"
+    with conn.cursor() as cur:
+        cur.execute(sql)
+        return _rows_by_id(cur)
+
+
+# ---------------------------------------------------------------------------
+# ref_partner_flat_rate
+# ---------------------------------------------------------------------------
+
+# Engine consumers:
+#   - calc_tier reads this when a case routes via a partner whose
+#     bonus_model == 'FLAT' (currently ApplyBoard and Can-Achieve).
+#   - Lookup key: (partner_id, office_id, role_id, as_of_date).
+PARTNER_FLAT_RATE_COLUMNS = (
+    "id",
+    "partner_id",
+    "office_id",
+    "role_id",
+    "amount",
+    "effective_from",
+    "effective_to",
+)
+
+
+def load_partner_flat_rates(conn: psycopg.Connection) -> dict[int, dict]:
+    """Load ref_partner_flat_rate into {row_id: {col: val, ...}}."""
+    sql = f"SELECT {', '.join(PARTNER_FLAT_RATE_COLUMNS)} FROM ref_partner_flat_rate"
     with conn.cursor() as cur:
         cur.execute(sql)
         return _rows_by_id(cur)
@@ -224,24 +347,101 @@ def load_rates(conn: psycopg.Connection) -> dict[int, dict]:
 
 
 # ---------------------------------------------------------------------------
-# ref_priority_partner
+# ref_priority_group
 # ---------------------------------------------------------------------------
 
 # Engine consumers:
-#   - calc_priority reads name (display) and is_aggregate (resolution
-#     path: institutions point to either a 1:1 priority_partner_id or
-#     to an aggregate via aggregate_priority_partner_id).
-PRIORITY_PARTNER_COLUMNS = (
+#   - calc_priority reads canonical_name for audit/display when reporting
+#     a case's contribution against a Group's collective List target.
+#   - country_id used for filtering / sanity checks.
+#   - effective_from/to gate validity.
+PRIORITY_GROUP_COLUMNS = (
     "id",
-    "name",
+    "canonical_name",
     "country_id",
-    "is_aggregate",
+    "effective_from",
+    "effective_to",
+    # Phase 12b — payment timing rule for the group.
+    # Values: 'STANDARD_50_50' (default) | 'CURRENT_ENROL_25_25_50'.
+    # Read by payment_timing._resolve_priority_quota_status to decide
+    # whether to apply the SPLIT branch for Current-Enrolled cases.
+    "priority_split_rule_type",
 )
 
 
-def load_priority_partners(conn: psycopg.Connection) -> dict[int, dict]:
-    """Load ref_priority_partner into {priority_partner_id: {col: val, ...}}."""
-    sql = f"SELECT {', '.join(PRIORITY_PARTNER_COLUMNS)} FROM ref_priority_partner"
+def load_priority_groups(conn: psycopg.Connection) -> dict[int, dict]:
+    """Load ref_priority_group into {group_id: {col: val, ...}}."""
+    sql = f"SELECT {', '.join(PRIORITY_GROUP_COLUMNS)} FROM ref_priority_group"
+    with conn.cursor() as cur:
+        cur.execute(sql)
+        return _rows_by_id(cur)
+
+
+# ---------------------------------------------------------------------------
+# ref_priority_list
+# ---------------------------------------------------------------------------
+
+# Engine consumers:
+#   - calc_priority reads:
+#       canonical_name (display)
+#       is_aggregate (resolution path: a List can have one or many member
+#         institutions linked via ref_priority_list_institution)
+#       group_id (Lists belong to Groups; KPI rolls up at Group level)
+#       country_id (filter / sanity)
+#   - effective_from/to gate validity (Lists can be retired or replaced).
+#
+# RENAMED from ref_priority_partner in Phase7prep_v2.
+PRIORITY_LIST_COLUMNS = (
+    "id",
+    "canonical_name",
+    "country_id",
+    "is_aggregate",
+    "group_id",
+    "effective_from",
+    "effective_to",
+)
+
+
+def load_priority_lists(conn: psycopg.Connection) -> dict[int, dict]:
+    """Load ref_priority_list into {list_id: {col: val, ...}}."""
+    sql = f"SELECT {', '.join(PRIORITY_LIST_COLUMNS)} FROM ref_priority_list"
+    with conn.cursor() as cur:
+        cur.execute(sql)
+        return _rows_by_id(cur)
+
+
+# ---------------------------------------------------------------------------
+# ref_priority_list_institution
+# ---------------------------------------------------------------------------
+
+# Engine consumers:
+#   - calc_priority builds an in-memory map {institution_id: [list_ids]}
+#     from this table to answer "what priority Lists does this institution
+#     belong to at the case date?".
+#   - institution_target_direct / institution_target_sub provide the
+#     per-institution sub-targets within an aggregate List (e.g. each
+#     Navitas college's own slice of the 'Other Navitas AU' total).
+#   - bonus_pct_override and weight_override (Phase7prep_v2_extension):
+#     when set, override the List-level ref_priority_target.bonus_pct
+#     and the partner-level kpi_weight respectively, for promotional
+#     periods at institution-within-list granularity.
+#   - effective_from/to gate validity.
+PRIORITY_LIST_INSTITUTION_COLUMNS = (
+    "id",
+    "priority_list_id",
+    "institution_id",
+    "institution_target_direct",
+    "institution_target_sub",
+    "bonus_pct_override",
+    "weight_override",
+    "effective_from",
+    "effective_to",
+)
+
+
+def load_priority_list_institutions(conn: psycopg.Connection) -> dict[int, dict]:
+    """Load ref_priority_list_institution into {row_id: {col: val, ...}}."""
+    sql = f"SELECT {', '.join(PRIORITY_LIST_INSTITUTION_COLUMNS)} FROM ref_priority_list_institution"
     with conn.cursor() as cur:
         cur.execute(sql)
         return _rows_by_id(cur)
@@ -254,17 +454,22 @@ def load_priority_partners(conn: psycopg.Connection) -> dict[int, dict]:
 # Engine consumers:
 #   - calc_priority reads bonus_pct (uplift % applied to tier_bonus) and
 #     total_target / direct_target / sub_target (used to compute the
-#     achievement factor against ctx.enrolments_by_priority_partner_ytd).
+#     achievement factor against ctx.enrolments_by_priority_list_ytd).
 #   - prior_year_owing affects target calculation in some scenarios.
+#   - effective_from/to gate validity (replaced annual 'year' column;
+#     promotions can now overlay temporary boosted rates).
+#
+# COLUMN RENAMED in Phase7prep_v2: priority_partner_id -> priority_list_id.
 PRIORITY_TARGET_COLUMNS = (
     "id",
-    "priority_partner_id",
-    "year",
+    "priority_list_id",
     "total_target",
     "direct_target",
     "sub_target",
     "bonus_pct",
     "prior_year_owing",
+    "effective_from",
+    "effective_to",
 )
 
 
@@ -285,8 +490,11 @@ def load_priority_targets(conn: psycopg.Connection) -> dict[int, dict]:
 #     split percentages and all four flag columns drive every timing
 #     outcome (zero bonus, current-enrolled withhold, carry-over
 #     unlock, fees-paid-non-enrolled override).
-#   - calc_tier reads is_carry_over and fees_paid_non_enrolled to
-#     decide special-case rate behavior.
+#   - calc_tier reads is_carry_over, fees_paid_non_enrolled, and
+#     is_visa_only_paid (Phase 14a — DD-§I.6) to decide special-case
+#     rate behavior.
+#   - adapter._status_allows_null_institution reads is_visa_only_paid
+#     to decide whether to permit NULL institution_id.
 # Schema-to-engine column rename:
 #   status → status_code (the engine refers to it as case.status_code,
 #   so the row's own copy of that value is also called status_code)
@@ -303,6 +511,7 @@ STATUS_SPLIT_SELECT = """
     is_current_enrolled,
     is_zero_bonus,
     fees_paid_non_enrolled,
+    is_visa_only_paid,
     is_visa_granted,
     deduplication_rank
 """
@@ -528,6 +737,58 @@ def load_staff_targets(conn: psycopg.Connection) -> dict[int, dict]:
 
 
 # ---------------------------------------------------------------------------
+# tx_priority_quota_tracker (Phase 12b)
+# ---------------------------------------------------------------------------
+
+# Engine consumers:
+#   - The engine_runner loads the current state of this table into
+#     RunContext.priority_quota_state at run start, mutates it in place
+#     as cases are processed by payment_timing, then UPSERTs the updated
+#     state back at run end.
+#
+# This is a TRANSACTIONAL table (tx_*), not strictly a reference table,
+# but it lives alongside the ref_* loaders here because the engine_runner
+# loads it the same way during run setup and treats it as
+# point-in-time-snapshot input, just like clawback balances.
+PRIORITY_QUOTA_TRACKER_COLUMNS = (
+    "id",
+    "priority_list_institution_id",
+    "enrolment_count_direct",
+    "enrolment_count_sub",
+    "last_updated_run_year",
+    "last_updated_run_month",
+)
+
+
+def load_priority_quota_tracker(conn: psycopg.Connection) -> dict[int, dict]:
+    """Load tx_priority_quota_tracker rows keyed by priority_list_institution_id.
+
+    Returns {pli_id: {'count_direct': int, 'count_sub': int, ...}} suitable
+    for assignment to ctx.priority_quota_state. The engine_runner is
+    responsible for transforming this dict into the in-run shape (it
+    stores both the count fields the engine needs and the audit fields
+    the writer uses for UPSERTing).
+
+    Returns an empty dict if the table is empty (e.g. fresh year, no
+    priority enrolments yet — engine treats every case as quota-not-met
+    until the first increment).
+    """
+    sql = f"SELECT {', '.join(PRIORITY_QUOTA_TRACKER_COLUMNS)} FROM tx_priority_quota_tracker"
+    with conn.cursor() as cur:
+        cur.execute(sql)
+        out: dict[int, dict] = {}
+        for row in cur.fetchall():
+            pli_id = row['priority_list_institution_id']
+            out[pli_id] = {
+                'count_direct': row['enrolment_count_direct'] or 0,
+                'count_sub':    row['enrolment_count_sub'] or 0,
+                'last_updated_run_year':  row['last_updated_run_year'],
+                'last_updated_run_month': row['last_updated_run_month'],
+            }
+        return out
+
+
+# ---------------------------------------------------------------------------
 # Smoke test — `python -m data.ref_loaders` runs this.
 # ---------------------------------------------------------------------------
 
@@ -538,10 +799,16 @@ if __name__ == "__main__":
         countries = load_countries(conn)
         offices = load_offices(conn)
         institutions = load_institutions(conn)
+        institution_agreements = load_institution_agreements(conn)
+        partners = load_partners(conn)
+        partner_classifications = load_partner_classifications(conn)
+        partner_flat_rates = load_partner_flat_rates(conn)
         roles = load_roles(conn)
         staff = load_staff(conn)
         rates = load_rates(conn)
-        priority_partners = load_priority_partners(conn)
+        priority_groups = load_priority_groups(conn)
+        priority_lists = load_priority_lists(conn)
+        priority_list_institutions = load_priority_list_institutions(conn)
         priority_targets = load_priority_targets(conn)
         status_splits = load_status_splits(conn)
         service_fees = load_service_fees(conn)
@@ -551,26 +818,34 @@ if __name__ == "__main__":
         complaint_deductions = load_complaint_deductions(conn)
         contract_target_tiers = load_contract_target_tiers(conn)
         staff_targets = load_staff_targets(conn)
+        priority_quota_tracker = load_priority_quota_tracker(conn)
 
     def _show(label: str, data: dict) -> None:
-        print(f"{label:24s} {len(data):>4} rows")
+        print(f"{label:30s} {len(data):>4} rows")
         if data:
             sample = next(iter(data.values()))
-            print(f"  sample:     {sample}")
+            print(f"  sample: {sample}")
 
-    _show("Countries:",           countries)
-    _show("Offices:",             offices)
-    _show("Institutions:",        institutions)
-    _show("Roles:",               roles)
-    _show("Staff:",               staff)
-    _show("Rates:",               rates)
-    _show("Priority partners:",   priority_partners)
-    _show("Priority targets:",    priority_targets)
-    _show("Status splits:",       status_splits)
-    _show("Service fees:",        service_fees)
-    _show("Local enrol bonuses:", local_enrolment_bonuses)
-    _show("Calculation params:",  calculation_params)
-    _show("Departure rules:",     departure_rules)
-    _show("Complaint deducts:",   complaint_deductions)
-    _show("Contract tgt tiers:",  contract_target_tiers)
-    _show("Staff targets:",       staff_targets)
+    _show("Countries:",                  countries)
+    _show("Offices:",                    offices)
+    _show("Institutions:",               institutions)
+    _show("Institution agreements:",     institution_agreements)
+    _show("Partners:",                   partners)
+    _show("Partner classifications:",    partner_classifications)
+    _show("Partner flat rates:",         partner_flat_rates)
+    _show("Roles:",                      roles)
+    _show("Staff:",                      staff)
+    _show("Rates:",                      rates)
+    _show("Priority groups:",            priority_groups)
+    _show("Priority lists:",             priority_lists)
+    _show("Priority list institutions:", priority_list_institutions)
+    _show("Priority targets:",           priority_targets)
+    _show("Status splits:",              status_splits)
+    _show("Service fees:",               service_fees)
+    _show("Local enrol bonuses:",        local_enrolment_bonuses)
+    _show("Calculation params:",         calculation_params)
+    _show("Departure rules:",            departure_rules)
+    _show("Complaint deducts:",          complaint_deductions)
+    _show("Contract tgt tiers:",         contract_target_tiers)
+    _show("Staff targets:",              staff_targets)
+    _show("Priority quota tracker:",     priority_quota_tracker)

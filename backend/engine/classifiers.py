@@ -230,7 +230,7 @@ def classify_tier(
     # Defensive: caller must pass a filled slot.
     assert slot.staff_id is not None, "classify_tier called with empty slot"
 
-    # 1. Master Agent route overrides everything.
+    # 1. Master Agent route (resolved partner) overrides everything.
     if case.referring_partner_id is not None:
         return TIER_OUT_SYSTEM
 
@@ -242,10 +242,26 @@ def classify_tier(
     #       return TIER_VISA_ONLY
 
     # 3. Non-TARGET buckets all use the FLAT tier.
+    # FLAT/VN_*/SUMMER buckets have no OUT_SYSTEM rate row in ref_rate, so
+    # this check must precede any further OUT_SYSTEM detection.
     if country_bucket != BUCKET_TARGET:
         return TIER_FLAT
 
-    # 4. Performance comparison
+    # 4. Out-of-system marker on raw institution text.
+    # Per CRM convention preserved by the importer in institution_text_raw:
+    #   '**' suffix → out-of-system case (via unresolved Master Agent OR
+    #                  identified as 'out-of-system individual institution')
+    #   '*'  suffix → via Group (in-system rate; do NOT trigger OUT_SYSTEM)
+    # When an institution can be reached both as 'out-of-system individual'
+    # and via a partner Group, the policy is: individual takes precedence.
+    # The '**' marker in the CRM is exactly that operative signal — it
+    # overrides whatever ref_institution_agreement rows say. Detection is
+    # a literal substring check; '*' alone is harmless because '**' is two
+    # adjacent stars.
+    if case.institution_text_raw and '**' in case.institution_text_raw:
+        return TIER_OUT_SYSTEM
+
+    # 5. Performance comparison
     key = (slot.staff_id, case.office_id)
     enrolments = ctx.enrolments_by_staff_office.get(key, 0)
     target = ctx.targets_by_staff_office.get(key)

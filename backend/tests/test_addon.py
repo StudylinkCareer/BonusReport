@@ -97,7 +97,7 @@ def _make_ctx() -> RunContext:
         year=2024, month=6,
         enrolments_by_staff_office={(10, 1): 2, (20, 1): 2},
         targets_by_staff_office={(10, 1): 2, (20, 1): 2},
-        enrolments_by_priority_partner_ytd={},
+        enrolments_by_priority_list_ytd={},
     )
 
 

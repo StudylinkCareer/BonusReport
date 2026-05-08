@@ -148,7 +148,17 @@ def calculate_case(
     pass1: list[_SlotResult] = []
 
     for slot_label, slot in _iter_filled_slots(case):
-        if is_local:
+        # Per-slot routing for VN-domestic cases:
+        # COUNS_DIR / CO_DIR slots → ref_local_enrolment_bonus (skip tier).
+        # CO_SUB slots → ref_rate VN_*/FLAT bucket (run tier, skip flat_local).
+        # The local-bonus rate card is keyed on counsellor-pairing patterns,
+        # and sub-agent COs sit outside that schema. ref_rate has dedicated
+        # VN_RMIT/VN_BUV/VN_OTHER/SUMMER rows for CO_SUB (subscheme-keyed)
+        # — those are the right path for sub-agent local enrolments.
+        role_code = ref.roles.get(slot.role_id, {}).get('code') if slot.role_id else None
+        use_flat_local_path = is_local and role_code != 'CO_SUB'
+
+        if use_flat_local_path:
             tier = 0
             tier_audit = {
                 'applied': False,

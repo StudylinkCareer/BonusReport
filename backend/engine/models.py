@@ -7,11 +7,54 @@ Percentages are stored as Decimal for precision.
 
 Per architecture.md §6.3.
 
-CHANGES IN THIS REVISION (Phase 6c — payment timing):
-  - RunContext: added clawback_balances_by_staff and prior_withholdings_by_case_staff
-  - ReferenceData: added departure_rules, complaint_deductions, contract_target_tiers
-  - BonusPayment: added withheld_amount, unlocked_amount, clawback_applied,
-                  bank_transfer_required
+CHANGES:
+  Phase 6c — payment timing:
+    - RunContext: added clawback_balances_by_staff and prior_withholdings_by_case_staff
+    - ReferenceData: added departure_rules, complaint_deductions, contract_target_tiers
+    - BonusPayment: added withheld_amount, unlocked_amount, clawback_applied,
+                    bank_transfer_required
+
+  Phase 7 — agreement-based schema + priority Lists:
+    - ReferenceData.priority_partners → priority_lists (rename for the
+      ref_priority_partner → ref_priority_list table rename)
+    - ReferenceData adds: priority_groups, priority_list_institutions,
+      partners, partner_classifications, partner_flat_rates,
+      institution_agreements
+    - RunContext.enrolments_by_priority_partner_ytd →
+      enrolments_by_priority_list_ytd (rename to match the new keying)
+    - RunContext adds: enrolments_by_priority_list_institution_ytd
+      (separate YTD bucket for carved-out institutions within an
+      aggregate List — see calc_priority.py)
+
+  Phase 7 (carry-over key fix):
+    - RunContext.prior_withholdings_by_case_staff →
+      prior_withholdings_by_contract_staff. Key changes from
+      (case_id, staff_id) to (contract_id, staff_id). Reason: tx_case
+      is keyed on (contract_id, run_year, run_month) — same contract
+      gets a different case_id every month. Carry-over balances need
+      to match across months by contract, not case.
+
+  Phase 8 — priority retroactive layer:
+    - RunContext.enrolments_by_priority_list_ytd and
+      enrolments_by_priority_list_institution_ytd → collapsed into a
+      single priority_ytd: PriorityYtdSnapshot field. The snapshot
+      carries channel-split YTD counts (direct/sub/total) at both
+      list and institution levels, so calc_priority can apply the
+      role-based threshold rule (CO_SUB gates on sub_target,
+      COUNS_DIR/CO_DIR gate on direct_target, both also gate on
+      total_target).
+
+  Phase 12b — priority 25/25/50 split rule:
+    - BonusPayment: added priority_withheld_amount, priority_unlocked_amount,
+                    priority_schedule_type. All default-zero/STANDARD so
+                    every existing constructor still works unchanged.
+    - RunContext: added prior_priority_withholdings_by_contract_staff,
+                  priority_quota_state, seen_priority_case_ids. The
+                  priority_quota_state and seen set are mutated in-place
+                  during the run by payment_timing — this is a deliberate
+                  exception to the otherwise-immutable RunContext, mirroring
+                  the existing pattern where dict contents (not the dict
+                  reference) are mutable inside a frozen dataclass.
 """
 
 from __future__ import annotations
@@ -19,6 +62,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import date
 from decimal import Decimal
+
+from backend.engine_runner.ytd_aggregator import PriorityYtdSnapshot
 
 
 # ---------------------------------------------------------------------------
@@ -103,25 +148,12 @@ class CaseInput:
     file_closed_date: date | None
 
     # --- Carry-over rate locking (Phase 6c) ---
-    # When ref_status_split.is_carry_over=Y, calc_tier uses this locked rate
-    # instead of doing a fresh lookup. Per Q3.4 (policy review):
-    # "carry-over rate locks at original calculation period." The data layer
-    # populates this when copying forward a case from a prior month's run.
     prior_month_rate: int | None = None
 
     # --- CO_SUB subscheme override (item 3 from post-Phase-6 backlog) ---
-    # Pattern Y: per-case override for the CO_SUB subscheme. Normally the
-    # engine resolves the subscheme from ref_staff_target for the
-    # (staff_id, role_id, office_id, year, month) combination. If this
-    # field is set, it takes precedence — useful when a CO_SUB processes
-    # a case under a subscheme different from their normal one for the
-    # month, without requiring a ref_staff_target update.
-    # Valid values: 'ENROL_ONLY_VISA_ONLY', 'ENROL_PLUS_VISA', or None.
     co_sub_subscheme_override: str | None = None
 
     # --- Prior payments (D1.R12) ---
-    # Key: (slot_label, staff_id) — e.g. ("counsellor", 12)
-    # Value: đồng already paid to that person on this case in prior months
     prior_payments_by_slot: dict[tuple[str, int], int] = field(default_factory=dict)
 
     # --- Addon items (drives addon_bonus) ---
@@ -142,29 +174,76 @@ class RunContext:
 
     targets_by_staff_office: monthly enrolment targets, same key shape.
 
-    enrolments_by_priority_partner_ytd: YTD enrolment counts per priority
-    partner for the run year. Key is priority_partner_id.
+    priority_ytd (Phase 8): year-to-date enrolment counts split by
+    channel (direct/sub/total) at both list and institution levels.
+    Replaces the prior pair of unsplit dicts. calc_priority reads:
 
-    NEW (Phase 6c — payment timing):
+        priority_ytd.list_count(list_id, channel)
+            for non-carve-out institutions, where channel is the slot's
+            role-mapped channel ('direct' for COUNS_DIR/CO_DIR slots,
+            'sub' for CO_SUB slots, or 'total' for the list's total
+            target gate)
+
+        priority_ytd.institution_count(list_id, inst_id, channel)
+            for carve-out institutions
+
+    Phase 6c — payment timing:
       clawback_balances_by_staff: §I.5.3 running clawback owed by each staff
         coming into this run. Key is staff_id, value is đồng owed (>= 0).
         Engine reads, applies to current-month payable, writes new balance
         to tx_clawback_balance.
 
-      prior_withholdings_by_case_staff: amounts withheld in prior runs that
-        should release this month under is_carry_over rules. Key is
-        (case_id, staff_id), value is đồng. Loaded by data layer from
-        tx_bonus_payment.withheld_amount in earlier runs.
+    Phase 7 carry-over key fix (renamed from prior_withholdings_by_case_staff):
+      prior_withholdings_by_contract_staff: amounts withheld in prior
+        runs that should release this month under is_carry_over rules.
+        Key is (contract_id, staff_id), value is đồng. The CONTRACT id
+        is the right key here — tx_case has a different case_id row for
+        every (contract, run_year, run_month) tuple, so a withholding
+        opened by Feb's case_id won't match April's case_id for the
+        same contract. Loaded by data layer from tx_carry_over_balance,
+        joined to tx_case to fetch contract_id.
+
+    Phase 12b — priority 25/25/50 split rule:
+      prior_priority_withholdings_by_contract_staff: parallel to
+        prior_withholdings_by_contract_staff but tracks the priority
+        portion withheld under SPLIT_25_25_50. Loaded from
+        tx_bonus_payment.priority_withheld_amount where the case has
+        not yet had its visa-receipt carry-over fire. Released in the
+        carry-over (a) multi-month branch.
+
+      priority_quota_state: running enrolment count keyed by
+        priority_list_institution_id. Loaded from tx_priority_quota_tracker
+        at run start, MUTATED IN PLACE by payment_timing as cases are
+        processed (this is the one explicit exception to the otherwise-
+        immutable RunContext — only the dict contents change, not the
+        dict reference). Persisted back to tx_priority_quota_tracker
+        by the engine_runner after all cases process.
+
+        Shape: {pli_id: {'count_direct': int, 'count_sub': int}}
+
+      seen_priority_case_ids: per-run set of case_ids that have already
+        had their priority quota incremented. Prevents double-counting
+        across multiple slot rows for the same case (counsellor +
+        case_officer + presales). Mutated in place. Reset per run.
     """
     year: int
     month: int
     enrolments_by_staff_office: dict[tuple[int, int], int]
     targets_by_staff_office: dict[tuple[int, int], int]
-    enrolments_by_priority_partner_ytd: dict[int, int] = field(default_factory=dict)
+
+    # Phase 8 — channel-split YTD snapshot (replaces the prior two dicts)
+    priority_ytd: PriorityYtdSnapshot = field(default_factory=PriorityYtdSnapshot)
 
     # Phase 6c additions
     clawback_balances_by_staff: dict[int, int] = field(default_factory=dict)
-    prior_withholdings_by_case_staff: dict[tuple[int, int], int] = field(default_factory=dict)
+
+    # Phase 7 carry-over key fix — keyed by (contract_id, staff_id), not (case_id, staff_id)
+    prior_withholdings_by_contract_staff: dict[tuple[str, int], int] = field(default_factory=dict)
+
+    # Phase 12b additions — priority 25/25/50 split rule
+    prior_priority_withholdings_by_contract_staff: dict[tuple[str, int], int] = field(default_factory=dict)
+    priority_quota_state: dict[int, dict] = field(default_factory=dict)
+    seen_priority_case_ids: set[int] = field(default_factory=set)
 
 
 # ---------------------------------------------------------------------------
@@ -181,18 +260,36 @@ class ReferenceData:
 
     Dict-based for O(1) lookups.
     """
+    # Core dimensions
     institutions: dict[int, dict] = field(default_factory=dict)
     countries: dict[int, dict] = field(default_factory=dict)
     offices: dict[int, dict] = field(default_factory=dict)
     roles: dict[int, dict] = field(default_factory=dict)
     staff: dict[int, dict] = field(default_factory=dict)
-    priority_partners: dict[int, dict] = field(default_factory=dict)
+    sub_agents: dict[int, dict] = field(default_factory=dict)
+
+    # Phase 7 — agreements & partners (replaces classification column)
+    institution_agreements: dict[int, dict] = field(default_factory=dict)
+    partners: dict[int, dict] = field(default_factory=dict)
+    partner_classifications: dict[int, dict] = field(default_factory=dict)
+    partner_flat_rates: dict[int, dict] = field(default_factory=dict)
+
+    # Phase 7 — priority structure (Group → List → Institution).
+    # Phase 12b note: ref_priority_group rows now carry priority_split_rule_type;
+    # payment_timing walks institution → list_institution → list → group to
+    # determine the active rule for a case.
+    priority_groups: dict[int, dict] = field(default_factory=dict)
+    priority_lists: dict[int, dict] = field(default_factory=dict)
+    priority_list_institutions: dict[int, dict] = field(default_factory=dict)
     priority_targets: dict[int, dict] = field(default_factory=dict)
+
+    # Rates & fees
     service_fees: dict[int, dict] = field(default_factory=dict)
     rates: dict[int, dict] = field(default_factory=dict)
     local_enrolment_bonuses: dict[int, dict] = field(default_factory=dict)
+
+    # Status & params
     status_splits: dict[str, dict] = field(default_factory=dict)
-    sub_agents: dict[int, dict] = field(default_factory=dict)
     calculation_params: dict[str, dict] = field(default_factory=dict)
 
     # Phase 6c additions
@@ -200,13 +297,7 @@ class ReferenceData:
     complaint_deductions: dict[str, dict] = field(default_factory=dict)
     contract_target_tiers: dict[int, dict] = field(default_factory=dict)
 
-    # Item 3 — Sub-agent CO scheme.
-    # Full ref_staff_target rows, indexed by row id. The
-    # resolve_co_sub_subscheme helper scans this for the matching
-    # (staff_id, role_id, office_id, year, month) tuple and reads
-    # the row's co_sub_subscheme. We don't pre-index by tuple
-    # because there are only ~hundreds of rows; linear scan is
-    # microseconds. Add an index in the data layer if it ever matters.
+    # Item 3 — Sub-agent CO scheme
     staff_targets: dict[int, dict] = field(default_factory=dict)
 
 
@@ -237,6 +328,18 @@ class BonusPayment:
                   - clawback_applied
                   - advance_offset         (D1.R12 prior payment)
 
+    Phase 12b — priority 25/25/50 split rule additions:
+      priority_withheld_amount: the portion of the at-enrolment priority
+        bonus deferred to the visa-receipt month. Non-zero only when
+        priority_schedule_type == 'SPLIT_25_25_50'. The carry-over
+        visa-receipt run releases this via priority_unlocked_amount.
+      priority_unlocked_amount: priority withhold released this run
+        from a prior SPLIT_25_25_50 case. Added to net_payable in the
+        carry-over branch.
+      priority_schedule_type: 'STANDARD' (default) or 'SPLIT_25_25_50'.
+        Locked at first-pay; not re-evaluated if quota state changes
+        between enrolment and visa.
+
     calc_notes: human-readable explanation of how this row was built.
     audit_json: full lookup trace (which rate row, which split row,
     which priority partner, etc.) for debugging and reconciliation.
@@ -263,8 +366,8 @@ class BonusPayment:
     gross_bonus: int                             # sum of components before timing
 
     # Phase 6c additions — payment timing
-    withheld_amount: int                         # held back this run
-    unlocked_amount: int                         # released this run (prior holds)
+    withheld_amount: int                         # held back this run (splittable)
+    unlocked_amount: int                         # released this run (prior splittable holds)
     clawback_applied: int                        # §I.5.3 clawback this run
     bank_transfer_required: bool                 # clawback couldn't be offset
 
@@ -273,3 +376,9 @@ class BonusPayment:
     # Audit
     calc_notes: str                              # human-readable trail
     audit_json: dict                             # full structured lookup trace
+
+    # Phase 12b additions — priority 25/25/50 split rule.
+    # Defaults provided so every existing constructor still works.
+    priority_withheld_amount: int = 0
+    priority_unlocked_amount: int = 0
+    priority_schedule_type: str = 'STANDARD'

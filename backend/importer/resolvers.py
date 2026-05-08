@@ -50,9 +50,29 @@ def resolve_country(cursor, raw: Optional[str]) -> Optional[int]:
 
 
 def resolve_office(cursor, raw: Optional[str]) -> Optional[int]:
+    """Office text -> dim_office.id.
+
+    Checks ref_office_alias first (catches CRM Refer Source Agent values
+    like 'StudyLink (Văn phòng chi nhánh Hà Nội)' and personal-name
+    variants like 'Hoang Le – VP Mel'), then falls back to dim_office
+    name/code for short canonical lookups ('HCM', 'Hanoi', etc.).
+
+    The alias-first order means an existing caller passing 'HCM' still
+    works (no alias row matches → falls through to dim_office.code).
+    """
     text = _normalize(raw)
     if not text:
         return None
+    # Try alias table first
+    cursor.execute(
+        """SELECT office_id FROM ref_office_alias
+           WHERE LOWER(alias) = LOWER(%s)""",
+        (text,),
+    )
+    row = cursor.fetchone()
+    if row:
+        return row["office_id"]
+    # Fallback: direct name/code lookup on dim_office
     cursor.execute(
         """SELECT id FROM dim_office
            WHERE LOWER(name) = LOWER(%s) OR LOWER(code) = LOWER(%s)""",
@@ -198,52 +218,7 @@ def resolve_staff_employment(cursor, staff_id: Optional[int]) -> Optional[str]:
     return row["employment_status"] if row else None
 
 
-# ---------------------------------------------------------------------------
-# Partner-institution junction helpers (Phase 6i / 6j)
-# ---------------------------------------------------------------------------
-
-def lookup_partner_institution_links(
-    cursor,
-    institution_id: Optional[int],
-    case_date: Optional[date] = None,
-) -> list[int]:
-    """Return all partner_ids actively linked to this institution at case_date.
-
-    The transformer uses this for two purposes:
-      1. When the CRM institution name has a single-asterisk suffix
-         (e.g. "X * - Navitas"), we resolve "Navitas" to a partner_id and
-         then verify that link is among the active links for X at case_date.
-      2. When the CRM has a bare asterisk (no suffix), we look up active
-         links and use the unique one if exactly one exists.
-
-    Args:
-        institution_id: resolved institution canonical id, or None.
-        case_date: the contract-signed date for the case. If None, returns
-            currently-open links (effective_to IS NULL). If a date, returns
-            links where effective_from <= case_date <= COALESCE(effective_to, infinity).
-
-    Returns:
-        List of partner_ids. Empty list if institution_id is None or no
-        links exist.
-    """
-    if institution_id is None:
-        return []
-
-    if case_date is None:
-        cursor.execute(
-            """SELECT partner_id
-               FROM ref_partner_institution
-               WHERE institution_id = %s AND effective_to IS NULL""",
-            (institution_id,),
-        )
-    else:
-        cursor.execute(
-            """SELECT partner_id
-               FROM ref_partner_institution
-               WHERE institution_id = %s
-                 AND effective_from <= %s
-                 AND (effective_to IS NULL OR effective_to >= %s)""",
-            (institution_id, case_date, case_date),
-        )
-
-    return [row["partner_id"] for row in cursor.fetchall()]
+# Note: lookup_partner_institution_links() was removed as part of
+# Phase7prep_v2_extension. Partner derivation from institution is now an
+# engine-runtime concern using ref_institution_agreement; the importer
+# records only what's explicitly in the CRM Refer Source Agent column.

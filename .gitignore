@@ -52,7 +52,7 @@ ehthumbs.db
 Desktop.ini
 $RECYCLE.BIN/
 
-# ----- Testing / coverage -----
+# ----- Testing / coverage (artifacts only — does NOT exclude tests/ source) -----
 .pytest_cache/
 .coverage
 htmlcov/
@@ -62,11 +62,14 @@ coverage.xml
 *.cover
 *.py,cover
 .hypothesis/
+test_baseline.txt
+test_collection.txt
+collect_only.txt
 
 # ----- Jupyter -----
-.ipynb_checkpoints
+.ipynb_checkpoints/
 
-# ----- Frontend (Node/React) -----
+# ----- Frontend (Node / Next.js) -----
 node_modules/
 npm-debug.log*
 yarn-debug.log*
@@ -75,6 +78,8 @@ yarn-error.log*
 .next/
 .nuxt/
 .cache/
+.turbo/
+frontend/out/
 
 # ----- Logs -----
 *.log
@@ -86,9 +91,17 @@ backend/logs/
 *.sqlite
 *.sqlite3
 
-# ----- Project-specific scratch -----
+# ----- Backup files -----
+*.bak
+*.tmp
+*_bak.py
+
+# ----- Project-specific scratch directories -----
 Supporting Content/
 DocumentReview/
 backend/docs/DocumentReview/
-*.bak
-*.tmp
+
+# ----- Regression outputs at repo root only (keeps backend/tools/regression_*.py tracked) -----
+/regression_*.xlsx
+/regression_*.csv
+/regression_*.ps1

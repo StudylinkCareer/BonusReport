@@ -4,41 +4,65 @@ backend/importer/transformer.py
 Convert a RawRow (from reader.py) into a CaseRecord ready for tx_case
 insertion, plus zero or more NoteRecords for tx_case_notes_staging.
 
-The transformer is where all the business rules live. It does NOT execute
-SQL writes — it only reads (via resolvers) and produces dataclasses.
+The transformer reads (via resolvers) and produces dataclasses. It does NOT
+execute SQL writes.
 
-Asterisk convention in institution names (corrected per chat 2026-05-03):
-  * (single)  : institution is reached via a routing partner. The partner
-                may be a Group OR a Master Agent — ref_partner.classification
-                determines which. If the CRM text includes a suffix
-                (e.g. "X * - Navitas"), the suffix names the specific partner.
-                If the suffix is missing (bare *), the partner is auto-resolved
-                from ref_partner_institution if exactly one active link
-                exists for this institution at the case date.
-  ** (double) : institution is OUT OF SYSTEM. No partner involvement.
-                referring_source_type = 'NONE'.
-  none        : use the Refer Source Agent CRM column to determine routing.
+KEY POLICY CHANGES (Phase7prep_v2_extension, 2026-05-05):
 
-Other locked policy decisions implemented here (do not re-derive):
-  * Role is intrinsic to the staff member, not the column. The Excel column
-    determines slot placement (counsellor_* vs case_officer_*); the role_id
+1. Asterisks in institution names are LEGACY DATA and should never be parsed
+   as syntax. They are alias variants — the team adds asterisk-decorated
+   forms to ref_institution_alias as needed. The transformer just looks up
+   the raw string in the alias table; if it doesn't resolve, the row gets
+   an UNRESOLVED_INSTITUTION warning and the team adds the alias.
+
+2. Routing partner (Group / Master Agent) is NOT recorded on tx_case from
+   institution name parsing. It is derivable at engine runtime from the
+   institution's active VIA_PARTNER agreement in ref_institution_agreement.
+
+3. The Refer Source Agent column is the ONLY source of routing info recorded
+   on tx_case. Resolution order (Phase 11b, 2026-05-08): office → sub_agent
+   → partner. Office-first protects against accidental matches when a
+   personal-name variant (e.g. 'Hoang Le – VP Mel') collides with a
+   sub-agent or partner string. If blank → OFFICE_ONLY with no
+   referring_office_id. If neither resolves → UNRESOLVED.
+
+4. System Type vs. agreement-existence cross-check (replaces the old
+   classification-based check):
+     - If System Type says "Trong hệ thống" (in-system) but institution has
+       no active agreement at contract_signed_date → mismatch
+     - If System Type says "Ngoài hệ thống" (out-of-system) but institution
+       DOES have an active agreement → mismatch
+
+5. CO_SUB slot rule (patch4): CO_SUB staff always populate the case_officer
+   slot, never the counsellor slot, regardless of which Excel column they
+   appeared in. Same-person-both-columns collapses to a single slot.
+   Different-person-each-column with the counsellor being CO_SUB triggers
+   a CO_SUB_SLOT_CONFLICT warning. This prevents the engine from emitting
+   two BonusPayment rows per case for sub-agent files.
+
+6. Departed-staff warning suppression (Phase 11b, 2026-05-08): when
+   DEPARTED_STAFF fires for a name in either staff column, the redundant
+   UNRESOLVED_COUNSELLOR / UNRESOLVED_CASE_OFFICER warning for the same
+   name is suppressed. The departed-staff list is the authoritative reason
+   the lookup misses; the second warning is noise.
+
+OTHER LOCKED POLICY (do not re-derive):
+  * Role is intrinsic to the staff member, not the column. The role_id
     always comes from ref_staff.primary_role_id.
   * Departed staff cases are marked SCRAP and skipped from engine processing.
-  * System Type vs institution.classification mismatch => WARN-MISMATCH.
-  * Office-only cases (asterisk_count == 0 and empty Refer Source) =>
+  * Office-only cases (empty Refer Source, no other partner signal) =>
     source_type='OFFICE_ONLY'.
 """
 
-import re
 from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Any, Optional
 
 from backend.importer.reader import RawRow
 from backend.importer.resolvers import (
-    lookup_partner_institution_links,
     resolve_country,
     resolve_institution,
+    resolve_office,
     resolve_partner,
     resolve_staff,
     resolve_staff_employment,
@@ -58,6 +82,9 @@ DEPARTED_STAFF_NAMES: frozenset[str] = frozenset({
 })
 
 INCENTIVE_THRESHOLD_VND = 5_000_000
+
+# Role identifiers (matches dim_role.id)
+ROLE_ID_CO_SUB = 18  # dim_role.code = 'CO_SUB' (D6.R6 sub-agent CO scheme)
 
 # CRM column keys
 COL_CONTRACT_ID = "Contract ID"
@@ -95,9 +122,6 @@ STATUS_WARN_MISMATCH = "WARN-MISMATCH"
 SYSTEM_TYPE_IN_VN = "Trong hệ thống"
 SYSTEM_TYPE_OUT_VN = "Ngoài hệ thống"
 
-CLASSIFICATION_IN_PREFIX = "IN_"
-CLASSIFICATION_OUT_PREFIX = "OUT_"
-
 
 # ---------------------------------------------------------------------------
 # Output dataclasses
@@ -116,6 +140,7 @@ class CaseRecord:
     institution_id: Optional[int]
     referring_partner_id: Optional[int]
     referring_sub_agent_id: Optional[int]
+    referring_office_id: Optional[int]
     institution_text_raw: Optional[str]
     referring_agent_text_raw: Optional[str]
     client_type_code: Optional[str]
@@ -141,37 +166,8 @@ class NoteRecord:
 
 
 # ---------------------------------------------------------------------------
-# Parsing helpers
+# Parsing helpers (value coercion only — no semantic parsing)
 # ---------------------------------------------------------------------------
-
-# Matches institution name with trailing asterisks and optional partner suffix.
-# Examples:
-#   "Eynesbury College * - Navitas"  -> ("Eynesbury College", "*",  "Navitas")
-#   "SAIBT *"                         -> ("SAIBT",             "*",  None)
-#   "Some College **"                 -> ("Some College",      "**", None)
-#   "Some College ** - Adventus"      -> ("Some College",      "**", "Adventus")  (rare)
-_INSTITUTION_PATTERN = re.compile(
-    r"^(?P<name>.+?)\s*(?P<stars>\*+)\s*(?:-\s*(?P<partner>.+?))?\s*$"
-)
-
-
-def _parse_institution_field(text: Optional[str]) -> tuple[Optional[str], int, Optional[str]]:
-    """Split an Institution Name cell into (cleaned_name, asterisk_count, partner_text)."""
-    if text is None:
-        return None, 0, None
-    s = str(text).strip()
-    if not s:
-        return None, 0, None
-    match = _INSTITUTION_PATTERN.match(s)
-    if not match:
-        return s, 0, None
-    name = match.group("name").strip()
-    stars = match.group("stars") or ""
-    partner = match.group("partner")
-    if not stars:
-        return s, 0, None
-    return name, len(stars), (partner.strip() if partner else None)
-
 
 def _parse_system_type(text: Optional[str]) -> Optional[str]:
     if text is None:
@@ -240,13 +236,40 @@ def _get_staff_office(cursor, staff_id: Optional[int]) -> Optional[int]:
     return row["home_office_id"] if row else None
 
 
-def _get_institution_classification(cursor, institution_id: int) -> Optional[str]:
-    cursor.execute(
-        "SELECT classification FROM ref_institution WHERE id = %s",
-        (institution_id,),
-    )
-    row = cursor.fetchone()
-    return row["classification"] if row else None
+def _has_active_agreement(
+    cursor,
+    institution_id: Optional[int],
+    case_date: Optional[date],
+) -> bool:
+    """Does this institution have an active agreement at the given date?
+
+    Used by the System Type cross-check. Returns True if at least one row in
+    ref_institution_agreement covers the case date for this institution.
+
+    If case_date is None we fall back to "currently active" (effective_to NULL
+    or in the future).
+    """
+    if institution_id is None:
+        return False
+
+    if case_date is None:
+        cursor.execute(
+            """SELECT 1 FROM ref_institution_agreement
+                WHERE institution_id = %s
+                  AND (effective_to IS NULL OR effective_to >= CURRENT_DATE)
+                LIMIT 1""",
+            (institution_id,),
+        )
+    else:
+        cursor.execute(
+            """SELECT 1 FROM ref_institution_agreement
+                WHERE institution_id = %s
+                  AND effective_from <= %s
+                  AND (effective_to IS NULL OR effective_to >= %s)
+                LIMIT 1""",
+            (institution_id, case_date, case_date),
+        )
+    return cursor.fetchone() is not None
 
 
 # ---------------------------------------------------------------------------
@@ -275,126 +298,6 @@ def _get_incentive_value(data: dict[str, Any]) -> Any:
         if header.startswith(COL_INCENTIVE_PREFIX):
             return value
     return None
-
-
-# ---------------------------------------------------------------------------
-# Asterisk routing — encapsulates the new partner-resolution logic
-# ---------------------------------------------------------------------------
-
-@dataclass(frozen=True)
-class _AsteriskRouting:
-    """Result of asterisk parsing and partner lookup.
-
-    partner_id           : resolved referring_partner_id, or None.
-    source_type          : one of the SOURCE_* constants.
-    notes                : list of NoteRecords to append for this row.
-    status_to_escalate   : a STATUS_* constant the caller should _escalate against.
-    """
-    partner_id: Optional[int]
-    source_type: str
-    notes: list
-    status_to_escalate: str
-
-
-def _route_via_asterisk(
-    cursor,
-    asterisk_count: int,
-    partner_suffix_text: Optional[str],
-    institution_id: Optional[int],
-    institution_text_raw: Optional[str],
-    contract_signed_date: Optional[date],
-    row_number: int,
-) -> _AsteriskRouting:
-    """Decide partner routing from the institution's asterisk markers.
-
-    See the file-level docstring for the asterisk convention.
-    """
-    notes: list = []
-
-    # ** (double asterisk) — out of system, no partner.
-    if asterisk_count == 2:
-        return _AsteriskRouting(
-            partner_id=None,
-            source_type=SOURCE_NONE,
-            notes=notes,
-            status_to_escalate=STATUS_OK,
-        )
-
-    # * (single asterisk) — routed via a partner.
-    if asterisk_count == 1:
-        if partner_suffix_text:
-            # Suffix names the specific partner.
-            partner_id = resolve_partner(cursor, partner_suffix_text)
-            if partner_id is None:
-                notes.append(NoteRecord(
-                    warning_type="UNRESOLVED_PARTNER_SUFFIX",
-                    raw_value=partner_suffix_text,
-                    note=(f"Row {row_number}: '* - {partner_suffix_text}' did not "
-                          f"resolve to a partner."),
-                ))
-                return _AsteriskRouting(None, SOURCE_UNRESOLVED, notes, STATUS_UNRESOLVED)
-
-            # Optional verification — flag a soft warning if the suffix-named
-            # partner doesn't have an active partner_institution link for this
-            # institution. This catches CRM typos / stale data without blocking.
-            if institution_id is not None:
-                active_partners = lookup_partner_institution_links(
-                    cursor, institution_id, contract_signed_date
-                )
-                if partner_id not in active_partners:
-                    notes.append(NoteRecord(
-                        warning_type="PARTNER_LINK_NOT_VERIFIED",
-                        raw_value=partner_suffix_text,
-                        note=(f"Row {row_number}: '{partner_suffix_text}' has no active "
-                              f"link to this institution at case date — using suffix anyway."),
-                    ))
-                    # Informational; do not escalate import_status.
-
-            return _AsteriskRouting(partner_id, SOURCE_PARTNER, notes, STATUS_OK)
-
-        # Bare * — auto-resolve via partner_institution links.
-        if institution_id is None:
-            notes.append(NoteRecord(
-                warning_type="BARE_ASTERISK_NO_INSTITUTION",
-                raw_value=institution_text_raw,
-                note=(f"Row {row_number}: bare * but institution did not resolve — "
-                      f"cannot auto-detect partner."),
-            ))
-            return _AsteriskRouting(None, SOURCE_UNRESOLVED, notes, STATUS_UNRESOLVED_PARTNER)
-
-        active_partners = lookup_partner_institution_links(
-            cursor, institution_id, contract_signed_date
-        )
-        if len(active_partners) == 1:
-            return _AsteriskRouting(active_partners[0], SOURCE_PARTNER, notes, STATUS_OK)
-        elif len(active_partners) == 0:
-            notes.append(NoteRecord(
-                warning_type="BARE_ASTERISK_NO_LINKS",
-                raw_value=institution_text_raw,
-                note=(f"Row {row_number}: bare * but institution has no active "
-                      f"partner links at case date."),
-            ))
-            return _AsteriskRouting(None, SOURCE_UNRESOLVED, notes, STATUS_UNRESOLVED_PARTNER)
-        else:
-            notes.append(NoteRecord(
-                warning_type="BARE_ASTERISK_AMBIGUOUS",
-                raw_value=institution_text_raw,
-                note=(f"Row {row_number}: bare * with multiple active partners "
-                      f"({len(active_partners)} candidates) — partner ambiguous."),
-            ))
-            return _AsteriskRouting(None, SOURCE_UNRESOLVED, notes, STATUS_UNRESOLVED_PARTNER)
-
-    # Three or more asterisks — undefined; flag and treat as UNRESOLVED.
-    if asterisk_count >= 3:
-        notes.append(NoteRecord(
-            warning_type="UNEXPECTED_ASTERISK_COUNT",
-            raw_value=institution_text_raw,
-            note=f"Row {row_number}: institution has {asterisk_count} asterisks; rule undefined.",
-        ))
-        return _AsteriskRouting(None, SOURCE_UNRESOLVED, notes, STATUS_UNRESOLVED)
-
-    # asterisk_count == 0 — caller handles via Refer Source Agent column.
-    return _AsteriskRouting(None, SOURCE_NONE, notes, STATUS_OK)
 
 
 # ---------------------------------------------------------------------------
@@ -441,10 +344,17 @@ def transform_row(
     counsellor_text = _string_or_none(data.get(COL_COUNSELLOR))
     case_officer_text = _string_or_none(data.get(COL_CASE_OFFICER))
 
-    if counsellor_text in DEPARTED_STAFF_NAMES or case_officer_text in DEPARTED_STAFF_NAMES:
+    # Track whether each slot's name is on the departed list. When True, we
+    # suppress the redundant UNRESOLVED_COUNSELLOR / UNRESOLVED_CASE_OFFICER
+    # warning for that slot — DEPARTED_STAFF is the authoritative reason and
+    # the second warning is noise (Phase 11b cleanup).
+    counsellor_is_departed = counsellor_text in DEPARTED_STAFF_NAMES
+    case_officer_is_departed = case_officer_text in DEPARTED_STAFF_NAMES
+
+    if counsellor_is_departed or case_officer_is_departed:
         notes.append(NoteRecord(
             warning_type="DEPARTED_STAFF",
-            raw_value=counsellor_text or case_officer_text,
+            raw_value=counsellor_text if counsellor_is_departed else case_officer_text,
             note=f"Row {raw.row_number}: case attributed to a departed staff member.",
         ))
         import_status = _escalate(import_status, STATUS_SCRAP)
@@ -452,14 +362,14 @@ def transform_row(
     counsellor_staff_id = resolve_staff(cursor, counsellor_text) if counsellor_text else None
     case_officer_staff_id = resolve_staff(cursor, case_officer_text) if case_officer_text else None
 
-    if counsellor_text and counsellor_staff_id is None:
+    if counsellor_text and counsellor_staff_id is None and not counsellor_is_departed:
         notes.append(NoteRecord(
             warning_type="UNRESOLVED_COUNSELLOR",
             raw_value=counsellor_text,
             note=f"Row {raw.row_number}: counsellor name not found in ref_staff.",
         ))
         import_status = _escalate(import_status, STATUS_UNRESOLVED)
-    if case_officer_text and case_officer_staff_id is None:
+    if case_officer_text and case_officer_staff_id is None and not case_officer_is_departed:
         notes.append(NoteRecord(
             warning_type="UNRESOLVED_CASE_OFFICER",
             raw_value=case_officer_text,
@@ -481,6 +391,41 @@ def transform_row(
                 note=f"Row {raw.row_number}: {label} marked DEPARTED in ref_staff.",
             ))
             import_status = _escalate(import_status, STATUS_SCRAP)
+
+    # ---- CO_SUB slot rule -------------------------------------------------
+    # CO_SUB staff always populate case_officer slot, never counsellor slot,
+    # regardless of which Excel column they appeared in. Per the locked
+    # policy decision: role is intrinsic to the staff member.
+    #
+    # Three cases this handles:
+    #   1. Same CO_SUB person in both columns (the typical sub-agent file
+    #      pattern, e.g. Phạm Thị Lợi cases): counsellor cleared,
+    #      case_officer keeps the staff.
+    #   2. CO_SUB in counsellor column only (case_officer empty): migrate
+    #      across — CO_SUB doesn't belong in counsellor slot.
+    #   3. CO_SUB in counsellor + different person in case_officer: keep
+    #      case_officer's existing staff, drop the CO_SUB from counsellor,
+    #      and surface a warning for operator review.
+    if counsellor_role_id == ROLE_ID_CO_SUB:
+        if case_officer_staff_id is None:
+            # Migrate counsellor → case_officer slot
+            case_officer_staff_id = counsellor_staff_id
+            case_officer_role_id = counsellor_role_id
+        elif case_officer_staff_id != counsellor_staff_id:
+            notes.append(NoteRecord(
+                warning_type="CO_SUB_SLOT_CONFLICT",
+                raw_value=f"counsellor={counsellor_text!r}, "
+                          f"case_officer={case_officer_text!r}",
+                note=(f"Row {raw.row_number}: Counsellor column has CO_SUB "
+                      f"staff {counsellor_text!r} but Case Officer column "
+                      f"has a different staff member {case_officer_text!r}. "
+                      f"The CO_SUB entry is being dropped from counsellor "
+                      f"slot per the CO_SUB-only-in-case_officer rule. "
+                      f"Verify intended assignment."),
+            ))
+        # All three branches: clear the counsellor slot
+        counsellor_staff_id = None
+        counsellor_role_id = None
 
     # ---- Office derivation ------------------------------------------------
     case_office_id = (
@@ -510,41 +455,43 @@ def transform_row(
     # ---- Dates we'll need ------------------------------------------------
     contract_signed_date = _coerce_date(data.get(COL_CONTRACT_SIGNED))
 
-    # ---- Institution parsing + resolution --------------------------------
+    # ---- Institution resolution (pure alias lookup, no asterisk parsing) -
+    # Asterisk-decorated forms are aliases. If "WSU College *" is in the alias
+    # table, it resolves. If not, log UNRESOLVED_INSTITUTION; the team adds
+    # the alias and the next import resolves cleanly.
     institution_raw = _string_or_none(data.get(COL_INSTITUTION))
-    inst_clean, asterisk_count, partner_suffix_text = _parse_institution_field(
-        data.get(COL_INSTITUTION)
-    )
-    institution_id = resolve_institution(cursor, inst_clean) if inst_clean else None
-    if inst_clean and institution_id is None:
+    institution_id = resolve_institution(cursor, institution_raw) if institution_raw else None
+    if institution_raw and institution_id is None:
         notes.append(NoteRecord(
             warning_type="UNRESOLVED_INSTITUTION",
             raw_value=institution_raw,
-            note=f"Row {raw.row_number}: institution not in ref_institution.",
+            note=(f"Row {raw.row_number}: institution {institution_raw!r} not in "
+                  f"ref_institution / ref_institution_alias. Add the variant as an "
+                  f"alias if it's a known institution."),
         ))
         import_status = _escalate(import_status, STATUS_UNRESOLVED)
 
-    # ---- Asterisk-based routing ------------------------------------------
-    routing = _route_via_asterisk(
-        cursor=cursor,
-        asterisk_count=asterisk_count,
-        partner_suffix_text=partner_suffix_text,
-        institution_id=institution_id,
-        institution_text_raw=institution_raw,
-        contract_signed_date=contract_signed_date,
-        row_number=raw.row_number,
-    )
-    notes.extend(routing.notes)
-    import_status = _escalate(import_status, routing.status_to_escalate)
-
-    referring_partner_id: Optional[int] = routing.partner_id
-    referring_sub_agent_id: Optional[int] = None
-    source_type = routing.source_type
-
-    # ---- Refer Source Agent fallback (only when no asterisk in name) -----
+    # ---- Refer Source Agent → routing ------------------------------------
+    # Resolution order (Phase 11b, 2026-05-08): office → sub_agent → partner.
+    # Office-first is intentional: a personal-name variant like
+    # 'Hoang Le – VP Mel' might collide with a sub-agent or partner
+    # name, and we want internal-office matches to take precedence.
+    #
+    # The institution's partner relationship (Group / Master Agent) is
+    # derivable at engine runtime from ref_institution_agreement; we do
+    # NOT record it on tx_case from institution name parsing.
     refer_text = _string_or_none(data.get(COL_REFER_SOURCE))
-    if asterisk_count == 0:
-        if not refer_text:
+    referring_partner_id: Optional[int] = None
+    referring_sub_agent_id: Optional[int] = None
+    referring_office_id: Optional[int] = None
+
+    if not refer_text:
+        # Blank Refer Source → office-only with no specific referring office
+        source_type = SOURCE_OFFICE_ONLY
+    else:
+        office_id = resolve_office(cursor, refer_text)
+        if office_id is not None:
+            referring_office_id = office_id
             source_type = SOURCE_OFFICE_ONLY
         else:
             sa_id = resolve_sub_agent(cursor, refer_text)
@@ -561,28 +508,35 @@ def transform_row(
                     notes.append(NoteRecord(
                         warning_type="UNRESOLVED_REFER_SOURCE",
                         raw_value=refer_text,
-                        note=f"Row {raw.row_number}: Refer Source Agent did not resolve.",
+                        note=(f"Row {raw.row_number}: Refer Source Agent "
+                              f"{refer_text!r} resolved to neither office, "
+                              f"sub-agent, nor partner."),
                     ))
                     import_status = _escalate(import_status, STATUS_UNRESOLVED)
 
-    # ---- System type vs institution.classification cross-check -----------
+    # ---- System Type vs agreement-existence cross-check -----------------
+    # In-system / out-of-system is now derived from whether the institution
+    # has an active agreement at the contract date (see Phase7prep_v2_extension).
     system_type = _parse_system_type(data.get(COL_SYSTEM_TYPE))
-    if institution_id is not None and system_type is not None:
-        classification = _get_institution_classification(cursor, institution_id)
-        if classification:
-            mismatch = (
-                (system_type == "IN" and not classification.startswith(CLASSIFICATION_IN_PREFIX))
-                or (system_type == "OUT" and not classification.startswith(CLASSIFICATION_OUT_PREFIX))
-            )
-            if mismatch:
-                notes.append(NoteRecord(
-                    warning_type="SYSTEM_TYPE_MISMATCH",
-                    raw_value=f"{data.get(COL_SYSTEM_TYPE)} vs {classification}",
-                    note=(f"Row {raw.row_number}: System Type "
-                          f"{data.get(COL_SYSTEM_TYPE)!r} disagrees with "
-                          f"institution classification {classification!r}."),
-                ))
-                import_status = _escalate(import_status, STATUS_WARN_MISMATCH)
+    if system_type is not None and institution_id is not None:
+        has_agreement = _has_active_agreement(
+            cursor, institution_id, contract_signed_date
+        )
+        mismatch = (
+            (system_type == "IN" and not has_agreement)
+            or (system_type == "OUT" and has_agreement)
+        )
+        if mismatch:
+            notes.append(NoteRecord(
+                warning_type="SYSTEM_TYPE_MISMATCH",
+                raw_value=f"{data.get(COL_SYSTEM_TYPE)} vs has_agreement={has_agreement}",
+                note=(f"Row {raw.row_number}: System Type "
+                      f"{data.get(COL_SYSTEM_TYPE)!r} disagrees with database "
+                      f"state (institution has "
+                      f"{'an active' if has_agreement else 'no active'} "
+                      f"agreement at case date)."),
+            ))
+            import_status = _escalate(import_status, STATUS_WARN_MISMATCH)
 
     # ---- Application status sanity check ---------------------------------
     application_status_text = _string_or_none(data.get(COL_APPLICATION_STATUS))
@@ -607,6 +561,7 @@ def transform_row(
         institution_id=institution_id,
         referring_partner_id=referring_partner_id,
         referring_sub_agent_id=referring_sub_agent_id,
+        referring_office_id=referring_office_id,
         institution_text_raw=institution_raw,
         referring_agent_text_raw=refer_text,
         client_type_code=_string_or_none(data.get(COL_CLIENT_TYPE)),

@@ -131,7 +131,7 @@ institution = next(
 )
 assert institution is not None, "No AU institution in ref_institution"
 print(f"  Institution:   {institution['canonical_name']} (id={institution['id']})")
-print(f"                  classification: {institution['classification']}")
+# print(f"                  classification: {institution['classification']}")
 
 # Find a status code that means "closed, visa granted, enrolled" — full bonus.
 status_code = _find_status(ref, "Visa granted (plus enrolled)")
@@ -221,7 +221,7 @@ ctx = RunContext(
         (counsellor_staff['id'], office['id']): 5,
         (co_staff['id'], office['id']): 5,
     },
-    enrolments_by_priority_partner_ytd={},
+    enrolments_by_priority_list_ytd={},
     clawback_balances_by_staff={},
     prior_withholdings_by_case_staff={},
 )

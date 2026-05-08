@@ -129,6 +129,22 @@ def calc_flat_local_bonus(
     if slot_label not in ('counsellor', 'case_officer'):
         return 0, {'applied': False, 'reason': f'slot_{slot_label}_ineligible'}
 
+    # CO_SUB sub-agent staff are paid via ref_rate (VN_*/FLAT bucket) for
+    # VN-domestic cases, NOT through ref_local_enrolment_bonus. The local
+    # rate card is keyed on counsellor-pairing patterns and doesn't carry
+    # a sub-agent share column. The orchestrator (calc.py) routes CO_SUB
+    # slots to calc_tier_bonus even when is_local_enrolment_case=True;
+    # this guard mirrors that decision so the audit reads cleanly.
+    role_code = (
+        ref.roles.get(slot.role_id, {}).get('code')
+        if slot.role_id is not None else None
+    )
+    if role_code == 'CO_SUB':
+        return 0, {
+            'applied': False,
+            'reason': 'co_sub_uses_ref_rate_for_local_enrolment',
+        }
+
     # Effective date — same policy as tier_bonus.
     as_of = case.contract_signed_date or case.fee_paid_date
     if as_of is None:

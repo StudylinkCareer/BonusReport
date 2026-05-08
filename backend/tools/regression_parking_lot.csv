@@ -1,0 +1,31 @@
+year,month,contract_id,staff,bao_cao_source,reason,escalated_on,escalation_status
+2024,1,SLC-13117,Phạm Thị Lợi,VP_ĐN,Bao cao only - not in CRM closed-file. VP ĐN office case.,2026-05-07,Awaiting feedback
+2024,1,SLC-13263,Phạm Thị Lợi,VP_ĐN,Bao cao only - not in CRM closed-file. VP ĐN office case.,2026-05-07,Awaiting feedback
+2024,1,SLC-13507,Phạm Thị Lợi,VP_ĐN,Bao cao only - not in CRM closed-file. VP ĐN office case.,2026-05-07,Awaiting feedback
+2024,3,SLC-11999,Phạm Thị Lợi,sub_Agent,Closed - Cancelled (zero-bonus). In CRM with WARN-MISMATCH at import. Both sides paid zero. Need feedback on what mismatched and whether to reclassify.,2026-05-07,Awaiting feedback
+2024,3,SLC-13403,Phạm Thị Lợi,VP_ĐN,Bao cao only - not in CRM closed-file. VP ĐN office case.,2026-05-07,Awaiting feedback
+2024,4,SLC-13314,Phạm Thị Lợi,VP_ĐN,Bao cao only - not in CRM closed-file. VP ĐN office case.,2026-05-07,Awaiting feedback
+2024,7,SLC-13777,Phạm Thị Lợi,sub_Agent,Bao cao tracks case in Jul but case in CRM has run_month=9. Engine processed it correctly in Sep. Bao cao multi-month tracking pattern needs feedback.,2026-05-07,Awaiting feedback
+2024,8,SLC-13771,Phạm Thị Lợi,VP_ĐN,Bao cao only - not in CRM closed-file. VP ĐN office case. Note: also has Section II contract bonus implications (Oct).,2026-05-07,Awaiting feedback
+2024,8,SLC-14111,Phạm Thị Lợi,sub_Agent,Bao cao only - not in CRM closed-file. Same shape as VP ĐN cases but appeared in sub_Agent variant.,2026-05-07,Awaiting feedback
+2024,9,SLC-13095,Phạm Thị Lợi,VP_ĐN,Bao cao only - not in CRM closed-file. VP ĐN office case.,2026-05-07,Awaiting feedback
+2024,9,SLC-14083,Phạm Thị Lợi,VP_ĐN,Bao cao only - not in CRM closed-file. VP ĐN office case.,2026-05-07,Awaiting feedback
+2024,10,SLC-13771,Phạm Thị Lợi,VP_ĐN,Bao cao only - not in CRM closed-file. VP ĐN office case. Section II contract bonus.,2026-05-07,Awaiting feedback
+2024,11,SLC-13177,Phạm Thị Lợi,VP_ĐN,Bao cao only - not in CRM closed-file. VP ĐN office case.,2026-05-07,Awaiting feedback
+2025,1,SLC-13689,Quan Hoàng Yến,VP_HN,Bao cao only - not in CRM closed-file. VP HN office case.,2026-05-07,Awaiting feedback
+2025,1,SLC-13829,Phạm Thị Lợi,VP_Hà_Nội,Bao cao only - not in CRM closed-file. VP Hà Nội office case. Cross-month tracked (also appears Feb 2025).,2026-05-07,Awaiting feedback
+2025,2,SLC-13636,Trần Thanh Gia Mẫn,VP_HN,Bao cao only - not in CRM closed-file. VP HN office case.,2026-05-07,Awaiting feedback
+2025,2,SLC-13829,Phạm Thị Lợi,VP_Hà_Nội,Bao cao only - not in CRM closed-file. VP Hà Nội office case. Cross-month tracked (also Jan 2025).,2026-05-07,Awaiting feedback
+2025,2,SLC-14085,Phạm Thị Lợi,VP_Hà_Nội,Bao cao only - not in CRM closed-file. VP Hà Nội office case.,2026-05-07,Awaiting feedback
+2025,2,SLC-14278,Trần Thanh Gia Mẫn,VP_HN,Bao cao only - not in CRM closed-file. VP HN office case.,2026-05-07,Awaiting feedback
+2025,3,SLC-12941,Trần Thanh Gia Mẫn,VP_HN,Bao cao only - not in CRM closed-file. VP HN office case.,2026-05-07,Awaiting feedback
+2025,3,SLC-13885,Trần Thanh Gia Mẫn,VP_HN,Bao cao only - not in CRM closed-file. VP HN office case.,2026-05-07,Awaiting feedback
+2025,3,SLC-13959,Trần Thanh Gia Mẫn,VP_HN,Bao cao only - not in CRM closed-file. VP HN office case.,2026-05-07,Awaiting feedback
+2025,3,SLC-14238,Phạm Thị Lợi,VP_HN,Bao cao only - not in CRM closed-file. VP HN office case.,2026-05-07,Awaiting feedback
+2025,4,SLC-13426,Phạm Thị Lợi,VP_DN,Bao cao only - not in CRM closed-file. VP DN office case. Cross-month tracked (also May 2025).,2026-05-07,Awaiting feedback
+2025,4,SLC-14211,Phạm Thị Lợi,sub_Agent,Bao cao only - not in CRM closed-file. Same shape as VP DN/HN cases but appeared in sub_Agent variant.,2026-05-07,Awaiting feedback
+2025,4,SLC-14231,Phạm Thị Lợi,VP_DN,Bao cao only - not in CRM closed-file. VP DN office case. Cross-month tracked (also Jun 2025).,2026-05-07,Awaiting feedback
+2025,5,SLC-13426,Phạm Thị Lợi,VP_Đà_Nẵng,Bao cao only - not in CRM closed-file. VP Đà Nẵng office case. Cross-month tracked (also Apr 2025).,2026-05-07,Awaiting feedback
+2025,6,SLC-14231,Phạm Thị Lợi,VP_Đà_Nẵng,Bao cao only - not in CRM closed-file. VP Đà Nẵng office case. Cross-month tracked (also Apr 2025).,2026-05-07,Awaiting feedback
+2025,9,SLC-14436,Phạm Thị Lợi,VP_ĐN,Bao cao only - not in CRM closed-file. VP ĐN office case.,2026-05-07,Awaiting feedback
+2025,9,SLC-14627,Phạm Thị Lợi,(CRM-only),CRM only - not tracked in any bao cao. Closed-Cancelled (zero-bonus). Engine and bao cao implicitly agree on zero. Inverse-direction divergence.,2026-05-07,Awaiting feedback

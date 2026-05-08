@@ -81,7 +81,7 @@ def _make_ref() -> ReferenceData:
         institutions=INSTITUTIONS,
         rates=RATES,
         service_fees=SERVICE_FEES,
-        priority_partners=PRIORITY_PARTNERS,
+        priority_lists=PRIORITY_PARTNERS,
         priority_targets=PRIORITY_TARGETS,
         status_splits=TIMING_NEUTRAL_STATUS_SPLITS,
         roles=TIMING_TEST_ROLES,
@@ -94,7 +94,7 @@ def _make_ctx() -> RunContext:
         year=2024, month=6,
         enrolments_by_staff_office={(10, 1): 2, (20, 1): 2, (30, 1): 2},
         targets_by_staff_office={(10, 1): 2, (20, 1): 2, (30, 1): 2},
-        enrolments_by_priority_partner_ytd={100: 10},
+        enrolments_by_priority_list_ytd={100: 10},
     )
 
 
