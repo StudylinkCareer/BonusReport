@@ -97,24 +97,33 @@ def list_cases(
         SELECT
             c.id,
             c.contract_id,
+            c.student_id,
             c.student_name,
             c.application_status,
-            c.application_date,
-            c.enrolment_date,
-            c.visa_date,
+            c.course_status,
+            c.import_status,
+            c.contract_signed_date,
+            c.course_start_date,
+            c.visa_received_date,
+            c.client_type_code,
+            c.handover_flag,
+            c.case_transition,
+            c.deferral_code,
             c.run_year,
             c.run_month,
-            c.import_status,
             c.created_at,
+            c.updated_at,
             inst.canonical_name       AS institution_name,
             cn.name                   AS country_name,
             counsellor.canonical_name AS counsellor_name,
-            co.canonical_name         AS case_officer_name
+            co.canonical_name         AS case_officer_name,
+            vp.canonical_name         AS vp_name
         FROM tx_case c
         LEFT JOIN ref_institution inst       ON c.institution_id        = inst.id
         LEFT JOIN dim_country     cn         ON c.country_id            = cn.id
         LEFT JOIN ref_staff       counsellor ON c.counsellor_staff_id   = counsellor.id
         LEFT JOIN ref_staff       co         ON c.case_officer_staff_id = co.id
+        LEFT JOIN ref_staff       vp         ON c.vp_staff_id           = vp.id
         WHERE c.run_year  = %s
           AND c.run_month = %s
           AND (
