@@ -34,6 +34,7 @@ app.add_middleware(
     allow_origins=[
         "http://localhost:3000",
         "http://localhost:5173",
+        "https://bonusreport.netlify.app",
     ],
     allow_credentials=False,
     allow_methods=["GET", "POST", "PUT", "DELETE"],
