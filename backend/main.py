@@ -17,8 +17,10 @@ sys.modules["backend"] = _backend_pkg
 from typing import Any, Optional
 
 from fastapi import Body, FastAPI, HTTPException, Path as PathParam, Query
+from psycopg.rows import dict_row
 
 from backend.data.connection import get_connection
+from backend.engine_runner.api_runner import run_engine_api
 
 
 app = FastAPI(title="BonusReport API")
@@ -352,6 +354,139 @@ def get_reference_list(list_name: str = PathParam(..., min_length=1)) -> dict:
         status_code=404,
         detail=f"Unknown reference list {list_name!r}. Available: {available}",
     )
+
+
+# ===========================================================================
+# Engine run — POST /api/engine/run
+# ===========================================================================
+
+@app.post("/api/engine/run")
+def run_engine_endpoint(body: dict = Body(default_factory=dict)) -> dict:
+    """
+    Run the bonus engine for a single (year, month) period.
+
+    Request body (JSON):
+        {
+            "year": 2024,
+            "month": 11,
+            "persist": true,         // optional, default true
+            "contract_id": "...",    // optional, debug a single case
+            "limit": 50              // optional, cap N cases
+        }
+
+    Response: result dict from run_engine_api with payment_count,
+    gross_total, net_total, skipped[], errored[], etc.
+
+    Errors:
+        400 — bad year/month/limit/contract_id
+        500 — engine raised mid-run (DB rolled back)
+    """
+    year = body.get("year")
+    month = body.get("month")
+    persist = bool(body.get("persist", True))
+    limit = body.get("limit")
+    contract_id = body.get("contract_id")
+
+    if not isinstance(year, int) or not isinstance(month, int):
+        raise HTTPException(400, "year and month must be integers")
+    if not (2020 <= year <= 2099):
+        raise HTTPException(400, "year out of range (2020–2099)")
+    if not (1 <= month <= 12):
+        raise HTTPException(400, "month must be 1–12")
+    if limit is not None and (not isinstance(limit, int) or limit < 1):
+        raise HTTPException(400, "limit must be a positive integer")
+    if contract_id is not None and not isinstance(contract_id, str):
+        raise HTTPException(400, "contract_id must be a string")
+
+    try:
+        return run_engine_api(
+            year=year,
+            month=month,
+            persist=persist,
+            limit=limit,
+            contract_id=contract_id,
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Engine run failed: {type(exc).__name__}: {exc}",
+        )
+
+
+# ===========================================================================
+# Bonus payments — GET /api/bonus
+# ===========================================================================
+
+@app.get("/api/bonus")
+def list_bonus_payments(
+    year: int = Query(..., ge=2020, le=2099, description="Run year"),
+    month: int = Query(..., ge=1, le=12, description="Run month 1–12"),
+    staff_id: Optional[int] = Query(None, description="Optional: filter to one staff"),
+) -> list[dict]:
+    """
+    All tx_bonus_payment rows for (year, month), with case/staff/role/
+    office/institution context joined for display.
+    """
+    sql = """
+        SELECT
+            bp.id,
+            bp.case_id,
+            bp.slot,
+            bp.staff_id,
+            bp.role_id,
+            bp.office_id,
+            bp.tier,
+            bp.target,
+            bp.actual_enrolled,
+            bp.base_rate,
+            bp.split_pct,
+            bp.tier_bonus,
+            bp.package_bonus,
+            bp.addon_bonus,
+            bp.priority_bonus,
+            bp.presales_share_taken,
+            bp.flat_local_enrolment_bonus,
+            bp.advance_offset,
+            bp.gross_bonus,
+            bp.net_payable,
+            bp.priority_withheld_amount,
+            bp.priority_unlocked_amount,
+            bp.priority_schedule_type,
+            bp.calc_notes,
+            bp.run_year,
+            bp.run_month,
+            bp.calculated_at,
+            c.contract_id,
+            c.student_name,
+            c.application_status,
+            c.course_status,
+            inst.canonical_name           AS institution_name,
+            staff.canonical_name          AS staff_name,
+            r.code                        AS role_code,
+            r.name                        AS role_name,
+            office.code                   AS office_code,
+            office.name                   AS office_name,
+            country.name                  AS country_name
+          FROM tx_bonus_payment bp
+          JOIN tx_case             c       ON bp.case_id      = c.id
+          LEFT JOIN ref_institution inst   ON c.institution_id = inst.id
+          LEFT JOIN ref_staff       staff  ON bp.staff_id     = staff.id
+          LEFT JOIN dim_role        r      ON bp.role_id      = r.id
+          LEFT JOIN dim_office      office ON bp.office_id    = office.id
+          LEFT JOIN dim_country     country ON c.country_id   = country.id
+         WHERE bp.run_year = %s AND bp.run_month = %s
+    """
+    params: list[Any] = [year, month]
+    if staff_id is not None:
+        sql += " AND bp.staff_id = %s"
+        params.append(staff_id)
+    sql += " ORDER BY staff.canonical_name NULLS LAST, c.contract_id, bp.slot"
+
+    with get_connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(sql, params)
+            return list(cur.fetchall())
+
 
 # Note: The duplicate inline @app.post("/api/imports") that previously lived
 # at the bottom of this file has been removed. The router-based version in

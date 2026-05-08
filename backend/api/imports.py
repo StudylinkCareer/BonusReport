@@ -3,17 +3,19 @@ backend/api/imports.py — CRM import endpoints.
 
 POST /api/imports
     Accept one or more CRM closed-file xlsx uploads. For each file:
-      1. Parse year/month from the filename (no manual input needed).
+      1. Parse year/month from the filename.
       2. Save to the persistent Railway volume at
          /data/imports/{year}/{month:02d}/{timestamp}_{filename}.
-      3. Run the importer pipeline against the saved file.
-      4. Record the run in tx_import_run (audit log + workflow anchor).
-      5. Return a per-file result (success or error) — one bad file
-         doesn't block the others.
+      3. Validate that the period inside the file (cell A1 / B1 header)
+         matches the period from the filename. If they disagree, the
+         file is REJECTED and the saved upload is deleted.
+      4. Run the importer pipeline against the saved file.
+      5. Record the run in tx_import_run (audit log + workflow anchor).
+      6. Return a per-file result. One bad file does not block the
+         others.
 
-    Engine is NOT auto-run. The user reviews cases via
-    GET /api/cases?year=Y&month=M and explicitly progresses the
-    workflow (build coming in a later migration).
+    Engine is NOT auto-run. The user reviews cases and triggers the
+    engine separately via POST /api/engine/run.
 
 The volume mount path is configurable via env var BONUSREPORT_DATA_DIR
 (default /data) so this works locally without a volume too.
@@ -24,7 +26,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -32,6 +33,11 @@ from fastapi import APIRouter, File, HTTPException, UploadFile
 
 from backend.data.connection import get_connection
 from backend.importer.orchestrator import run_file
+from backend.importer.period_validator import (
+    ReportPeriodMismatchError,
+    ReportPeriodNotFoundError,
+    validate_report_period,
+)
 from backend.importer.reader import parse_filename
 
 
@@ -58,7 +64,8 @@ router = APIRouter(prefix="/api/imports", tags=["imports"])
 
 @router.post("")
 async def upload_crm_reports(files: list[UploadFile] = File(...)) -> dict:
-    """Accept 1+ CRM xlsx uploads. Year/month derived from each filename.
+    """Accept 1+ CRM xlsx uploads. Year/month derived from each filename
+    AND validated against the period embedded in the file's header.
 
     Returns a per-file result list. Top-level summary counts successes
     and failures. One file's failure does not abort the rest.
@@ -136,8 +143,40 @@ async def _process_one_file(upload: UploadFile) -> dict:
         }
 
     log.info(
-        "Saved upload %s to %s (%d bytes), running importer for %d-%02d",
-        upload.filename, dest_path, len(content), year, month,
+        "Saved upload %s to %s (%d bytes), validating period header",
+        upload.filename, dest_path, len(content),
+    )
+
+    # ---- Period validation: report's embedded header vs filename ----------
+    # If the file's internal period header disagrees with what the filename
+    # claims, REJECT the file. The internal header is authoritative because
+    # filenames can be renamed by accident.
+    try:
+        report_period = validate_report_period(
+            dest_path, expected_year=year, expected_month=month,
+        )
+    except ReportPeriodNotFoundError as exc:
+        _safely_delete(dest_path)
+        return {
+            "success": False,
+            "filename": upload.filename,
+            "error": f"Period header missing: {exc!s}",
+            "filename_year": year,
+            "filename_month": month,
+        }
+    except ReportPeriodMismatchError as exc:
+        _safely_delete(dest_path)
+        return {
+            "success": False,
+            "filename": upload.filename,
+            "error": str(exc),
+            "filename_year": year,
+            "filename_month": month,
+        }
+
+    log.info(
+        "Period validated for %s: %d-%02d matches header. Running importer.",
+        upload.filename, year, month,
     )
 
     # Run the importer (it owns the DB connection and per-file transaction)
@@ -145,11 +184,7 @@ async def _process_one_file(upload: UploadFile) -> dict:
         result = run_file(dest_path, run_year=year, run_month=month)
     except Exception as exc:
         log.exception("run_file raised for %s", dest_path)
-        # Clean up the saved file so it isn't tracked as a successful import
-        try:
-            dest_path.unlink()
-        except OSError:
-            pass
+        _safely_delete(dest_path)
         return {
             "success": False,
             "filename": upload.filename,
@@ -167,8 +202,7 @@ async def _process_one_file(upload: UploadFile) -> dict:
             result=result,
         )
     except Exception as exc:
-        # The case data was inserted successfully; the audit-log row failed.
-        # Surface that as a partial success so the operator sees the issue.
+        # Cases were inserted; the audit-log row failed. Partial success.
         log.exception("tx_import_run insert failed for %s", dest_path)
         return {
             "success": True,
@@ -176,6 +210,7 @@ async def _process_one_file(upload: UploadFile) -> dict:
             "import_run_id": None,
             "run_year": year,
             "run_month": month,
+            "report_period": str(report_period),
             "file_path": str(dest_path),
             "summary": _summary_from_result(result),
             "errors": result.errors,
@@ -188,6 +223,7 @@ async def _process_one_file(upload: UploadFile) -> dict:
         "import_run_id": import_run_id,
         "run_year": year,
         "run_month": month,
+        "report_period": str(report_period),
         "file_path": str(dest_path),
         "summary": _summary_from_result(result),
         "errors": result.errors,
@@ -197,6 +233,14 @@ async def _process_one_file(upload: UploadFile) -> dict:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _safely_delete(path: Path) -> None:
+    """Best-effort delete used when an upload should not be retained."""
+    try:
+        path.unlink()
+    except OSError:
+        log.warning("Could not delete %s after rejection", path)
+
 
 def _summary_from_result(result) -> dict:
     return {
