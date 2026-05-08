@@ -4,12 +4,6 @@ StudyLink BonusReport API.
 Endpoints live under /api/* to match the Netlify proxy redirect.
 """
 # --- Make 'backend' importable as a package alias for the current dir ----
-# Railway sets the working directory to backend/ (via Root Directory),
-# which flattens backend/'s contents to /app/. So the literal folder
-# 'backend' doesn't exist on the filesystem there. The engine and
-# importer modules use `from backend.X import Y` style imports
-# throughout. Rather than rewrite every file, we register a synthetic
-# 'backend' package that points at the current directory.
 import sys
 import types
 from pathlib import Path
@@ -84,11 +78,6 @@ def list_staff() -> list[dict]:
 # Cases for review (extended — every reviewable column, all FKs joined)
 # ===========================================================================
 
-# Fields the user is allowed to edit via PATCH /api/cases/{id}.
-# Mirrors writer._INSERT_COLUMNS (importer-controlled fields), minus the
-# upsert conflict key (run_year, run_month) which would break re-imports
-# if changed. Adding referring_office_id from Phase 11a even though the
-# pasted writer.py predates that change — schema supports it.
 EDITABLE_FIELDS = {
     "contract_id", "student_id", "student_name",
     "contract_signed_date", "course_start_date", "visa_received_date",
@@ -110,13 +99,7 @@ def list_cases(
     year: int = Query(..., ge=2020, le=2030),
     month: int = Query(..., ge=1, le=12),
 ) -> list[dict]:
-    """
-    Cases for one (year, month). If staff_id provided, filtered to cases
-    where that staff appears in any role (counsellor, case officer, or VP).
-
-    Returns every reviewable column with human-readable FK values alongside
-    the raw IDs (so the frontend can both display and edit).
-    """
+    """Cases for one (year, month). Optionally filtered by staff_id (any role)."""
     where_extra = ""
     params: list[Any] = [year, month]
     if staff_id is not None:
@@ -153,61 +136,49 @@ def list_cases(
             c.created_at,
             c.updated_at,
 
-            -- Institution (resolved + raw text from the CRM)
             c.institution_id,
             inst.canonical_name        AS institution_name,
             c.institution_text_raw,
 
-            -- Country
             c.country_id,
             cn.name                    AS country_name,
 
-            -- Case office (where the case is processed)
             c.case_office_id,
             case_office.code           AS case_office_code,
 
-            -- Referring office (Phase 11a; lead source)
             c.referring_office_id,
             ref_office.code            AS referring_office_code,
 
-            -- Referring partner (Master Agent / Group)
             c.referring_partner_id,
-            partner.canonical_name     AS referring_partner_name,
+            partner.name               AS referring_partner_name,
+            partner.classification     AS referring_partner_classification,
 
-            -- Referring sub-agent
             c.referring_sub_agent_id,
             sub_agent.canonical_name   AS referring_sub_agent_name,
 
-            -- Raw text from CRM (preserve for audit)
             c.referring_agent_text_raw,
             c.referring_source_type,
 
-            -- Service fee (engine-resolved; display only)
             c.service_fee_id,
-            fee.label                  AS service_fee_label,
+            fee.service_code           AS service_fee_label,
 
-            -- Counsellor
             c.counsellor_staff_id,
             counsellor.canonical_name  AS counsellor_name,
             c.counsellor_role_id,
             counsellor_role.code       AS counsellor_role_code,
 
-            -- Case officer
             c.case_officer_staff_id,
             co.canonical_name          AS case_officer_name,
             c.case_officer_role_id,
             co_role.code               AS case_officer_role_code,
 
-            -- Presales (engine-managed; display only)
             c.presales_staff_id,
             presales.canonical_name    AS presales_name,
             c.presales_share_pct,
 
-            -- VP (engine-managed; display only)
             c.vp_staff_id,
             vp.canonical_name          AS vp_name,
 
-            -- Target owner (engine-managed)
             c.target_owner_staff_id,
             target_owner.canonical_name AS target_owner_name
 
@@ -247,19 +218,9 @@ def update_case(
     updates: dict[str, Any] = Body(
         ...,
         description="Partial dict of {field: new_value}. Only importer-controlled fields are accepted.",
-        example={"institution_id": 123, "import_status": "OK"},
     ),
 ) -> dict:
-    """
-    Update one or more importer-controlled fields on a single tx_case row.
-
-    Validation:
-      * Field names must be in EDITABLE_FIELDS (engine-managed fields rejected).
-      * Empty body → 400.
-      * Type coercion is delegated to psycopg — bad types raise a clean DB error.
-
-    Returns the updated row in the same shape as GET /api/cases.
-    """
+    """Update one or more importer-controlled fields on a single tx_case row."""
     if not updates:
         raise HTTPException(status_code=400, detail="Empty update body.")
 
@@ -282,7 +243,7 @@ def update_case(
         SET {', '.join(set_clauses)},
             updated_at = NOW()
         WHERE id = %(id)s
-        RETURNING id, run_year, run_month
+        RETURNING id
     """
 
     with get_connection() as conn:
@@ -297,16 +258,11 @@ def update_case(
                 raise HTTPException(status_code=404, detail=f"Case {case_id} not found.")
             conn.commit()
 
-    # Re-fetch the full row via list_cases logic so the response matches
-    # the GET shape exactly. Inefficient but consistent.
     return _fetch_one_case(case_id)
 
 
 def _fetch_one_case(case_id: int) -> dict:
     """Internal: fetch one case using the same JOINs as list_cases."""
-    # Same SELECT as list_cases but filtered by id. Keeping inline so any
-    # column-list change in list_cases automatically propagates here would
-    # be ideal, but for now this is a pragmatic copy of the column list.
     sql = """
         SELECT
             c.id, c.contract_id, c.student_id, c.student_name,
@@ -320,10 +276,12 @@ def _fetch_one_case(case_id: int) -> dict:
             c.country_id,             cn.name                  AS country_name,
             c.case_office_id,         case_office.code         AS case_office_code,
             c.referring_office_id,    ref_office.code          AS referring_office_code,
-            c.referring_partner_id,   partner.canonical_name   AS referring_partner_name,
+            c.referring_partner_id,
+            partner.name              AS referring_partner_name,
+            partner.classification    AS referring_partner_classification,
             c.referring_sub_agent_id, sub_agent.canonical_name AS referring_sub_agent_name,
             c.referring_agent_text_raw, c.referring_source_type,
-            c.service_fee_id,         fee.label                AS service_fee_label,
+            c.service_fee_id,         fee.service_code         AS service_fee_label,
             c.counsellor_staff_id,    counsellor.canonical_name AS counsellor_name,
             c.counsellor_role_id,     counsellor_role.code     AS counsellor_role_code,
             c.case_officer_staff_id,  co.canonical_name        AS case_officer_name,
@@ -362,12 +320,6 @@ def _fetch_one_case(case_id: int) -> dict:
 # Reference lists (dropdown options for the Review screen)
 # ===========================================================================
 
-# DB-backed reference lists. Each entry is a SQL query returning at minimum
-# {id, name}; some return extra columns (e.g. partner.classification) which
-# the frontend can use to group or filter.
-#
-# Naming: list_name in the URL path → SELECT below. Adding a new dropdown
-# is a one-line addition to this dict.
 REF_LIST_QUERIES: dict[str, str] = {
     "institutions": """
         SELECT id, canonical_name AS name
@@ -380,9 +332,9 @@ REF_LIST_QUERIES: dict[str, str] = {
         ORDER BY canonical_name
     """,
     "partners": """
-        SELECT id, canonical_name AS name
+        SELECT id, name, classification
         FROM ref_partner
-        ORDER BY canonical_name
+        ORDER BY name
     """,
     "offices": """
         SELECT id, code, name
@@ -417,8 +369,6 @@ REF_LIST_QUERIES: dict[str, str] = {
     """,
 }
 
-# Static enums for fields that don't have a dedicated reference table.
-# If the frontend needs more values, add them here.
 REF_LIST_STATIC: dict[str, list[str]] = {
     "source_types": ["DIRECT", "SUB_AGENT", "MASTER_AGENT", "GROUP", "OFFICE"],
     "import_statuses": ["OK", "UNRESOLVED", "FLAGGED", "SCRAP"],
@@ -427,13 +377,7 @@ REF_LIST_STATIC: dict[str, list[str]] = {
 
 @app.get("/api/reference/{list_name}")
 def get_reference_list(list_name: str = PathParam(..., min_length=1)) -> dict:
-    """
-    Return the options for a single dropdown.
-
-    Path parameter list_name dispatches to either a SQL query or a static
-    enum. Returns {"name": ..., "items": [...]}; for DB-backed lists each
-    item is a dict, for static lists each is a string.
-    """
+    """Return options for a single dropdown."""
     if list_name in REF_LIST_QUERIES:
         with get_connection() as conn:
             with conn.cursor() as cur:
@@ -452,9 +396,6 @@ def get_reference_list(list_name: str = PathParam(..., min_length=1)) -> dict:
 
 # ===========================================================================
 # CRM Excel upload → importer pipeline
-# (Note: also exposed via backend.api.imports.router — see top of file.
-#  This duplicate endpoint is kept for safety; remove once the router
-#  version is verified to be the one serving traffic.)
 # ===========================================================================
 
 @app.post("/api/imports")
