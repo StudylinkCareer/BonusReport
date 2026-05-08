@@ -21,8 +21,11 @@ sys.modules["backend"] = _backend_pkg
 # ------------------------------------------------------------------------
 
 import tempfile
+from datetime import date
+from typing import Optional
 
 from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
+from pydantic import BaseModel
 
 from backend.data.connection import get_connection
 from backend.importer.orchestrator import run_file
