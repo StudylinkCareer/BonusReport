@@ -209,6 +209,14 @@ export default function ImportPage() {
                 </ul>
               </div>
             )}
+            {staffId && (
+              <a
+                href={`/import/review?staff_id=${staffId}&year=${result.year}&month=${result.month}`}
+                className="inline-block mt-4 px-4 py-2 bg-blue-600 text-white rounded font-medium hover:bg-blue-700"
+              >
+                Review imported cases →
+              </a>
+            )}
           </div>
         )}
       </div>
