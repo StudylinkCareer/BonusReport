@@ -222,7 +222,7 @@ export default function UploadPage() {
                         : null}
                     </div>
                     <button
-                      onClick={() => router.push(`/import/review/${r.run_year}/${r.run_month}`)}
+                      onClick={() => router.push(`/import/review?year=${r.run_year}&month=${r.run_month}`)}
                       className="rounded bg-blue-600 px-3 py-1 text-xs text-white"
                     >
                       Review →

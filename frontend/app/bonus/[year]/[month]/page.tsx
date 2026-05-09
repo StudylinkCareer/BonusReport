@@ -173,7 +173,7 @@ export default function BonusReportPage({
         </div>
         <div className="flex items-center gap-2">
           <Link
-            href={`/import/review/${year}/${month}`}
+            href={`/import/review?year=${year}&month=${month}`}
             className="text-sm text-blue-600 hover:underline"
           >
             ← Review imports
