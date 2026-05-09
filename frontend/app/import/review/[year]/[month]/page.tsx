@@ -239,8 +239,7 @@ export default function ReviewPage() {
         const next: RefData = { ...EMPTY_REF };
         for (let i = 0; i < lists.length; i++) {
           const name = lists[i] as keyof RefData;
-          // @ts-expect-error indexing dynamic key
-          next[name] = results[i].items;
+          (next as Record<string, unknown>)[name] = results[i].items;
         }
         setRefData(next);
         setRefReady(true);
