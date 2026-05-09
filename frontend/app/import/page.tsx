@@ -29,6 +29,7 @@ type FileResult = {
   import_run_id?: number
   run_year?: number
   run_month?: number
+  staff_id?: number | null
   file_path?: string
   summary?: FileSummary
   errors?: string[]
@@ -222,7 +223,15 @@ export default function UploadPage() {
                         : null}
                     </div>
                     <button
-                      onClick={() => router.push(`/import/review?year=${r.run_year}&month=${r.run_month}`)}
+                      onClick={() => {
+                        const params = new URLSearchParams({
+                          year: String(r.run_year),
+                          month: String(r.run_month),
+                        });
+                        if (r.staff_id) params.set('staff_id', String(r.staff_id));
+                        router.push(`/import/review?${params.toString()}`);
+                      }}
+                      
                       className="rounded bg-blue-600 px-3 py-1 text-xs text-white"
                     >
                       Review →
