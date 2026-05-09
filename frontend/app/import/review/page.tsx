@@ -25,6 +25,7 @@
  */
 
 import {
+  CSSProperties,
   FormEvent,
   KeyboardEvent,
   ReactNode,
@@ -114,7 +115,7 @@ type RefData = {
   partners: RefItem[];
   offices: RefItem[];
   countries: RefItem[];
-  staff_active: RefItem[];
+  staff_all: RefItem[];
   statuses: RefItem[];
   source_types: string[];
   import_statuses: string[];
@@ -126,7 +127,7 @@ const EMPTY_REF: RefData = {
   partners: [],
   offices: [],
   countries: [],
-  staff_active: [],
+  staff_all: [],
   statuses: [],
   source_types: [],
   import_statuses: [],
@@ -222,7 +223,7 @@ export default function ReviewPage() {
         'partners',
         'offices',
         'countries',
-        'staff_active',
+        'staff_all',
         'statuses',
         'source_types',
         'import_statuses',
@@ -611,15 +612,24 @@ type CommonProps = {
   onSave: (caseId: number, updates: Record<string, unknown>) => Promise<void>;
 };
 
+// Fixed widths (px) for the three sticky columns. Cumulative lefts must
+// match the running total so columns butt up perfectly with no gap.
+const STICKY_W = { status: 140, contract: 130, student: 220 } as const;
+const STICKY_L = {
+  status: 0,
+  contract: STICKY_W.status,
+  student: STICKY_W.status + STICKY_W.contract,
+} as const;
+
 function CasesTable({ cases, refData, onSave }: { cases: Case[] } & CommonProps) {
   return (
-    <div className="overflow-x-auto">
+    <div className="overflow-auto max-h-[calc(100vh-280px)] border border-gray-200 rounded">
       <table className="w-full text-sm">
-        <thead className="bg-gray-50 border-b border-gray-200 text-xs uppercase tracking-wide">
+        <thead className="bg-gray-50 border-b border-gray-200 text-xs uppercase tracking-wide sticky top-0 z-20">
           <tr>
-            <Th sticky left={0}>Status</Th>
-            <Th sticky left={110}>Contract</Th>
-            <Th sticky left={230}>Student</Th>
+            <Th sticky left={STICKY_L.status}    width={STICKY_W.status}>Status</Th>
+            <Th sticky left={STICKY_L.contract}  width={STICKY_W.contract}>Contract</Th>
+            <Th sticky left={STICKY_L.student}   width={STICKY_W.student}>Student</Th>
             <Th>Student ID</Th>
             <Th>Signed</Th>
             <Th>Client Type</Th>
@@ -658,7 +668,7 @@ function CaseRow({
 
   return (
     <tr className={`${rowBg} border-b border-gray-100 align-top`}>
-      <Td sticky left={0} bg={stickyBg}>
+      <Td sticky left={STICKY_L.status} width={STICKY_W.status} bg={stickyBg}>
         <SelectCell
           value={c.import_status}
           options={refData.import_statuses}
@@ -672,14 +682,14 @@ function CaseRow({
           onSave={(v) => save({ import_status: v })}
         />
       </Td>
-      <Td sticky left={110} bg={stickyBg}>
+      <Td sticky left={STICKY_L.contract} width={STICKY_W.contract} bg={stickyBg}>
         <TextCell
           value={c.contract_id}
           monospace
           onSave={(v) => save({ contract_id: v })}
         />
       </Td>
-      <Td sticky left={230} bg={stickyBg}>
+      <Td sticky left={STICKY_L.student} width={STICKY_W.student} bg={stickyBg}>
         <TextCell value={c.student_name} onSave={(v) => save({ student_name: v })} />
       </Td>
       <Td>
@@ -749,7 +759,7 @@ function CaseRow({
         <StaffCell
           staffId={c.counsellor_staff_id}
           staffName={c.counsellor_name}
-          options={refData.staff_active}
+          options={refData.staff_all}
           onSave={(staffId, roleId) =>
             save({
               counsellor_staff_id: staffId,
@@ -762,7 +772,7 @@ function CaseRow({
         <StaffCell
           staffId={c.case_officer_staff_id}
           staffName={c.case_officer_name}
-          options={refData.staff_active}
+          options={refData.staff_all}
           onSave={(staffId, roleId) =>
             save({
               case_officer_staff_id: staffId,
@@ -780,7 +790,7 @@ function CaseRow({
           onSave={(id) => save({ case_office_id: id })}
         />
       </Td>
-      <Td>
+      <Td wrap>
         <TextAreaCell value={c.notes} onSave={(v) => save({ notes: v })} />
       </Td>
     </tr>
@@ -887,7 +897,7 @@ function CaseCard({
           <StaffCell
             staffId={c.counsellor_staff_id}
             staffName={c.counsellor_name}
-            options={refData.staff_active}
+            options={refData.staff_all}
             onSave={(staffId, roleId) =>
               save({
                 counsellor_staff_id: staffId,
@@ -900,7 +910,7 @@ function CaseCard({
           <StaffCell
             staffId={c.case_officer_staff_id}
             staffName={c.case_officer_name}
-            options={refData.staff_active}
+            options={refData.staff_all}
             onSave={(staffId, roleId) =>
               save({
                 case_officer_staff_id: staffId,
@@ -1270,10 +1280,6 @@ function FkCell({
 }) {
   const { state, setState, error, setError, editing, setEditing } = useCellState();
   const [draft, setDraft] = useState(label ?? '');
-  const datalistId = useMemo(
-    () => `dl-${Math.random().toString(36).slice(2, 10)}`,
-    [],
-  );
 
   useEffect(() => {
     setDraft(label ?? '');
@@ -1329,7 +1335,7 @@ function FkCell({
         onClick={() => {
           setEditing(true);
           setError(null);
-          setDraft(label ?? '');
+          setDraft(''); // empty draft → show all options
         }}
       >
         {label || DASH}
@@ -1337,14 +1343,38 @@ function FkCell({
     );
   }
 
+  const lcDraft = draft.trim().toLowerCase();
+  const filtered = lcDraft
+    ? options.filter((o) => {
+        const txt = (labelField === 'code' ? o.code : o.name) ?? '';
+        return txt.toLowerCase().includes(lcDraft);
+      })
+    : options;
+
+  function pick(o: RefItem) {
+    if (o.id === value) {
+      setEditing(false);
+      return;
+    }
+    setState('saving');
+    setError(null);
+    onSave(o.id)
+      .then(() => {
+        setEditing(false);
+        setState('idle');
+      })
+      .catch((e) => {
+        setError(String(e instanceof Error ? e.message : e));
+        setState('error');
+      });
+  }
+
   return (
     <div className="relative">
       <input
         autoFocus
-        list={datalistId}
         value={draft}
         onChange={(e) => setDraft(e.target.value)}
-        onBlur={commit}
         onKeyDown={(e) => {
           if (e.key === 'Enter') commit();
           else if (e.key === 'Escape') {
@@ -1355,13 +1385,37 @@ function FkCell({
         }}
         disabled={state === 'saving'}
         className={INPUT_BASE}
-        placeholder={`type to search… (${options.length})`}
+        placeholder={`type to search… (${options.length} options)`}
       />
-      <datalist id={datalistId}>
-        {options.map((o) => (
-          <option key={o.id} value={(labelField === 'code' ? o.code : o.name) ?? ''} />
-        ))}
-      </datalist>
+      <div className="absolute left-0 right-0 top-full mt-1 max-h-64 overflow-y-auto bg-white border border-gray-200 rounded shadow-lg z-30">
+        {filtered.length === 0 ? (
+          <div className="px-3 py-2 text-xs text-gray-400">No matches</div>
+        ) : (
+          filtered.slice(0, 200).map((o) => {
+            const txt = (labelField === 'code' ? o.code : o.name) ?? '';
+            const isCurrent = o.id === value;
+            return (
+              <div
+                key={o.id}
+                onMouseDown={(e) => {
+                  e.preventDefault(); // prevent input blur before click registers
+                  pick(o);
+                }}
+                className={`px-3 py-1.5 text-sm cursor-pointer hover:bg-blue-50 ${
+                  isCurrent ? 'bg-blue-100 font-medium' : ''
+                }`}
+              >
+                {txt}
+              </div>
+            );
+          })
+        )}
+        {filtered.length > 200 && (
+          <div className="px-3 py-1.5 text-xs text-gray-400 border-t border-gray-100">
+            … and {filtered.length - 200} more. Refine the search.
+          </div>
+        )}
+      </div>
       <ErrorTooltip error={error} />
     </div>
   );
@@ -1381,10 +1435,6 @@ function StaffCell({
 }) {
   const { state, setState, error, setError, editing, setEditing } = useCellState();
   const [draft, setDraft] = useState(staffName ?? '');
-  const datalistId = useMemo(
-    () => `dl-${Math.random().toString(36).slice(2, 10)}`,
-    [],
-  );
 
   useEffect(() => {
     setDraft(staffName ?? '');
@@ -1438,7 +1488,7 @@ function StaffCell({
         onClick={() => {
           setEditing(true);
           setError(null);
-          setDraft(staffName ?? '');
+          setDraft(''); // empty draft → show all staff
         }}
       >
         {staffName || DASH}
@@ -1446,14 +1496,35 @@ function StaffCell({
     );
   }
 
+  const lcDraft = draft.trim().toLowerCase();
+  const filtered = lcDraft
+    ? options.filter((o) => (o.name ?? '').toLowerCase().includes(lcDraft))
+    : options;
+
+  function pick(o: typeof options[number]) {
+    if (o.id === staffId) {
+      setEditing(false);
+      return;
+    }
+    setState('saving');
+    setError(null);
+    onSave(o.id, o.primary_role_id ?? null)
+      .then(() => {
+        setEditing(false);
+        setState('idle');
+      })
+      .catch((e) => {
+        setError(String(e instanceof Error ? e.message : e));
+        setState('error');
+      });
+  }
+
   return (
     <div className="relative">
       <input
         autoFocus
-        list={datalistId}
         value={draft}
         onChange={(e) => setDraft(e.target.value)}
-        onBlur={commit}
         onKeyDown={(e) => {
           if (e.key === 'Enter') commit();
           else if (e.key === 'Escape') {
@@ -1466,11 +1537,34 @@ function StaffCell({
         className={INPUT_BASE}
         placeholder={`type to search… (${options.length} staff)`}
       />
-      <datalist id={datalistId}>
-        {options.map((o) => (
-          <option key={o.id} value={o.name ?? ''} />
-        ))}
-      </datalist>
+      <div className="absolute left-0 right-0 top-full mt-1 max-h-64 overflow-y-auto bg-white border border-gray-200 rounded shadow-lg z-30">
+        {filtered.length === 0 ? (
+          <div className="px-3 py-2 text-xs text-gray-400">No matches</div>
+        ) : (
+          filtered.slice(0, 200).map((o) => {
+            const isCurrent = o.id === staffId;
+            return (
+              <div
+                key={o.id}
+                onMouseDown={(e) => {
+                  e.preventDefault();
+                  pick(o);
+                }}
+                className={`px-3 py-1.5 text-sm cursor-pointer hover:bg-blue-50 ${
+                  isCurrent ? 'bg-blue-100 font-medium' : ''
+                }`}
+              >
+                {o.name}
+              </div>
+            );
+          })
+        )}
+        {filtered.length > 200 && (
+          <div className="px-3 py-1.5 text-xs text-gray-400 border-t border-gray-100">
+            … and {filtered.length - 200} more. Refine the search.
+          </div>
+        )}
+      </div>
       <ErrorTooltip error={error} />
     </div>
   );
@@ -1642,19 +1736,27 @@ function Th({
   children,
   sticky,
   left,
+  width,
 }: {
   children: ReactNode;
   sticky?: boolean;
   left?: number;
+  width?: number;
 }) {
   const stickyCls = sticky
-    ? `sticky bg-gray-50 z-10 border-r border-gray-200 shadow-[2px_0_2px_-2px_rgba(0,0,0,0.05)]`
+    ? `sticky bg-gray-50 z-10 border-r border-gray-200 shadow-[2px_0_2px_-2px_rgba(0,0,0,0.05)] overflow-hidden`
     : '';
-  const style = sticky && left !== undefined ? { left } : undefined;
+  const style: CSSProperties = {};
+  if (sticky && left !== undefined) style.left = left;
+  if (width !== undefined) {
+    style.width = width;
+    style.minWidth = width;
+    style.maxWidth = width;
+  }
   return (
     <th
       className={`px-3 py-2 text-left font-medium text-gray-600 whitespace-nowrap ${stickyCls}`}
-      style={style}
+      style={Object.keys(style).length ? style : undefined}
     >
       {children}
     </th>
@@ -1666,18 +1768,32 @@ function Td({
   sticky,
   left,
   bg,
+  width,
+  wrap,
 }: {
   children: ReactNode;
   sticky?: boolean;
   left?: number;
   bg?: string;
+  width?: number;
+  wrap?: boolean;
 }) {
   const stickyCls = sticky
-    ? `sticky z-10 border-r border-gray-200 ${bg ?? 'bg-white'} shadow-[2px_0_2px_-2px_rgba(0,0,0,0.05)]`
+    ? `sticky z-10 border-r border-gray-200 ${bg ?? 'bg-white'} shadow-[2px_0_2px_-2px_rgba(0,0,0,0.05)] overflow-hidden`
     : '';
-  const style = sticky && left !== undefined ? { left } : undefined;
+  const wrapCls = wrap ? '' : 'whitespace-nowrap';
+  const style: CSSProperties = {};
+  if (sticky && left !== undefined) style.left = left;
+  if (width !== undefined) {
+    style.width = width;
+    style.minWidth = width;
+    style.maxWidth = width;
+  }
   return (
-    <td className={`px-3 py-2 ${stickyCls}`} style={style}>
+    <td
+      className={`px-3 py-2 ${wrapCls} ${stickyCls}`}
+      style={Object.keys(style).length ? style : undefined}
+    >
       {children}
     </td>
   );
