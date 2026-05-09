@@ -790,7 +790,7 @@ function CaseRow({
           onSave={(id) => save({ case_office_id: id })}
         />
       </Td>
-      <Td wrap>
+      <Td>
         <TextAreaCell value={c.notes} onSave={(v) => save({ notes: v })} />
       </Td>
     </tr>
@@ -1084,7 +1084,8 @@ function TextAreaCell({
   if (!editing) {
     return (
       <div
-        className={EDITABLE_BASE + ' whitespace-pre-wrap text-xs max-w-[300px]'}
+        className={EDITABLE_BASE + ' text-xs'}
+        title={value ?? undefined}
         onClick={() => {
           setEditing(true);
           setError(null);
