@@ -47,6 +47,7 @@ from pathlib import Path
 from typing import Any, Iterable, Iterator, Optional
 
 from backend.data.connection import get_connection
+from backend.importer.cached_resolvers import ResolverCache
 from backend.importer.consolidated_reader import iter_filtered_rows
 from backend.importer.reader import RawRow
 from backend.importer.transformer import NoteRecord, transform_row
@@ -204,53 +205,54 @@ def run_consolidated(
                 if truncate_first:
                     truncate_tx_case(cursor)
 
-                row_iter = iter_filtered_rows(
-                    path,
-                    staff_names_lower=staff_names_lower,
-                    contract_signed_from=contract_signed_from,
-                    contract_signed_to=contract_signed_to,
-                    visa_received_from=visa_received_from,
-                    visa_received_to=visa_received_to,
-                    course_start_from=course_start_from,
-                    course_start_to=course_start_to,
-                    limit=limit,
-                )
+                with ResolverCache(cursor):
+                    row_iter = iter_filtered_rows(
+                        path,
+                        staff_names_lower=staff_names_lower,
+                        contract_signed_from=contract_signed_from,
+                        contract_signed_to=contract_signed_to,
+                        visa_received_from=visa_received_from,
+                        visa_received_to=visa_received_to,
+                        course_start_from=course_start_from,
+                        course_start_to=course_start_to,
+                        limit=limit,
+                    )
 
-                for raw in row_iter:
-                    result.rows_seen += 1
-                    period = derive_run_period(raw.data)
+                    for raw in row_iter:
+                        result.rows_seen += 1
+                        period = derive_run_period(raw.data)
 
-                    if period.year is None:
-                        # Skip; log an orphan note so it shows up downstream
-                        result.rows_period_unresolved += 1
-                        if len(result.period_failures) < 10:
-                            result.period_failures.append(
-                                f"row {raw.row_number} (contract={raw.data.get('Contract ID')!r}): "
-                                f"{period.failure_reason}"
+                        if period.year is None:
+                            # Skip; log an orphan note so it shows up downstream
+                            result.rows_period_unresolved += 1
+                            if len(result.period_failures) < 10:
+                                result.period_failures.append(
+                                    f"row {raw.row_number} (contract={raw.data.get('Contract ID')!r}): "
+                                    f"{period.failure_reason}"
+                                )
+                            notes = [
+                                NoteRecord(
+                                    warning_type="period_unresolved",
+                                    raw_value=str(raw.data.get("Application Report Status") or ""),
+                                    note=period.failure_reason or "",
+                                )
+                            ]
+                            write_transformer_output(
+                                cursor, None, notes,
+                                run_year=0, run_month=0,  # sentinel; orphan note only
+                                result=result.write,
                             )
-                        notes = [
-                            NoteRecord(
-                                warning_type="period_unresolved",
-                                raw_value=str(raw.data.get("Application Report Status") or ""),
-                                note=period.failure_reason or "",
-                            )
-                        ]
+                            continue
+
+                        record, notes = transform_row(
+                            cursor, raw,
+                            run_year=period.year, run_month=period.month,
+                        )
                         write_transformer_output(
-                            cursor, None, notes,
-                            run_year=0, run_month=0,  # sentinel; orphan note only
+                            cursor, record, notes,
+                            run_year=period.year, run_month=period.month,
                             result=result.write,
                         )
-                        continue
-
-                    record, notes = transform_row(
-                        cursor, raw,
-                        run_year=period.year, run_month=period.month,
-                    )
-                    write_transformer_output(
-                        cursor, record, notes,
-                        run_year=period.year, run_month=period.month,
-                        result=result.write,
-                    )
 
                 if own_conn:
                     active_conn.commit()
