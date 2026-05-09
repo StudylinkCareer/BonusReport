@@ -148,7 +148,7 @@ export default function ImportsListPage() {
                   <td className="px-3 py-2">
                     <button
                       onClick={() =>
-                        router.push(`/import/review/${r.run_year}/${r.run_month}`)
+                        router.push(`/import/review?year=${r.run_year}&month=${r.run_month}`)
                       }
                       className="text-xs text-blue-600 hover:underline"
                     >
