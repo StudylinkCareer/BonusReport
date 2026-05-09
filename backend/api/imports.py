@@ -26,8 +26,8 @@ from __future__ import annotations
 import json
 import logging
 import os
-import re                  # NEW
-import unicodedata         # NEW
+import re
+import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -115,6 +115,9 @@ async def _process_one_file(upload: UploadFile) -> dict:
             "error": f"Could not parse year/month from filename: {exc!s}",
         }
 
+    # Best-effort: derive staff_id from the filename for one-click drilldown
+    # on the frontend after upload. None is fine — frontend falls back to a
+    # manual staff picker on the review page.
     staff_id = _resolve_staff_from_filename(upload.filename)
 
     # Build destination path on the volume:
@@ -247,12 +250,25 @@ def _safely_delete(path: Path) -> None:
     except OSError:
         log.warning("Could not delete %s after rejection", path)
 
+
 def _resolve_staff_from_filename(filename: str) -> int | None:
-    """Extract staff name from "{Name}'s report of closed file in ..." and
-    resolve to ref_staff.id. Returns None on any failure."""
+    """Extract staff name from filenames like
+        "Trần Thanh Gia Mẫn's report of closed file in January 2025.xlsx"
+    and resolve it to a ref_staff.id. Returns None on any failure
+    (regex miss, DB miss, or DB error). Never raises.
+
+    Handles both ASCII apostrophe (U+0027) and curly/typographic
+    apostrophe (U+2019) since filenames can contain either.
+    """
     name_part = unicodedata.normalize("NFC", filename)
-    m = re.match(r"^(.+?)'s\s+report\s+of\s+closed\s+file", name_part, re.IGNORECASE)
+    # [\u0027\u2019] = either straight ' or curly '
+    m = re.match(
+        r"^(.+?)[\u0027\u2019]s\s+report\s+of\s+closed\s+file",
+        name_part,
+        re.IGNORECASE,
+    )
     if not m:
+        log.info("Filename did not match staff regex: %r", filename)
         return None
     staff_name = m.group(1).strip()
     if not staff_name:
@@ -265,10 +281,17 @@ def _resolve_staff_from_filename(filename: str) -> int | None:
                     (staff_name,),
                 )
                 row = cur.fetchone()
-                return row["id"] if row else None
+                if row is None:
+                    log.info(
+                        "No ref_staff match for %r (parsed from %r)",
+                        staff_name, filename,
+                    )
+                    return None
+                return row["id"]
     except Exception:
         log.exception("Failed to resolve staff_id from filename %r", filename)
         return None
+
 
 def _summary_from_result(result) -> dict:
     return {

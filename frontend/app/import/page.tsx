@@ -227,11 +227,10 @@ export default function UploadPage() {
                         const params = new URLSearchParams({
                           year: String(r.run_year),
                           month: String(r.run_month),
-                        });
-                        if (r.staff_id) params.set('staff_id', String(r.staff_id));
-                        router.push(`/import/review?${params.toString()}`);
+                        })
+                        if (r.staff_id) params.set('staff_id', String(r.staff_id))
+                        router.push(`/import/review?${params.toString()}`)
                       }}
-                      
                       className="rounded bg-blue-600 px-3 py-1 text-xs text-white"
                     >
                       Review →
