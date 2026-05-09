@@ -3,7 +3,7 @@ StudyLink BonusReport API.
 
 Endpoints live under /api/* to match the Netlify proxy redirect.
 """
-# --- Make 'backend' importable as a package alias for the current dir ----
+# --- Make 'backend' importable as a package alias for the current dir. ----
 import sys
 import types
 from pathlib import Path
