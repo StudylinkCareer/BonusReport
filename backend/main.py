@@ -327,7 +327,7 @@ REF_LIST_QUERIES: dict[str, str] = {
     "countries":    "SELECT id, code, name FROM dim_country ORDER BY name",
     "staff_active": "SELECT id, canonical_name AS name, primary_role_id FROM ref_staff WHERE employment_status = 'ACTIVE' ORDER BY canonical_name",
     "staff_all":    "SELECT id, canonical_name AS name, employment_status, primary_role_id FROM ref_staff ORDER BY canonical_name",
-    "statuses":     "SELECT id, canonical_name AS name FROM ref_status_split ORDER BY canonical_name",
+    "statuses":     "SELECT id, status AS name FROM ref_status_split ORDER BY status",
     "roles":        "SELECT id, code, name FROM dim_role ORDER BY code",
 }
 
