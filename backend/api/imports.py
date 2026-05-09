@@ -26,6 +26,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re                  # NEW
+import unicodedata         # NEW
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -112,6 +114,8 @@ async def _process_one_file(upload: UploadFile) -> dict:
             "filename": upload.filename,
             "error": f"Could not parse year/month from filename: {exc!s}",
         }
+
+    staff_id = _resolve_staff_from_filename(upload.filename)
 
     # Build destination path on the volume:
     #   /data/imports/{year}/{month:02d}/{utc-timestamp}_{filename}
@@ -210,6 +214,7 @@ async def _process_one_file(upload: UploadFile) -> dict:
             "import_run_id": None,
             "run_year": year,
             "run_month": month,
+            "staff_id": staff_id,
             "report_period": str(report_period),
             "file_path": str(dest_path),
             "summary": _summary_from_result(result),
@@ -223,6 +228,7 @@ async def _process_one_file(upload: UploadFile) -> dict:
         "import_run_id": import_run_id,
         "run_year": year,
         "run_month": month,
+        "staff_id": staff_id,
         "report_period": str(report_period),
         "file_path": str(dest_path),
         "summary": _summary_from_result(result),
@@ -241,6 +247,28 @@ def _safely_delete(path: Path) -> None:
     except OSError:
         log.warning("Could not delete %s after rejection", path)
 
+def _resolve_staff_from_filename(filename: str) -> int | None:
+    """Extract staff name from "{Name}'s report of closed file in ..." and
+    resolve to ref_staff.id. Returns None on any failure."""
+    name_part = unicodedata.normalize("NFC", filename)
+    m = re.match(r"^(.+?)'s\s+report\s+of\s+closed\s+file", name_part, re.IGNORECASE)
+    if not m:
+        return None
+    staff_name = m.group(1).strip()
+    if not staff_name:
+        return None
+    try:
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id FROM ref_staff WHERE canonical_name ILIKE %s LIMIT 1",
+                    (staff_name,),
+                )
+                row = cur.fetchone()
+                return row["id"] if row else None
+    except Exception:
+        log.exception("Failed to resolve staff_id from filename %r", filename)
+        return None
 
 def _summary_from_result(result) -> dict:
     return {
