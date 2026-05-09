@@ -3,7 +3,7 @@ StudyLink BonusReport API.
 
 Endpoints live under /api/* to match the Netlify proxy redirect.
 """
-# --- Make 'backend' importable as a package alias for the current dir. ----
+# --- Make 'backend' importable as a package alias for the current dir ----
 import sys
 import types
 from pathlib import Path
@@ -87,6 +87,11 @@ def list_imports(
     """
     All CRM uploads from tx_import_run, most recent first.
     Optional year/month filter. limit caps the page size.
+
+    Each row also gets a `staff_id` field computed by parsing the filename
+    and matching against ref_staff. Returns null when the parse or lookup
+    fails. Used by the imports list page to one-click drilldown to the
+    review page for that staff/period.
     """
     where = "WHERE 1=1"
     params: list[Any] = []
@@ -111,10 +116,37 @@ def list_imports(
     """
     params.append(limit)
 
+    # Pre-load all staff once so we don't hit the DB N times for N rows.
+    # Build a dict from canonical_name (lower-cased, NFC-normalised) → id.
+    import unicodedata as _ud
+    name_to_id: dict[str, int] = {}
     with get_connection() as conn:
         with conn.cursor() as cur:
+            cur.execute("SELECT id, canonical_name FROM ref_staff")
+            for row in cur.fetchall():
+                key = _ud.normalize("NFC", row["canonical_name"]).lower()
+                name_to_id[key] = row["id"]
+
             cur.execute(sql, params)
-            return [dict(row) for row in cur.fetchall()]
+            rows = [dict(r) for r in cur.fetchall()]
+
+    # Per-row: parse staff name from filename, look up in dict
+    import re as _re
+    pat = _re.compile(
+        r"^(.+?)[\u0027\u2019]s\s+report\s+of\s+closed\s+file",
+        _re.IGNORECASE,
+    )
+    for row in rows:
+        staff_id = None
+        fname = row.get("original_filename") or ""
+        norm = _ud.normalize("NFC", fname)
+        m = pat.match(norm)
+        if m:
+            key = m.group(1).strip().lower()
+            staff_id = name_to_id.get(key)
+        row["staff_id"] = staff_id
+
+    return rows
 
 
 # ===========================================================================

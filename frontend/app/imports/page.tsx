@@ -18,6 +18,7 @@ type ImportRun = {
   file_path: string
   run_year: number
   run_month: number
+  staff_id?: number | null
   uploaded_at: string
   inserted_count: number
   updated_count: number
@@ -147,9 +148,14 @@ export default function ImportsListPage() {
                   </td>
                   <td className="px-3 py-2">
                     <button
-                      onClick={() =>
-                        router.push(`/import/review?year=${r.run_year}&month=${r.run_month}`)
-                      }
+                      onClick={() => {
+                        const params = new URLSearchParams({
+                          year: String(r.run_year),
+                          month: String(r.run_month),
+                        })
+                        if (r.staff_id) params.set('staff_id', String(r.staff_id))
+                        router.push(`/import/review?${params.toString()}`)
+                      }}
                       className="text-xs text-blue-600 hover:underline"
                     >
                       Review →
