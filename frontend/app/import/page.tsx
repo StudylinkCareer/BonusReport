@@ -3,7 +3,7 @@
 /**
  * frontend/app/import/page.tsx
  *
- * CRM file upload page.
+ * CRM file upload page
  *
  * Two upload modes (Phase 15+):
  *   - 'individual'  : drag/drop one or more closed-file xlsx reports;
