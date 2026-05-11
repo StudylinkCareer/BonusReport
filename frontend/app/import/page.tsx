@@ -1,358 +1,2325 @@
-'use client'
+'use client';
 
 /**
- * frontend/app/import/page.tsx
+ * frontend/app/import/review/[year]/[month]/page.tsx
  *
- * CRM file upload page
+ * Imported-cases review screen. Displays one staff member's cases for one
+ * (year, month). Every field that maps to a CRM column is inline-editable.
  *
- * Two upload modes (Phase 15+):
- *   - 'individual'  : drag/drop one or more closed-file xlsx reports;
- *                     year/month derived from filename, period validated
- *                     against the file header. Posts to POST /api/imports.
- *   - 'consolidated': single mass-upload xlsx (every status across many
- *                     months in one sheet); period derived per row.
- *                     Posts to POST /api/imports/consolidated (added next).
+ * Layout:
+ *   - md+ : wide horizontal-scroll table with sticky Status/Contract/Student
+ *   - <md : card-per-case layout for mobile
  *
- * The mass-upload backend endpoint is wired up in the next batch. For now
- * the 'consolidated' tab UI is present but the upload button is disabled
- * until the backend is live.
+ * Edit flow:
+ *   - Click a cell -> input/select/datepicker
+ *   - Enter or blur saves via PATCH /api/cases/{id}
+ *   - Escape cancels
+ *   - Errors show inline beneath the cell, value reverts
+ *
+ * URL query string drives filter state:
+ *   /import/review?staff_id=N&year=YYYY&month=M
+ *
+ * The "Submit to Engine" button at the bottom triggers POST /api/engine/run
+ * for the WHOLE period (every staff for that year+month, not just the
+ * staff being reviewed) and redirects to /bonus/{year}/{month}.
  */
 
-import { useRef, useState } from 'react'
-import { useRouter } from 'next/navigation'
-import Link from 'next/link'
+import {
+  CSSProperties,
+  FormEvent,
+  KeyboardEvent,
+  ReactNode,
+  useCallback,
+  useEffect,
+  useMemo,
+  useState,
+} from 'react';
+import {
+  ColumnDef,
+  ColumnFiltersState,
+  ColumnOrderState,
+  ColumnSizingState,
+  SortingState,
+  flexRender,
+  getCoreRowModel,
+  getFilteredRowModel,
+  getSortedRowModel,
+  useReactTable,
+} from '@tanstack/react-table';
+import { useRouter } from 'next/navigation';
 
-type Mode = 'individual' | 'consolidated'
+// ===========================================================================
+// Types
+// ===========================================================================
 
-type FileSummary = {
-  inserted: number
-  updated: number
-  rows_skipped: number
-  notes_attached: number
-  notes_orphan: number
-  error_count: number
-}
+type Staff = {
+  id: number;
+  name: string;
+  role_code: string;
+  office_code: string;
+};
 
-type FileResult = {
-  success: boolean
-  filename: string | null
-  error?: string
-  warning?: string
-  import_run_id?: number
-  run_year?: number
-  run_month?: number
-  staff_id?: number | null
-  file_path?: string
-  summary?: FileSummary
-  errors?: string[]
-}
+type Case = {
+  id: number;
+  contract_id: string;
+  student_id: string | null;
+  student_name: string;
+  application_status: string;
+  course_status: string | null;
+  import_status: string;
+  contract_signed_date: string | null;
+  course_start_date: string | null;
+  visa_received_date: string | null;
+  client_type_code: string | null;
+  handover_flag: boolean;
+  case_transition: string | null;
+  deferral_code: string | null;
+  notes: string | null;
+  run_year: number;
+  run_month: number;
 
-type UploadResponse = {
-  total_files: number
-  successful: number
-  failed: number
-  files: FileResult[]
-}
+  institution_id: number | null;
+  institution_name: string | null;
+  institution_text_raw: string | null;
 
-export default function UploadPage() {
-  const router = useRouter()
-  const [mode, setMode] = useState<Mode>('individual')
-  const [files, setFiles] = useState<File[]>([])
-  const [uploading, setUploading] = useState(false)
-  const [response, setResponse] = useState<UploadResponse | null>(null)
-  const [error, setError] = useState<string | null>(null)
-  const [dragOver, setDragOver] = useState(false)
-  const inputRef = useRef<HTMLInputElement>(null)
+  country_id: number | null;
+  country_name: string | null;
 
-  const onPick = (filelist: FileList | null) => {
-    if (!filelist) return
-    const valid = Array.from(filelist).filter((f) => /\.(xlsx|xlsm)$/i.test(f.name))
-    const invalid = Array.from(filelist).filter((f) => !/\.(xlsx|xlsm)$/i.test(f.name))
-    // Consolidated mode is single-file only
-    const next = mode === 'consolidated' ? valid.slice(0, 1) : [...files, ...valid]
-    setFiles(next)
-    if (invalid.length) {
-      setError(`Skipped ${invalid.length} non-Excel file(s): ${invalid.map((f) => f.name).join(', ')}`)
-    } else {
-      setError(null)
-    }
-  }
+  case_office_id: number | null;
+  case_office_code: string | null;
 
-  const removeFile = (idx: number) => {
-    setFiles((prev) => prev.filter((_, i) => i !== idx))
-  }
+  referring_office_id: number | null;
+  referring_office_code: string | null;
 
-  const switchMode = (next: Mode) => {
-    if (next === mode) return
-    setMode(next)
-    setFiles([])
-    setResponse(null)
-    setError(null)
-  }
+  referring_partner_id: number | null;
+  referring_partner_name: string | null;
+  referring_partner_classification: string | null;
 
-  const onUpload = async () => {
-    if (files.length === 0) {
-      setError('Please select at least one file.')
-      return
-    }
-    setUploading(true)
-    setError(null)
-    setResponse(null)
+  referring_sub_agent_id: number | null;
+  referring_sub_agent_name: string | null;
 
-    const endpoint = mode === 'consolidated' ? '/api/imports/consolidated' : '/api/imports'
+  referring_agent_text_raw: string | null;
+  referring_source_type: string | null;
 
-    const fd = new FormData()
-    if (mode === 'consolidated') {
-      fd.append('file', files[0])
-    } else {
-      for (const f of files) fd.append('files', f)
-    }
+  counsellor_staff_id: number | null;
+  counsellor_name: string | null;
+  counsellor_role_id: number | null;
+  counsellor_role_code: string | null;
 
-    try {
-      const res = await fetch(endpoint, { method: 'POST', body: fd })
-      if (!res.ok) {
-        const body = await res.json().catch(() => ({}))
-        throw new Error(body.detail || `Upload failed (${res.status})`)
+  case_officer_staff_id: number | null;
+  case_officer_name: string | null;
+  case_officer_role_id: number | null;
+  case_officer_role_code: string | null;
+
+  pre_sales_staff_id: number | null;
+  pre_sales_name: string | null;
+};
+
+type RefItem = {
+  id: number;
+  name?: string;
+  code?: string;
+  classification?: string;
+  primary_role_id?: number | null;
+  employment_status?: string | null;
+};
+
+type RefData = {
+  institutions: RefItem[];
+  sub_agents: RefItem[];
+  partners: RefItem[];
+  offices: RefItem[];
+  countries: RefItem[];
+  staff_all: RefItem[];
+  statuses: RefItem[];
+  source_types: string[];
+  import_statuses: string[];
+  client_types: string[];
+};
+
+const EMPTY_REF: RefData = {
+  institutions: [],
+  sub_agents: [],
+  partners: [],
+  offices: [],
+  countries: [],
+  staff_all: [],
+  statuses: [],
+  source_types: [],
+  import_statuses: [],
+  client_types: [],
+};
+
+type EngineResult = {
+  total_cases: number;
+  adapted: number;
+  payment_count: number;
+  gross_total: number;
+  net_total: number;
+  skipped: { contract_id: string; reason: string }[];
+  errored: { contract_id: string; error: string; phase: string }[];
+};
+
+type SourceType = 'DIRECT' | 'SUB_AGENT' | 'MASTER_AGENT' | 'GROUP' | 'OFFICE';
+
+// ===========================================================================
+// Constants & helpers
+// ===========================================================================
+
+const ROW_BG: Record<string, string> = {
+  OK: 'bg-green-50',
+  FLAGGED: 'bg-amber-50',
+  UNRESOLVED: 'bg-red-50',
+  SCRAP: 'bg-gray-100 opacity-70',
+};
+
+const STICKY_BG: Record<string, string> = {
+  OK: 'bg-green-50',
+  FLAGGED: 'bg-amber-50',
+  UNRESOLVED: 'bg-red-50',
+  SCRAP: 'bg-gray-100',
+};
+
+const BADGE: Record<string, string> = {
+  OK: 'bg-green-200 text-green-900',
+  FLAGGED: 'bg-amber-200 text-amber-900',
+  UNRESOLVED: 'bg-red-200 text-red-900',
+  SCRAP: 'bg-gray-300 text-gray-700',
+};
+
+const fmtVnd = (n: number | null | undefined) => {
+  if (n == null) return '–';
+  return n.toLocaleString('vi-VN') + ' đ';
+};
+
+// ===========================================================================
+// Page
+// ===========================================================================
+
+export default function ReviewPage() {
+  const router = useRouter();
+
+  // --- Filter / data state -------------------------------------------------
+  const [staff, setStaff] = useState<Staff[]>([]);
+  const [staffId, setStaffId] = useState<number | null>(null);
+  const [year, setYear] = useState(new Date().getFullYear());
+  const [month, setMonth] = useState(new Date().getMonth() + 1);
+  const [workflowState, setWorkflowState] = useState<string | null>(null);  // Phase 15: pillar-view mode
+  const [cases, setCases] = useState<Case[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [hasLoaded, setHasLoaded] = useState(false);
+
+  // --- Reference data ------------------------------------------------------
+  const [refData, setRefData] = useState<RefData>(EMPTY_REF);
+  const [refReady, setRefReady] = useState(false);
+  const [refError, setRefError] = useState<string | null>(null);
+
+  // --- Submit to Engine state ---------------------------------------------
+  const [submitting, setSubmitting] = useState(false);
+  const [engineMessage, setEngineMessage] = useState<
+    | { ok: true; result: EngineResult }
+    | { ok: false; detail: string }
+    | null
+  >(null);
+
+  // --- Load staff list on mount -------------------------------------------
+  useEffect(() => {
+    fetch('/api/staff')
+      .then((r) => (r.ok ? r.json() : Promise.reject(r.statusText)))
+      .then(setStaff)
+      .catch((e) => setError(`Failed to load staff list: ${e}`));
+  }, []);
+
+  // --- Load reference data once on mount (parallel) -----------------------
+  useEffect(() => {
+    let cancelled = false;
+    async function loadRef() {
+      const lists = [
+        'institutions',
+        'sub_agents',
+        'partners',
+        'offices',
+        'countries',
+        'staff_all',
+        'statuses',
+        'source_types',
+        'import_statuses',
+        'client_types',
+      ];
+      try {
+        const results = await Promise.all(
+          lists.map((name) =>
+            fetch(`/api/reference/${name}`).then((r) =>
+              r.ok ? r.json() : Promise.reject(`${name}: HTTP ${r.status}`),
+            ),
+          ),
+        );
+        if (cancelled) return;
+        const next: RefData = { ...EMPTY_REF };
+        for (let i = 0; i < lists.length; i++) {
+          const name = lists[i] as keyof RefData;
+          (next as Record<string, unknown>)[name] = results[i].items;
+        }
+        setRefData(next);
+        setRefReady(true);
+      } catch (e) {
+        if (!cancelled) setRefError(String(e));
       }
-      const body: UploadResponse = await res.json()
-      setResponse(body)
-      setFiles([])
-    } catch (e: any) {
-      setError(e.message)
+    }
+    loadRef();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // --- URL params bootstrap -----------------------------------------------
+  // Two filter modes supported:
+  //   - workflow_state mode (Phase 15 pillar drill-down): /import/review?workflow_state=uploaded
+  //   - legacy period mode: /import/review?staff_id=N&year=YYYY&month=M
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const wState = params.get('workflow_state');
+    const sid = params.get('staff_id');
+    const y = params.get('year');
+    const m = params.get('month');
+    const yNum = y ? Number(y) : null;
+    const mNum = m ? Number(m) : null;
+    if (yNum && Number.isFinite(yNum)) setYear(yNum);
+    if (mNum && Number.isFinite(mNum)) setMonth(mNum);
+
+    if (wState) {
+      setWorkflowState(wState);
+      loadCasesByWorkflowState(wState);
+    } else if (sid && yNum && mNum) {
+      const sidNum = Number(sid);
+      setStaffId(sidNum);
+      loadCases(sidNum, yNum, mNum);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  async function loadCases(sid: number, y: number, m: number) {
+    setLoading(true);
+    setError(null);
+    setCases([]);
+    setEngineMessage(null);
+    try {
+      const res = await fetch(`/api/cases?staff_id=${sid}&year=${y}&month=${m}`);
+      if (!res.ok) {
+        const detail = await res.text();
+        throw new Error(`HTTP ${res.status}: ${detail}`);
+      }
+      setCases(await res.json());
+      setHasLoaded(true);
+    } catch (e: unknown) {
+      const message = e instanceof Error ? e.message : String(e);
+      setError(message);
     } finally {
-      setUploading(false)
+      setLoading(false);
     }
   }
+
+  async function loadCasesByWorkflowState(state: string) {
+    setLoading(true);
+    setError(null);
+    setCases([]);
+    setEngineMessage(null);
+    try {
+      const res = await fetch(`/api/cases?workflow_state=${encodeURIComponent(state)}`);
+      if (!res.ok) {
+        const detail = await res.text();
+        throw new Error(`HTTP ${res.status}: ${detail}`);
+      }
+      setCases(await res.json());
+      setHasLoaded(true);
+    } catch (e: unknown) {
+      const message = e instanceof Error ? e.message : String(e);
+      setError(message);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  function handleSubmit(e: FormEvent) {
+    e.preventDefault();
+    if (staffId === null) {
+      setError('Please pick a staff member');
+      return;
+    }
+    const url = `/import/review?staff_id=${staffId}&year=${year}&month=${month}`;
+    window.history.replaceState({}, '', url);
+    loadCases(staffId, year, month);
+  }
+
+  // --- Cell save handler --------------------------------------------------
+  // PATCHes one or more fields on one case and updates the row in state.
+  const saveCase = useCallback(
+    async (caseId: number, updates: Record<string, unknown>) => {
+      const r = await fetch(`/api/cases/${caseId}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(updates),
+      });
+      if (!r.ok) {
+        let detail: string;
+        try {
+          const body = await r.json();
+          detail = body.detail ?? `HTTP ${r.status}`;
+        } catch {
+          detail = `HTTP ${r.status}`;
+        }
+        throw new Error(detail);
+      }
+      const updated = (await r.json()) as Case;
+      setCases((prev) => prev.map((c) => (c.id === caseId ? updated : c)));
+    },
+    [],
+  );
+
+  // --- Submit-to-engine handler ------------------------------------------
+  async function handleSubmitToEngine() {
+    const confirmed = window.confirm(
+      `Run the engine for ${year}-${String(month).padStart(2, '0')}?\n\n` +
+        `Important: this runs the engine for the WHOLE PERIOD (every staff ` +
+        `member's cases), not just the staff you're currently viewing.\n\n` +
+        `It will:\n` +
+        `  • DELETE all existing bonus payments for this period\n` +
+        `  • Re-calculate from imported tx_case rows\n` +
+        `  • Write fresh tx_bonus_payment rows\n\n` +
+        `It is idempotent — you can re-run safely.`,
+    );
+    if (!confirmed) return;
+
+    setSubmitting(true);
+    setEngineMessage(null);
+    try {
+      const r = await fetch('/api/engine/run', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ year, month, persist: true }),
+      });
+      if (!r.ok) {
+        const err = await r.json().catch(() => ({}));
+        const detail = (err as { detail?: string }).detail ?? `HTTP ${r.status}`;
+        setEngineMessage({ ok: false, detail });
+        setSubmitting(false);
+        return;
+      }
+      const result = (await r.json()) as EngineResult;
+      setEngineMessage({ ok: true, result });
+      setTimeout(() => router.push(`/bonus/${year}/${month}`), 1500);
+    } catch (err) {
+      setEngineMessage({ ok: false, detail: `Network error: ${String(err)}` });
+      setSubmitting(false);
+    }
+  }
+
+  // --- Counts for badges --------------------------------------------------
+  const counts = useMemo(
+    () => ({
+      OK: cases.filter((c) => c.import_status === 'OK').length,
+      FLAGGED: cases.filter((c) => c.import_status === 'FLAGGED').length,
+      UNRESOLVED: cases.filter((c) => c.import_status === 'UNRESOLVED').length,
+      SCRAP: cases.filter((c) => c.import_status === 'SCRAP').length,
+    }),
+    [cases],
+  );
+
+  // ----------------------------------------------------------------------
+  // Title metadata for the workflow_state header banner.
+  const PILLAR_TITLES: Record<string, { label: string; chip: string; dot: string }> = {
+    uploaded:  { label: 'Uploaded',  chip: 'bg-slate-100 text-slate-700',   dot: 'bg-slate-400' },
+    in_review: { label: 'In Review', chip: 'bg-amber-100 text-amber-800',   dot: 'bg-amber-500' },
+    submitted: { label: 'Submitted', chip: 'bg-sky-100 text-sky-800',       dot: 'bg-sky-500' },
+    closed:    { label: 'Closed',    chip: 'bg-emerald-100 text-emerald-800', dot: 'bg-emerald-500' },
+  };
+  const pillarMeta = workflowState ? PILLAR_TITLES[workflowState] : null;
 
   return (
-    <div className="mx-auto max-w-4xl p-6">
-      {/* Header with back-to-home link */}
-      <nav className="mb-4 text-sm text-gray-500">
-        <Link href="/" className="hover:text-gray-900 hover:underline">← Back to Case workflow</Link>
-      </nav>
-
-      <header className="mb-6 flex items-center justify-between">
-        <div>
-          <h1 className="text-2xl font-bold">Upload Cases</h1>
-          <p className="mt-1 text-sm text-gray-600">
-            Two formats supported. Pick the right one for your file.
-          </p>
-        </div>
-        <button
-          onClick={() => router.push('/imports')}
-          className="rounded bg-gray-200 px-3 py-1 text-sm hover:bg-gray-300"
-        >
-          View upload history
-        </button>
-      </header>
-
-      {/* Mode tabs */}
-      <div className="mb-4 flex gap-0 border-b border-gray-200">
-        <ModeTab
-          label="Input sheet"
-          sub="One file per staff member per month"
-          active={mode === 'individual'}
-          onClick={() => switchMode('individual')}
-        />
-        <ModeTab
-          label="Mass Upload"
-          sub="Single consolidated file across all staff/months"
-          active={mode === 'consolidated'}
-          onClick={() => switchMode('consolidated')}
-        />
-      </div>
-
-      {mode === 'individual' ? <IndividualNote /> : <ConsolidatedNote />}
-
-      {/* Drop zone */}
-      <div
-        onDragOver={(e) => { e.preventDefault(); setDragOver(true) }}
-        onDragLeave={() => setDragOver(false)}
-        onDrop={(e) => {
-          e.preventDefault()
-          setDragOver(false)
-          onPick(e.dataTransfer.files)
-        }}
-        onClick={() => inputRef.current?.click()}
-        className={`cursor-pointer rounded border-2 border-dashed p-10 text-center transition ${
-          dragOver
-            ? 'border-blue-500 bg-blue-50'
-            : 'border-gray-300 bg-gray-50 hover:bg-gray-100'
-        }`}
-      >
-        <p className="text-sm text-gray-700">
-          {dragOver
-            ? 'Drop files here…'
-            : mode === 'consolidated'
-            ? 'Drag one file here, or click to browse'
-            : 'Drag files here, or click to browse'}
-        </p>
-        <p className="mt-1 text-xs text-gray-500">.xlsx or .xlsm only</p>
-        <input
-          ref={inputRef}
-          type="file"
-          accept=".xlsx,.xlsm"
-          multiple={mode === 'individual'}
-          onChange={(e) => onPick(e.target.files)}
-          className="hidden"
-        />
-      </div>
-
-      {/* Pending list */}
-      {files.length > 0 && (
-        <div className="mt-4">
-          <h2 className="mb-2 text-sm font-semibold">
-            Files to upload ({files.length}):
-          </h2>
-          <ul className="divide-y divide-gray-100 rounded border border-gray-200">
-            {files.map((f, i) => (
-              <li key={i} className="flex items-center justify-between px-3 py-2 text-sm">
-                <span className="truncate" title={f.name}>{f.name}</span>
-                <button
-                  onClick={() => removeFile(i)}
-                  className="text-xs text-red-600 hover:underline"
-                  disabled={uploading}
-                >
-                  Remove
-                </button>
-              </li>
-            ))}
-          </ul>
-        </div>
-      )}
-
-      {/* Action buttons */}
-      {files.length > 0 && (
-        <div className="mt-4 flex gap-2">
-          <button
-            onClick={onUpload}
-            disabled={uploading}
-            className="rounded bg-blue-600 px-4 py-2 text-white disabled:opacity-50"
-          >
-            {uploading
-              ? `Uploading ${files.length} file(s)…`
-              : `Upload ${files.length} file(s)`}
-          </button>
-          <button
-            onClick={() => setFiles([])}
-            disabled={uploading}
-            className="rounded bg-gray-200 px-4 py-2 text-sm"
-          >
-            Clear
-          </button>
-        </div>
-      )}
-
-      {/* Errors / warnings */}
-      {error && (
-        <div className="mt-4 rounded border border-red-200 bg-red-50 px-4 py-3 text-red-800">
-          <strong>Error:</strong> {error}
-        </div>
-      )}
-
-      {/* Per-file results */}
-      {response && (
-        <div className="mt-6">
-          <h2 className="mb-3 font-semibold">
-            Upload results — {response.successful} succeeded, {response.failed} failed
-          </h2>
-          <ul className="space-y-2">
-            {response.files.map((r, i) => (
-              <li
-                key={i}
-                className={`rounded border px-4 py-3 text-sm ${
-                  r.success
-                    ? 'border-green-200 bg-green-50'
-                    : 'border-red-200 bg-red-50'
-                }`}
+    <main className="min-h-screen bg-gray-50 p-4 md:p-6">
+      <div className="max-w-[1800px] mx-auto">
+        <div className="flex items-baseline justify-between mb-6 flex-wrap gap-3">
+          <div>
+            {workflowState ? (
+              <>
+                <nav className="text-sm text-gray-500 mb-2">
+                  <a href="/" className="hover:text-gray-900 hover:underline">Case workflow</a>
+                  <span className="mx-2">/</span>
+                  <span className="text-gray-900">{pillarMeta?.label ?? workflowState}</span>
+                </nav>
+                <div className="flex items-center gap-3">
+                  {pillarMeta && <span className={`h-2.5 w-2.5 rounded-full ${pillarMeta.dot}`} />}
+                  <h1 className="text-2xl md:text-3xl font-bold">
+                    {pillarMeta?.label ?? workflowState}
+                  </h1>
+                  <span className={`rounded-full px-2.5 py-0.5 text-xs font-medium ${pillarMeta?.chip ?? 'bg-gray-100 text-gray-700'}`}>
+                    {loading ? '…' : `${cases.length} case${cases.length === 1 ? '' : 's'}`}
+                  </span>
+                </div>
+                <p className="text-gray-600 mt-1 text-sm">
+                  Click any cell to edit. Saves on Enter or blur. Esc cancels.
+                </p>
+              </>
+            ) : (
+              <>
+                <h1 className="text-2xl md:text-3xl font-bold">Imported Cases — Review</h1>
+                <p className="text-gray-600 mt-1 text-sm">
+                  Click any cell to edit. Saves on Enter or blur. Esc cancels.
+                </p>
+              </>
+            )}
+          </div>
+          <div className="flex items-center gap-4">
+            {!workflowState && (
+              <a
+                href={`/bonus/${year}/${month}`}
+                className="text-sm text-blue-600 hover:underline"
               >
-                <div className="mb-1 font-mono text-xs">{r.filename ?? '(no filename)'}</div>
-                {r.success ? (
-                  <div className="flex items-center justify-between">
-                    <div>
-                      {r.run_year && r.run_month && (
-                        <>Period: <strong>{r.run_year}-{String(r.run_month).padStart(2, '0')}</strong>{' · '}</>
-                      )}
-                      Inserted: {r.summary?.inserted ?? 0}
-                      {r.summary && r.summary.updated > 0 && <>, Updated: {r.summary.updated}</>}
-                      {r.summary?.error_count
-                        ? <span className="text-amber-700">, Errors: {r.summary.error_count}</span>
-                        : null}
-                    </div>
-                    <Link
-                      href="/"
-                      className="rounded bg-blue-600 px-3 py-1 text-xs text-white hover:bg-blue-700"
-                    >
-                      View on home →
-                    </Link>
-                  </div>
-                ) : (
-                  <div className="text-red-700">{r.error}</div>
-                )}
-                {r.warning && (
-                  <div className="mt-1 text-xs text-amber-700">⚠ {r.warning}</div>
-                )}
-              </li>
-            ))}
-          </ul>
-          <div className="mt-4 flex gap-2">
-            <Link
-              href="/"
-              className="rounded bg-blue-600 px-4 py-2 text-sm text-white hover:bg-blue-700"
-            >
-              Back to Case workflow
-            </Link>
-            <button
-              onClick={() => setResponse(null)}
-              className="rounded bg-gray-200 px-4 py-2 text-sm hover:bg-gray-300"
-            >
-              Upload more
-            </button>
+                View bonus report →
+              </a>
+            )}
+            {workflowState ? (
+              <a href="/" className="text-sm text-blue-600 hover:underline">
+                ← Back to Case workflow
+              </a>
+            ) : (
+              <a href="/imports" className="text-sm text-blue-600 hover:underline">
+                ← Back to Importer
+              </a>
+            )}
           </div>
         </div>
-      )}
-    </div>
-  )
+
+        {/* Filter form — hidden when in workflow_state mode */}
+        {!workflowState && (
+        <form
+          onSubmit={handleSubmit}
+          className="flex flex-wrap gap-3 items-end bg-white p-4 rounded-lg shadow border border-gray-200 mb-4"
+        >
+          <div className="flex-1 min-w-[260px]">
+            <label className="block text-sm font-medium mb-1.5 text-gray-700">
+              Staff
+            </label>
+            <select
+              value={staffId ?? ''}
+              onChange={(e) =>
+                setStaffId(e.target.value ? Number(e.target.value) : null)
+              }
+              className="w-full p-2 border border-gray-300 rounded focus:outline-none focus:ring-2 focus:ring-blue-500"
+              required
+            >
+              <option value="">— pick a staff member —</option>
+              {staff.map((s) => (
+                <option key={s.id} value={s.id}>
+                  {s.name} ({s.role_code}, {s.office_code})
+                </option>
+              ))}
+            </select>
+          </div>
+          <div className="w-24">
+            <label className="block text-sm font-medium mb-1.5 text-gray-700">
+              Year
+            </label>
+            <input
+              type="number"
+              value={year}
+              onChange={(e) => setYear(Number(e.target.value))}
+              min={2020}
+              max={2030}
+              className="w-full p-2 border border-gray-300 rounded"
+              required
+            />
+          </div>
+          <div className="w-20">
+            <label className="block text-sm font-medium mb-1.5 text-gray-700">
+              Month
+            </label>
+            <input
+              type="number"
+              value={month}
+              onChange={(e) => setMonth(Number(e.target.value))}
+              min={1}
+              max={12}
+              className="w-full p-2 border border-gray-300 rounded"
+              required
+            />
+          </div>
+          <button
+            type="submit"
+            disabled={loading || staffId === null}
+            className="bg-blue-600 text-white px-5 py-2 rounded font-medium hover:bg-blue-700 disabled:bg-gray-300"
+          >
+            {loading ? 'Loading…' : 'Load'}
+          </button>
+        </form>
+        )}
+
+        {refError && (
+          <div className="mb-4 p-3 bg-amber-50 border border-amber-300 rounded text-sm text-amber-800">
+            <strong>Reference data warning:</strong> {refError}
+            <br />
+            Some dropdowns may not populate; reload the page to retry.
+          </div>
+        )}
+
+        {error && (
+          <div className="mb-4 p-4 bg-red-50 border border-red-200 rounded">
+            <p className="text-red-800 font-medium">Error</p>
+            <p className="text-red-700 text-sm mt-1 font-mono whitespace-pre-wrap">
+              {error}
+            </p>
+          </div>
+        )}
+
+        {!loading && !error && hasLoaded && cases.length === 0 && (
+          <div className="p-8 text-center text-gray-500 bg-white rounded-lg shadow border border-gray-200">
+            No cases found for this period.
+          </div>
+        )}
+
+        {cases.length > 0 && (
+          <div className="bg-white rounded-lg shadow border border-gray-200 overflow-hidden">
+            {/* Status counts header */}
+            <div className="px-4 py-3 border-b border-gray-200 flex justify-between items-center flex-wrap gap-2">
+              <p className="text-sm text-gray-600">
+                <span className="font-semibold">{cases.length}</span> case
+                {cases.length === 1 ? '' : 's'}
+                {!refReady && (
+                  <span className="ml-2 text-amber-700 text-xs">
+                    (loading reference data…)
+                  </span>
+                )}
+              </p>
+              <div className="flex gap-2 text-xs">
+                {(['OK', 'FLAGGED', 'UNRESOLVED', 'SCRAP'] as const).map((status) =>
+                  counts[status] > 0 ? (
+                    <span
+                      key={status}
+                      className={`px-2 py-1 rounded font-medium ${BADGE[status]}`}
+                    >
+                      {status}: {counts[status]}
+                    </span>
+                  ) : null,
+                )}
+              </div>
+            </div>
+
+            {/* Desktop table */}
+            <div className="hidden md:block">
+              <CasesTable cases={cases} refData={refData} onSave={saveCase} />
+            </div>
+
+            {/* Mobile cards */}
+            <div className="md:hidden divide-y divide-gray-200">
+              {cases.map((c) => (
+                <CaseCard
+                  key={c.id}
+                  caseRow={c}
+                  refData={refData}
+                  onSave={saveCase}
+                />
+              ))}
+            </div>
+
+            {/* Submit-to-Engine footer (period mode only — engine runs are period-scoped) */}
+            {!workflowState && (
+            <div className="border-t border-gray-200 bg-gray-50 px-4 py-4 flex flex-col gap-3">
+              <div className="flex items-center justify-between flex-wrap gap-3">
+                <div className="text-sm text-gray-600">
+                  <span className="font-medium">Ready to calculate bonuses?</span>{' '}
+                  This runs the engine for{' '}
+                  <span className="font-semibold">
+                    {year}-{String(month).padStart(2, '0')}
+                  </span>{' '}
+                  across <em>all</em> staff for this period.
+                </div>
+                <button
+                  type="button"
+                  onClick={handleSubmitToEngine}
+                  disabled={submitting}
+                  className={
+                    'px-5 py-2 rounded text-white font-medium ' +
+                    (submitting
+                      ? 'bg-gray-400 cursor-not-allowed'
+                      : 'bg-emerald-600 hover:bg-emerald-700')
+                  }
+                >
+                  {submitting ? 'Running engine…' : 'Submit to Engine →'}
+                </button>
+              </div>
+              {engineMessage && engineMessage.ok && (
+                <div className="text-sm px-3 py-2 rounded border bg-emerald-50 border-emerald-200 text-emerald-800">
+                  <div className="font-medium">Engine run complete.</div>
+                  <div className="mt-1 text-xs">
+                    Adapted {engineMessage.result.adapted}/
+                    {engineMessage.result.total_cases} case(s),{' '}
+                    {engineMessage.result.payment_count} payment row(s) written.
+                    Net payable total:{' '}
+                    <span className="font-semibold">
+                      {fmtVnd(engineMessage.result.net_total)}
+                    </span>
+                    .
+                    {engineMessage.result.skipped.length > 0 && (
+                      <> Skipped: {engineMessage.result.skipped.length}.</>
+                    )}
+                    {engineMessage.result.errored.length > 0 && (
+                      <>
+                        {' '}
+                        <span className="text-red-700 font-medium">
+                          Errored: {engineMessage.result.errored.length}.
+                        </span>
+                      </>
+                    )}
+                  </div>
+                  <div className="mt-1 text-emerald-700 text-xs">
+                    Redirecting to the bonus report…
+                  </div>
+                </div>
+              )}
+              {engineMessage && !engineMessage.ok && (
+                <div className="text-sm px-3 py-2 rounded border bg-red-50 border-red-200 text-red-700">
+                  <div className="font-medium">Engine run failed.</div>
+                  <div className="mt-1 font-mono text-xs whitespace-pre-wrap">
+                    {engineMessage.detail}
+                  </div>
+                </div>
+              )}
+            </div>
+            )}
+          </div>
+        )}
+      </div>
+    </main>
+  );
 }
 
-/* ---------------- helpers ---------------- */
+// ===========================================================================
+// Desktop table view
+// ===========================================================================
 
-function ModeTab({
-  label, sub, active, onClick,
-}: { label: string; sub: string; active: boolean; onClick: () => void }) {
+type CommonProps = {
+  refData: RefData;
+  onSave: (caseId: number, updates: Record<string, unknown>) => Promise<void>;
+};
+
+// Fixed widths (px) for the three sticky columns. Cumulative lefts must
+// match the running total so columns butt up perfectly with no gap.
+const STICKY_W = { status: 140, contract: 130, student: 220 } as const;
+const STICKY_L = {
+  status: 0,
+  contract: STICKY_W.status,
+  student: STICKY_W.status + STICKY_W.contract,
+} as const;
+
+function CasesTable({ cases, refData, onSave }: { cases: Case[] } & CommonProps) {
+  // ---- column ordering ------------------------------------------------
+  // Pinned (sticky) columns always stay leftmost: import_status, contract_id, student_name.
+  // Reordering only applies to the unpinned columns.
+  const PINNED = ['import_status', 'contract_id', 'student_name'];
+  const DEFAULT_ORDER = [
+    'import_status',
+    'contract_id',
+    'student_name',
+    'student_id',
+    'contract_signed_date',
+    'client_type_code',
+    'country',
+    'refer_source',
+    'application_status',
+    'visa_received_date',
+    'institution',
+    'course_start_date',
+    'course_status',
+    'counsellor',
+    'case_officer',
+    'pre_sales',
+    'office',
+    'notes',
+  ];
+
+  // Persisted view-state — these only affect the local table, never the DB.
+  const [sorting, setSorting] = useState<SortingState>([]);
+  const [columnFilters, setColumnFilters] = useState<ColumnFiltersState>([]);
+  const [columnOrder, setColumnOrder] = useState<ColumnOrderState>(DEFAULT_ORDER);
+  const [columnSizing, setColumnSizing] = useState<ColumnSizingState>({});
+
+  // ---- column definitions --------------------------------------------
+  // Each column declares: id, header label, optional accessor for sort/filter,
+  // size (px), and the cell renderer (which reuses the existing TextCell / SelectCell
+  // / FkCell / StaffCell / DateCell / TextAreaCell / ReferSourceCell components).
+  const columns = useMemo<ColumnDef<Case>[]>(
+    () => [
+      {
+        id: 'import_status',
+        header: 'Status',
+        accessorFn: (row) => row.import_status ?? '',
+        size: STICKY_W.status,
+        minSize: 100,
+        enableResizing: false, // sticky col — keep fixed width
+        cell: ({ row }) => {
+          const c = row.original;
+          return (
+            <SelectCell
+              value={c.import_status}
+              options={refData.import_statuses}
+              render={(v) => (
+                <span
+                  className={`text-xs px-2 py-0.5 rounded font-medium ${
+                    BADGE[v ?? ''] ?? 'bg-gray-200'
+                  }`}
+                >
+                  {v}
+                </span>
+              )}
+              onSave={(v) => onSave(c.id, { import_status: v })}
+            />
+          );
+        },
+      },
+      {
+        id: 'contract_id',
+        header: 'Contract',
+        accessorFn: (row) => row.contract_id ?? '',
+        size: STICKY_W.contract,
+        minSize: 100,
+        enableResizing: false,
+        cell: ({ row }) => {
+          const c = row.original;
+          return (
+            <TextCell
+              value={c.contract_id}
+              monospace
+              onSave={(v) => onSave(c.id, { contract_id: v })}
+            />
+          );
+        },
+      },
+      {
+        id: 'student_name',
+        header: 'Student',
+        accessorFn: (row) => row.student_name ?? '',
+        size: STICKY_W.student,
+        minSize: 140,
+        enableResizing: false,
+        cell: ({ row }) => {
+          const c = row.original;
+          return (
+            <TextCell
+              value={c.student_name}
+              onSave={(v) => onSave(c.id, { student_name: v })}
+            />
+          );
+        },
+      },
+      {
+        id: 'student_id',
+        header: 'Student ID',
+        accessorFn: (row) => row.student_id ?? '',
+        size: 130,
+        cell: ({ row }) => {
+          const c = row.original;
+          return (
+            <TextCell
+              value={c.student_id}
+              monospace
+              onSave={(v) => onSave(c.id, { student_id: v })}
+            />
+          );
+        },
+      },
+      {
+        id: 'contract_signed_date',
+        header: 'Signed',
+        accessorFn: (row) => row.contract_signed_date ?? '',
+        size: 120,
+        cell: ({ row }) => {
+          const c = row.original;
+          return (
+            <DateCell
+              value={c.contract_signed_date}
+              onSave={(v) => onSave(c.id, { contract_signed_date: v })}
+            />
+          );
+        },
+      },
+      {
+        id: 'client_type_code',
+        header: 'Client Type',
+        accessorFn: (row) => row.client_type_code ?? '',
+        size: 200,
+        cell: ({ row }) => {
+          const c = row.original;
+          return (
+            <SelectCell
+              value={c.client_type_code}
+              options={refData.client_types}
+              onSave={(v) => onSave(c.id, { client_type_code: v })}
+            />
+          );
+        },
+      },
+      {
+        id: 'country',
+        header: 'Country',
+        accessorFn: (row) => row.country_name ?? '',
+        size: 140,
+        cell: ({ row }) => {
+          const c = row.original;
+          return (
+            <FkCell
+              value={c.country_id}
+              label={c.country_name}
+              options={refData.countries}
+              onSave={(id) => onSave(c.id, { country_id: id })}
+            />
+          );
+        },
+      },
+      {
+        id: 'refer_source',
+        header: 'Refer Source',
+        accessorFn: (row) =>
+          row.referring_partner_name ??
+          row.referring_sub_agent_name ??
+          row.referring_office_code ??
+          row.referring_agent_text_raw ??
+          '',
+        size: 200,
+        cell: ({ row }) => (
+          <ReferSourceCell
+            caseRow={row.original}
+            refData={refData}
+            onSave={(updates) => onSave(row.original.id, updates)}
+          />
+        ),
+      },
+      {
+        id: 'application_status',
+        header: 'App Status',
+        accessorFn: (row) => row.application_status ?? '',
+        size: 160,
+        cell: ({ row }) => {
+          const c = row.original;
+          return (
+            <SelectCell
+              value={c.application_status}
+              options={refData.statuses.map((s) => s.name ?? '').filter(Boolean)}
+              onSave={(v) => onSave(c.id, { application_status: v })}
+            />
+          );
+        },
+      },
+      {
+        id: 'visa_received_date',
+        header: 'Visa Date',
+        accessorFn: (row) => row.visa_received_date ?? '',
+        size: 120,
+        cell: ({ row }) => {
+          const c = row.original;
+          return (
+            <DateCell
+              value={c.visa_received_date}
+              onSave={(v) => onSave(c.id, { visa_received_date: v })}
+            />
+          );
+        },
+      },
+      {
+        id: 'institution',
+        header: 'Institution',
+        accessorFn: (row) => row.institution_name ?? row.institution_text_raw ?? '',
+        size: 220,
+        cell: ({ row }) => {
+          const c = row.original;
+          return (
+            <FkCell
+              value={c.institution_id}
+              label={c.institution_name}
+              options={refData.institutions}
+              onSave={(id) => onSave(c.id, { institution_id: id })}
+            />
+          );
+        },
+      },
+      {
+        id: 'course_start_date',
+        header: 'Course Start',
+        accessorFn: (row) => row.course_start_date ?? '',
+        size: 130,
+        cell: ({ row }) => {
+          const c = row.original;
+          return (
+            <DateCell
+              value={c.course_start_date}
+              onSave={(v) => onSave(c.id, { course_start_date: v })}
+            />
+          );
+        },
+      },
+      {
+        id: 'course_status',
+        header: 'Course Status',
+        accessorFn: (row) => row.course_status ?? '',
+        size: 140,
+        cell: ({ row }) => {
+          const c = row.original;
+          return (
+            <TextCell
+              value={c.course_status}
+              onSave={(v) => onSave(c.id, { course_status: v })}
+            />
+          );
+        },
+      },
+      {
+        id: 'counsellor',
+        header: 'Counsellor',
+        accessorFn: (row) => row.counsellor_name ?? '',
+        size: 180,
+        cell: ({ row }) => {
+          const c = row.original;
+          return (
+            <StaffCell
+              staffId={c.counsellor_staff_id}
+              staffName={c.counsellor_name}
+              options={refData.staff_all}
+              onSave={(staffId, roleId) =>
+                onSave(c.id, {
+                  counsellor_staff_id: staffId,
+                  counsellor_role_id: roleId,
+                })
+              }
+            />
+          );
+        },
+      },
+      {
+        id: 'case_officer',
+        header: 'Case Officer',
+        accessorFn: (row) => row.case_officer_name ?? '',
+        size: 180,
+        cell: ({ row }) => {
+          const c = row.original;
+          return (
+            <StaffCell
+              staffId={c.case_officer_staff_id}
+              staffName={c.case_officer_name}
+              options={refData.staff_all}
+              onSave={(staffId, roleId) =>
+                onSave(c.id, {
+                  case_officer_staff_id: staffId,
+                  case_officer_role_id: roleId,
+                })
+              }
+            />
+          );
+        },
+      },
+      {
+        id: 'pre_sales',
+        header: 'Pre-sales',
+        accessorFn: (row) => row.pre_sales_name ?? '',
+        size: 180,
+        cell: ({ row }) => {
+          const c = row.original;
+          return (
+            <StaffCell
+              staffId={c.pre_sales_staff_id}
+              staffName={c.pre_sales_name}
+              options={refData.staff_all}
+              onSave={(staffId, _roleId) =>
+                onSave(c.id, { pre_sales_staff_id: staffId })
+              }
+            />
+          );
+        },
+      },
+      {
+        id: 'office',
+        header: 'Office',
+        accessorFn: (row) => row.case_office_code ?? '',
+        size: 120,
+        cell: ({ row }) => {
+          const c = row.original;
+          return (
+            <FkCell
+              value={c.case_office_id}
+              label={c.case_office_code}
+              options={refData.offices}
+              labelField="code"
+              onSave={(id) => onSave(c.id, { case_office_id: id })}
+            />
+          );
+        },
+      },
+      {
+        id: 'notes',
+        header: 'Notes',
+        accessorFn: (row) => row.notes ?? '',
+        size: 280,
+        cell: ({ row }) => {
+          const c = row.original;
+          return (
+            <TextAreaCell
+              value={c.notes}
+              onSave={(v) => onSave(c.id, { notes: v })}
+            />
+          );
+        },
+      },
+    ],
+    [refData, onSave],
+  );
+
+  // ---- table instance -------------------------------------------------
+  const table = useReactTable({
+    data: cases,
+    columns,
+    state: { sorting, columnFilters, columnOrder, columnSizing },
+    onSortingChange: setSorting,
+    onColumnFiltersChange: setColumnFilters,
+    onColumnOrderChange: setColumnOrder,
+    onColumnSizingChange: setColumnSizing,
+    getCoreRowModel: getCoreRowModel(),
+    getSortedRowModel: getSortedRowModel(),
+    getFilteredRowModel: getFilteredRowModel(),
+    columnResizeMode: 'onChange',
+    enableColumnResizing: true,
+    defaultColumn: { minSize: 80 },
+  });
+
+  // Move-column helpers (used by the small "←  →" buttons in each non-pinned header).
+  const moveCol = (id: string, direction: -1 | 1) => {
+    setColumnOrder((order) => {
+      const i = order.indexOf(id);
+      if (i === -1) return order;
+      const j = i + direction;
+      // Don't move into pinned zone
+      if (j < PINNED.length || j >= order.length) return order;
+      const next = order.slice();
+      [next[i], next[j]] = [next[j], next[i]];
+      return next;
+    });
+  };
+
+  const resetView = () => {
+    setSorting([]);
+    setColumnFilters([]);
+    setColumnOrder(DEFAULT_ORDER);
+    setColumnSizing({});
+  };
+
+  // Pinned (sticky) left offset calculations.
+  const pinnedLeft: Record<string, number> = {
+    import_status: 0,
+    contract_id: STICKY_W.status,
+    student_name: STICKY_W.status + STICKY_W.contract,
+  };
+
+  const visibleHeaders = table.getHeaderGroups()[0]?.headers ?? [];
+  const anyFilterActive = columnFilters.length > 0 || sorting.length > 0;
+
   return (
-    <button
-      type="button"
-      onClick={onClick}
-      className={`px-4 py-2.5 text-left transition border-b-2 -mb-px ${
-        active
-          ? 'border-blue-600 text-blue-700 bg-blue-50/40'
-          : 'border-transparent text-gray-600 hover:text-gray-900 hover:bg-gray-50'
-      }`}
+    <div className="border border-gray-200 rounded">
+      {/* Toolbar */}
+      <div className="flex items-center justify-between border-b border-gray-200 bg-gray-50 px-3 py-2 text-xs">
+        <div className="text-gray-600">
+          {table.getRowModel().rows.length === cases.length
+            ? `${cases.length} case${cases.length === 1 ? '' : 's'}`
+            : `${table.getRowModel().rows.length} of ${cases.length} case${
+                cases.length === 1 ? '' : 's'
+              } (filtered)`}
+        </div>
+        <div className="flex items-center gap-2">
+          {anyFilterActive && (
+            <button
+              onClick={resetView}
+              className="rounded border border-gray-300 bg-white px-2 py-1 hover:bg-gray-100"
+            >
+              Reset view
+            </button>
+          )}
+        </div>
+      </div>
+
+      <div className="overflow-auto max-h-[calc(100vh-320px)] relative">
+        <table
+          className="text-sm border-collapse"
+          style={{ width: table.getTotalSize() }}
+        >
+          <thead className="bg-gray-50 text-xs uppercase tracking-wide sticky top-0 z-20">
+            <tr>
+              {visibleHeaders.map((header) => {
+                const id = header.column.id;
+                const isPinned = PINNED.includes(id);
+                const pinnedStyle: CSSProperties = isPinned
+                  ? {
+                      position: 'sticky',
+                      left: pinnedLeft[id] ?? 0,
+                      zIndex: 30,
+                      background: '#F9FAFB', // gray-50
+                    }
+                  : {};
+                return (
+                  <th
+                    key={header.id}
+                    style={{
+                      width: header.getSize(),
+                      ...pinnedStyle,
+                    }}
+                    className="border-b border-r border-gray-200 px-3 py-2 text-left font-semibold text-gray-700 align-bottom relative group"
+                  >
+                    <div className="flex items-center justify-between gap-1">
+                      <button
+                        type="button"
+                        onClick={header.column.getToggleSortingHandler()}
+                        className="flex-1 text-left truncate hover:text-gray-900"
+                        title="Click to sort"
+                      >
+                        {flexRender(header.column.columnDef.header, header.getContext())}
+                        <SortIndicator dir={header.column.getIsSorted()} />
+                      </button>
+                      {!isPinned && (
+                        <span className="opacity-0 group-hover:opacity-100 transition flex items-center gap-0.5">
+                          <button
+                            type="button"
+                            onClick={() => moveCol(id, -1)}
+                            className="text-gray-400 hover:text-gray-900 px-1"
+                            title="Move left"
+                          >
+                            ←
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => moveCol(id, 1)}
+                            className="text-gray-400 hover:text-gray-900 px-1"
+                            title="Move right"
+                          >
+                            →
+                          </button>
+                        </span>
+                      )}
+                    </div>
+                    {/* Filter input */}
+                    <input
+                      type="text"
+                      value={(header.column.getFilterValue() as string) ?? ''}
+                      onChange={(e) => header.column.setFilterValue(e.target.value)}
+                      placeholder="Filter…"
+                      className="mt-1 w-full text-xs font-normal normal-case px-1.5 py-0.5 border border-gray-200 rounded focus:outline-none focus:border-blue-400"
+                    />
+                    {/* Resize handle (not on pinned cols) */}
+                    {header.column.getCanResize() && (
+                      <div
+                        onMouseDown={header.getResizeHandler()}
+                        onTouchStart={header.getResizeHandler()}
+                        className={`absolute top-0 right-0 h-full w-1 cursor-col-resize select-none touch-none ${
+                          header.column.getIsResizing()
+                            ? 'bg-blue-500'
+                            : 'bg-transparent hover:bg-blue-300'
+                        }`}
+                      />
+                    )}
+                  </th>
+                );
+              })}
+            </tr>
+          </thead>
+          <tbody>
+            {table.getRowModel().rows.map((row, idx) => {
+              const c = row.original;
+              const altBg = idx % 2 === 0 ? 'bg-white' : 'bg-slate-50';
+              const rowBg =
+                c.import_status === 'OK' ? altBg : ROW_BG[c.import_status] ?? altBg;
+              const stickyBg =
+                c.import_status === 'OK'
+                  ? idx % 2 === 0
+                    ? '#FFFFFF'
+                    : '#F8FAFC' /* slate-50 */
+                  : STICKY_BG_HEX[c.import_status] ?? '#FFFFFF';
+
+              return (
+                <tr
+                  key={row.id}
+                  className={`${rowBg} border-b border-gray-100 align-top`}
+                >
+                  {row.getVisibleCells().map((cell) => {
+                    const id = cell.column.id;
+                    const isPinned = PINNED.includes(id);
+                    const pinnedStyle: CSSProperties = isPinned
+                      ? {
+                          position: 'sticky',
+                          left: pinnedLeft[id] ?? 0,
+                          zIndex: 10,
+                          background: stickyBg,
+                        }
+                      : {};
+                    return (
+                      <td
+                        key={cell.id}
+                        style={{
+                          width: cell.column.getSize(),
+                          ...pinnedStyle,
+                        }}
+                        className="border-r border-gray-100 px-3 py-2"
+                      >
+                        {flexRender(cell.column.columnDef.cell, cell.getContext())}
+                      </td>
+                    );
+                  })}
+                </tr>
+              );
+            })}
+            {table.getRowModel().rows.length === 0 && cases.length > 0 && (
+              <tr>
+                <td
+                  colSpan={visibleHeaders.length}
+                  className="px-3 py-8 text-center text-gray-500"
+                >
+                  No cases match the current filters.{' '}
+                  <button
+                    onClick={resetView}
+                    className="text-blue-600 underline hover:text-blue-800"
+                  >
+                    Reset
+                  </button>
+                </td>
+              </tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+function SortIndicator({ dir }: { dir: false | 'asc' | 'desc' }) {
+  if (!dir) return <span className="text-gray-300 ml-1">↕</span>;
+  return <span className="text-gray-700 ml-1">{dir === 'asc' ? '↑' : '↓'}</span>;
+}
+
+// STICKY_BG was a Tailwind class map; for inline-style use in sticky cells
+// we need explicit hex equivalents.
+const STICKY_BG_HEX: Record<string, string> = {
+  OK: '#F0FDF4', // green-50
+  FLAGGED: '#FFFBEB', // amber-50
+  UNRESOLVED: '#FEF2F2', // red-50
+  SCRAP: '#F3F4F6', // gray-100
+};
+
+// ===========================================================================
+// Mobile card view — same cells, vertical layout
+// ===========================================================================
+
+function CaseCard({
+  caseRow: c,
+  refData,
+  onSave,
+}: { caseRow: Case } & CommonProps) {
+  const save = (updates: Record<string, unknown>) => onSave(c.id, updates);
+  const rowBg = ROW_BG[c.import_status] ?? '';
+
+  return (
+    <div className={`p-4 ${rowBg}`}>
+      <div className="flex justify-between items-start mb-3">
+        <div className="font-mono text-xs text-gray-700">{c.contract_id}</div>
+        <SelectCell
+          value={c.import_status}
+          options={refData.import_statuses}
+          render={(v) => (
+            <span
+              className={`text-xs px-2 py-0.5 rounded font-medium ${BADGE[v ?? ''] ?? 'bg-gray-200'}`}
+            >
+              {v}
+            </span>
+          )}
+          onSave={(v) => save({ import_status: v })}
+        />
+      </div>
+      <div className="space-y-2 text-sm">
+        <Field label="Student">
+          <TextCell value={c.student_name} onSave={(v) => save({ student_name: v })} />
+        </Field>
+        <Field label="Student ID">
+          <TextCell
+            value={c.student_id}
+            monospace
+            onSave={(v) => save({ student_id: v })}
+          />
+        </Field>
+        <Field label="Signed">
+          <DateCell
+            value={c.contract_signed_date}
+            onSave={(v) => save({ contract_signed_date: v })}
+          />
+        </Field>
+        <Field label="Client Type">
+          <SelectCell
+            value={c.client_type_code}
+            options={refData.client_types}
+            onSave={(v) => save({ client_type_code: v })}
+          />
+        </Field>
+        <Field label="Country">
+          <FkCell
+            value={c.country_id}
+            label={c.country_name}
+            options={refData.countries}
+            onSave={(id) => save({ country_id: id })}
+          />
+        </Field>
+        <Field label="Refer Source">
+          <ReferSourceCell caseRow={c} refData={refData} onSave={save} />
+        </Field>
+        <Field label="App Status">
+          <SelectCell
+            value={c.application_status}
+            options={refData.statuses.map((s) => s.name ?? '').filter(Boolean)}
+            onSave={(v) => save({ application_status: v })}
+          />
+        </Field>
+        <Field label="Visa Date">
+          <DateCell
+            value={c.visa_received_date}
+            onSave={(v) => save({ visa_received_date: v })}
+          />
+        </Field>
+        <Field label="Institution">
+          <FkCell
+            value={c.institution_id}
+            label={c.institution_name}
+            options={refData.institutions}
+            onSave={(id) => save({ institution_id: id })}
+          />
+        </Field>
+        <Field label="Course Start">
+          <DateCell
+            value={c.course_start_date}
+            onSave={(v) => save({ course_start_date: v })}
+          />
+        </Field>
+        <Field label="Course Status">
+          <TextCell
+            value={c.course_status}
+            onSave={(v) => save({ course_status: v })}
+          />
+        </Field>
+        <Field label="Counsellor">
+          <StaffCell
+            staffId={c.counsellor_staff_id}
+            staffName={c.counsellor_name}
+            options={refData.staff_all}
+            onSave={(staffId, roleId) =>
+              save({
+                counsellor_staff_id: staffId,
+                counsellor_role_id: roleId,
+              })
+            }
+          />
+        </Field>
+        <Field label="Case Officer">
+          <StaffCell
+            staffId={c.case_officer_staff_id}
+            staffName={c.case_officer_name}
+            options={refData.staff_all}
+            onSave={(staffId, roleId) =>
+              save({
+                case_officer_staff_id: staffId,
+                case_officer_role_id: roleId,
+              })
+            }
+          />
+        </Field>
+        <Field label="Pre-sales">
+          <StaffCell
+            staffId={c.pre_sales_staff_id}
+            staffName={c.pre_sales_name}
+            options={refData.staff_all}
+            onSave={(staffId, _roleId) =>
+              save({
+                pre_sales_staff_id: staffId,
+              })
+            }
+          />
+        </Field>
+        <Field label="Office">
+          <FkCell
+            value={c.case_office_id}
+            label={c.case_office_code}
+            options={refData.offices}
+            labelField="code"
+            onSave={(id) => save({ case_office_id: id })}
+          />
+        </Field>
+        <Field label="Notes">
+          <TextAreaCell value={c.notes} onSave={(v) => save({ notes: v })} />
+        </Field>
+      </div>
+    </div>
+  );
+}
+
+function Field({ label, children }: { label: string; children: ReactNode }) {
+  return (
+    <div className="grid grid-cols-[110px_1fr] gap-2 items-start">
+      <div className="text-xs text-gray-500 uppercase tracking-wide pt-1">{label}</div>
+      <div>{children}</div>
+    </div>
+  );
+}
+
+// ===========================================================================
+// Editable cell primitives
+// ===========================================================================
+
+const DASH = <span className="text-gray-400">—</span>;
+const EDITABLE_BASE =
+  'cursor-pointer hover:bg-blue-50 px-2 py-1 rounded -mx-2 -my-1 min-h-[28px]';
+const INPUT_BASE = 'w-full px-2 py-1 border border-blue-500 rounded text-sm';
+
+type CellSavedState = 'idle' | 'saving' | 'error';
+
+function useCellState() {
+  const [state, setState] = useState<CellSavedState>('idle');
+  const [error, setError] = useState<string | null>(null);
+  const [editing, setEditing] = useState(false);
+  return { state, setState, error, setError, editing, setEditing };
+}
+
+function ErrorTooltip({ error }: { error: string | null }) {
+  if (!error) return null;
+  return (
+    <div className="absolute top-full left-0 mt-0.5 bg-red-100 text-red-800 text-xs px-2 py-1 rounded shadow z-20 max-w-[300px]">
+      {error}
+    </div>
+  );
+}
+
+// ---- TextCell -------------------------------------------------------------
+function TextCell({
+  value,
+  monospace,
+  onSave,
+}: {
+  value: string | null;
+  monospace?: boolean;
+  onSave: (newValue: string | null) => Promise<void>;
+}) {
+  const { state, setState, error, setError, editing, setEditing } = useCellState();
+  const [draft, setDraft] = useState(value ?? '');
+
+  useEffect(() => {
+    setDraft(value ?? '');
+  }, [value]);
+
+  async function commit() {
+    const cleaned = draft.trim();
+    const newVal = cleaned === '' ? null : cleaned;
+    if (newVal === (value ?? null)) {
+      setEditing(false);
+      return;
+    }
+    setState('saving');
+    setError(null);
+    try {
+      await onSave(newVal);
+      setEditing(false);
+      setState('idle');
+    } catch (e) {
+      setError(String(e instanceof Error ? e.message : e));
+      setState('error');
+    }
+  }
+
+  function onKey(e: KeyboardEvent<HTMLInputElement>) {
+    if (e.key === 'Enter') commit();
+    else if (e.key === 'Escape') {
+      setEditing(false);
+      setError(null);
+      setDraft(value ?? '');
+    }
+  }
+
+  if (!editing) {
+    return (
+      <div
+        className={EDITABLE_BASE + (monospace ? ' font-mono text-xs' : '')}
+        onClick={() => {
+          setEditing(true);
+          setError(null);
+          setDraft(value ?? '');
+        }}
+      >
+        {value || DASH}
+      </div>
+    );
+  }
+
+  return (
+    <div className="relative">
+      <input
+        autoFocus
+        value={draft}
+        onChange={(e) => setDraft(e.target.value)}
+        onBlur={commit}
+        onKeyDown={onKey}
+        disabled={state === 'saving'}
+        className={INPUT_BASE + (monospace ? ' font-mono text-xs' : '')}
+      />
+      <ErrorTooltip error={error} />
+    </div>
+  );
+}
+
+// ---- TextAreaCell --------------------------------------------------------
+function TextAreaCell({
+  value,
+  onSave,
+}: {
+  value: string | null;
+  onSave: (newValue: string | null) => Promise<void>;
+}) {
+  const { state, setState, error, setError, editing, setEditing } = useCellState();
+  const [draft, setDraft] = useState(value ?? '');
+
+  useEffect(() => {
+    setDraft(value ?? '');
+  }, [value]);
+
+  async function commit() {
+    const newVal = draft === '' ? null : draft;
+    if (newVal === (value ?? null)) {
+      setEditing(false);
+      return;
+    }
+    setState('saving');
+    setError(null);
+    try {
+      await onSave(newVal);
+      setEditing(false);
+      setState('idle');
+    } catch (e) {
+      setError(String(e instanceof Error ? e.message : e));
+      setState('error');
+    }
+  }
+
+  if (!editing) {
+    return (
+      <div
+        className={EDITABLE_BASE + ' text-xs'}
+        title={value ?? undefined}
+        onClick={() => {
+          setEditing(true);
+          setError(null);
+          setDraft(value ?? '');
+        }}
+      >
+        {value || DASH}
+      </div>
+    );
+  }
+
+  return (
+    <div className="relative">
+      <textarea
+        autoFocus
+        value={draft}
+        onChange={(e) => setDraft(e.target.value)}
+        onBlur={commit}
+        onKeyDown={(e) => {
+          if (e.key === 'Escape') {
+            setEditing(false);
+            setError(null);
+            setDraft(value ?? '');
+          }
+        }}
+        disabled={state === 'saving'}
+        rows={3}
+        className={INPUT_BASE + ' min-w-[200px] text-xs'}
+      />
+      <ErrorTooltip error={error} />
+    </div>
+  );
+}
+
+// ---- DateCell ------------------------------------------------------------
+function DateCell({
+  value,
+  onSave,
+}: {
+  value: string | null;
+  onSave: (newValue: string | null) => Promise<void>;
+}) {
+  const { state, setState, error, setError, editing, setEditing } = useCellState();
+  const [draft, setDraft] = useState(value ?? '');
+
+  useEffect(() => {
+    setDraft(value ?? '');
+  }, [value]);
+
+  async function commit() {
+    const newVal = draft === '' ? null : draft;
+    if (newVal === (value ?? null)) {
+      setEditing(false);
+      return;
+    }
+    setState('saving');
+    setError(null);
+    try {
+      await onSave(newVal);
+      setEditing(false);
+      setState('idle');
+    } catch (e) {
+      setError(String(e instanceof Error ? e.message : e));
+      setState('error');
+    }
+  }
+
+  if (!editing) {
+    return (
+      <div
+        className={EDITABLE_BASE + ' font-mono text-xs whitespace-nowrap'}
+        onClick={() => {
+          setEditing(true);
+          setError(null);
+          setDraft(value ?? '');
+        }}
+      >
+        {value || DASH}
+      </div>
+    );
+  }
+
+  return (
+    <div className="relative">
+      <input
+        autoFocus
+        type="date"
+        value={draft}
+        onChange={(e) => setDraft(e.target.value)}
+        onBlur={commit}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter') commit();
+          else if (e.key === 'Escape') {
+            setEditing(false);
+            setError(null);
+            setDraft(value ?? '');
+          }
+        }}
+        disabled={state === 'saving'}
+        className={INPUT_BASE + ' text-xs font-mono'}
+      />
+      <ErrorTooltip error={error} />
+    </div>
+  );
+}
+
+// ---- SelectCell (string options, e.g. import_status, application_status) -
+function SelectCell({
+  value,
+  options,
+  render,
+  onSave,
+}: {
+  value: string | null;
+  options: string[];
+  render?: (v: string | null) => ReactNode;
+  onSave: (newValue: string | null) => Promise<void>;
+}) {
+  const { state, setState, error, setError, editing, setEditing } = useCellState();
+
+  async function commit(newVal: string | null) {
+    if (newVal === (value ?? null)) {
+      setEditing(false);
+      return;
+    }
+    setState('saving');
+    setError(null);
+    try {
+      await onSave(newVal);
+      setEditing(false);
+      setState('idle');
+    } catch (e) {
+      setError(String(e instanceof Error ? e.message : e));
+      setState('error');
+    }
+  }
+
+  if (!editing) {
+    return (
+      <div
+        className={EDITABLE_BASE}
+        onClick={() => {
+          setEditing(true);
+          setError(null);
+        }}
+      >
+        {render ? render(value) : value || DASH}
+      </div>
+    );
+  }
+
+  return (
+    <div className="relative">
+      <select
+        autoFocus
+        defaultValue={value ?? ''}
+        onChange={(e) => commit(e.target.value || null)}
+        onBlur={() => setEditing(false)}
+        onKeyDown={(e) => {
+          if (e.key === 'Escape') {
+            setEditing(false);
+            setError(null);
+          }
+        }}
+        disabled={state === 'saving'}
+        className={INPUT_BASE}
+      >
+        <option value="">—</option>
+        {options.map((opt) => (
+          <option key={opt} value={opt}>
+            {opt}
+          </option>
+        ))}
+      </select>
+      <ErrorTooltip error={error} />
+    </div>
+  );
+}
+
+// ---- FkCell (foreign key with searchable datalist) ---------------------
+function FkCell({
+  value,
+  label,
+  options,
+  labelField = 'name',
+  onSave,
+}: {
+  value: number | null;
+  label: string | null;
+  options: RefItem[];
+  labelField?: 'name' | 'code';
+  onSave: (newId: number | null) => Promise<void>;
+}) {
+  const { state, setState, error, setError, editing, setEditing } = useCellState();
+  const [draft, setDraft] = useState(label ?? '');
+
+  useEffect(() => {
+    setDraft(label ?? '');
+  }, [label]);
+
+  async function commit() {
+    const trimmed = draft.trim();
+    if (trimmed === '') {
+      if (value === null) {
+        setEditing(false);
+        return;
+      }
+      setState('saving');
+      setError(null);
+      try {
+        await onSave(null);
+        setEditing(false);
+        setState('idle');
+      } catch (e) {
+        setError(String(e instanceof Error ? e.message : e));
+        setState('error');
+      }
+      return;
+    }
+    const match = options.find(
+      (o) => (labelField === 'code' ? o.code : o.name) === trimmed,
+    );
+    if (!match) {
+      setError(`No matching option for "${trimmed}"`);
+      setState('error');
+      return;
+    }
+    if (match.id === value) {
+      setEditing(false);
+      return;
+    }
+    setState('saving');
+    setError(null);
+    try {
+      await onSave(match.id);
+      setEditing(false);
+      setState('idle');
+    } catch (e) {
+      setError(String(e instanceof Error ? e.message : e));
+      setState('error');
+    }
+  }
+
+  if (!editing) {
+    return (
+      <div
+        className={EDITABLE_BASE}
+        onClick={() => {
+          setEditing(true);
+          setError(null);
+          setDraft(''); // empty draft → show all options
+        }}
+      >
+        {label || DASH}
+      </div>
+    );
+  }
+
+  const lcDraft = draft.trim().toLowerCase();
+  const filtered = lcDraft
+    ? options.filter((o) => {
+        const txt = (labelField === 'code' ? o.code : o.name) ?? '';
+        return txt.toLowerCase().includes(lcDraft);
+      })
+    : options;
+
+  function pick(o: RefItem) {
+    if (o.id === value) {
+      setEditing(false);
+      return;
+    }
+    setState('saving');
+    setError(null);
+    onSave(o.id)
+      .then(() => {
+        setEditing(false);
+        setState('idle');
+      })
+      .catch((e) => {
+        setError(String(e instanceof Error ? e.message : e));
+        setState('error');
+      });
+  }
+
+  return (
+    <div className="relative">
+      <input
+        autoFocus
+        value={draft}
+        onChange={(e) => setDraft(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter') commit();
+          else if (e.key === 'Escape') {
+            setEditing(false);
+            setError(null);
+            setDraft(label ?? '');
+          }
+        }}
+        disabled={state === 'saving'}
+        className={INPUT_BASE}
+        placeholder={`type to search… (${options.length} options)`}
+      />
+      <div className="absolute left-0 right-0 top-full mt-1 max-h-64 overflow-y-auto bg-white border border-gray-200 rounded shadow-lg z-30">
+        {filtered.length === 0 ? (
+          <div className="px-3 py-2 text-xs text-gray-400">No matches</div>
+        ) : (
+          filtered.slice(0, 200).map((o) => {
+            const txt = (labelField === 'code' ? o.code : o.name) ?? '';
+            const isCurrent = o.id === value;
+            return (
+              <div
+                key={o.id}
+                onMouseDown={(e) => {
+                  e.preventDefault(); // prevent input blur before click registers
+                  pick(o);
+                }}
+                className={`px-3 py-1.5 text-sm cursor-pointer hover:bg-blue-50 ${
+                  isCurrent ? 'bg-blue-100 font-medium' : ''
+                }`}
+              >
+                {txt}
+              </div>
+            );
+          })
+        )}
+        {filtered.length > 200 && (
+          <div className="px-3 py-1.5 text-xs text-gray-400 border-t border-gray-100">
+            … and {filtered.length - 200} more. Refine the search.
+          </div>
+        )}
+      </div>
+      <ErrorTooltip error={error} />
+    </div>
+  );
+}
+
+// ---- StaffCell — picks staff AND auto-sets role_id from primary_role ---
+function StaffCell({
+  staffId,
+  staffName,
+  options,
+  onSave,
+}: {
+  staffId: number | null;
+  staffName: string | null;
+  options: RefItem[];
+  onSave: (newStaffId: number | null, newRoleId: number | null) => Promise<void>;
+}) {
+  const { state, setState, error, setError, editing, setEditing } = useCellState();
+  const [draft, setDraft] = useState(staffName ?? '');
+
+  useEffect(() => {
+    setDraft(staffName ?? '');
+  }, [staffName]);
+
+  async function commit() {
+    const trimmed = draft.trim();
+    if (trimmed === '') {
+      if (staffId === null) {
+        setEditing(false);
+        return;
+      }
+      setState('saving');
+      setError(null);
+      try {
+        await onSave(null, null);
+        setEditing(false);
+        setState('idle');
+      } catch (e) {
+        setError(String(e instanceof Error ? e.message : e));
+        setState('error');
+      }
+      return;
+    }
+    const match = options.find((o) => o.name === trimmed);
+    if (!match) {
+      setError(`No matching staff for "${trimmed}"`);
+      setState('error');
+      return;
+    }
+    if (match.id === staffId) {
+      setEditing(false);
+      return;
+    }
+    setState('saving');
+    setError(null);
+    try {
+      await onSave(match.id, match.primary_role_id ?? null);
+      setEditing(false);
+      setState('idle');
+    } catch (e) {
+      setError(String(e instanceof Error ? e.message : e));
+      setState('error');
+    }
+  }
+
+  if (!editing) {
+    return (
+      <div
+        className={EDITABLE_BASE}
+        onClick={() => {
+          setEditing(true);
+          setError(null);
+          setDraft(''); // empty draft → show all staff
+        }}
+      >
+        {staffName || DASH}
+      </div>
+    );
+  }
+
+  const lcDraft = draft.trim().toLowerCase();
+  const filtered = lcDraft
+    ? options.filter((o) => (o.name ?? '').toLowerCase().includes(lcDraft))
+    : options;
+
+  function pick(o: typeof options[number]) {
+    if (o.id === staffId) {
+      setEditing(false);
+      return;
+    }
+    setState('saving');
+    setError(null);
+    onSave(o.id, o.primary_role_id ?? null)
+      .then(() => {
+        setEditing(false);
+        setState('idle');
+      })
+      .catch((e) => {
+        setError(String(e instanceof Error ? e.message : e));
+        setState('error');
+      });
+  }
+
+  return (
+    <div className="relative">
+      <input
+        autoFocus
+        value={draft}
+        onChange={(e) => setDraft(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter') commit();
+          else if (e.key === 'Escape') {
+            setEditing(false);
+            setError(null);
+            setDraft(staffName ?? '');
+          }
+        }}
+        disabled={state === 'saving'}
+        className={INPUT_BASE}
+        placeholder={`type to search… (${options.length} staff)`}
+      />
+      <div className="absolute left-0 right-0 top-full mt-1 max-h-64 overflow-y-auto bg-white border border-gray-200 rounded shadow-lg z-30">
+        {filtered.length === 0 ? (
+          <div className="px-3 py-2 text-xs text-gray-400">No matches</div>
+        ) : (
+          filtered.slice(0, 200).map((o) => {
+            const isCurrent = o.id === staffId;
+            return (
+              <div
+                key={o.id}
+                onMouseDown={(e) => {
+                  e.preventDefault();
+                  pick(o);
+                }}
+                className={`px-3 py-1.5 text-sm cursor-pointer hover:bg-blue-50 ${
+                  isCurrent ? 'bg-blue-100 font-medium' : ''
+                }`}
+              >
+                {o.name}
+              </div>
+            );
+          })
+        )}
+        {filtered.length > 200 && (
+          <div className="px-3 py-1.5 text-xs text-gray-400 border-t border-gray-100">
+            … and {filtered.length - 200} more. Refine the search.
+          </div>
+        )}
+      </div>
+      <ErrorTooltip error={error} />
+    </div>
+  );
+}
+
+// ---- ReferSourceCell — composite type + entity picker ------------------
+function ReferSourceCell({
+  caseRow: c,
+  refData,
+  onSave,
+}: {
+  caseRow: Case;
+  refData: RefData;
+  onSave: (updates: Record<string, unknown>) => Promise<void>;
+}) {
+  const { state, setState, error, setError, editing, setEditing } = useCellState();
+  const initialType = (c.referring_source_type ?? 'DIRECT') as SourceType;
+  const [draftType, setDraftType] = useState<SourceType>(initialType);
+  const [draftEntityId, setDraftEntityId] = useState<number | null>(
+    c.referring_partner_id ?? c.referring_sub_agent_id ?? c.referring_office_id ?? null,
+  );
+
+  const displayName =
+    c.referring_partner_name ||
+    c.referring_sub_agent_name ||
+    c.referring_office_code ||
+    c.referring_agent_text_raw ||
+    null;
+
+  let entityOptions: RefItem[] = [];
+  if (draftType === 'SUB_AGENT') entityOptions = refData.sub_agents;
+  else if (draftType === 'MASTER_AGENT')
+    entityOptions = refData.partners.filter(
+      (p) => p.classification === 'Master agent',
+    );
+  else if (draftType === 'GROUP')
+    entityOptions = refData.partners.filter((p) => p.classification === 'Group');
+  else if (draftType === 'OFFICE') entityOptions = refData.offices;
+
+  async function commit() {
+    if (draftType !== 'DIRECT' && draftEntityId === null) {
+      setError(`Pick a ${draftType.toLowerCase().replace('_', ' ')}`);
+      setState('error');
+      return;
+    }
+    const updates: Record<string, unknown> = {
+      referring_source_type: draftType,
+      referring_partner_id: null,
+      referring_sub_agent_id: null,
+      referring_office_id: null,
+    };
+    if (draftType === 'SUB_AGENT') updates.referring_sub_agent_id = draftEntityId;
+    else if (draftType === 'MASTER_AGENT' || draftType === 'GROUP')
+      updates.referring_partner_id = draftEntityId;
+    else if (draftType === 'OFFICE') updates.referring_office_id = draftEntityId;
+
+    setState('saving');
+    setError(null);
+    try {
+      await onSave(updates);
+      setEditing(false);
+      setState('idle');
+    } catch (e) {
+      setError(String(e instanceof Error ? e.message : e));
+      setState('error');
+    }
+  }
+
+  if (!editing) {
+    return (
+      <div
+        className={EDITABLE_BASE + ' min-w-[150px]'}
+        onClick={() => {
+          setEditing(true);
+          setError(null);
+          setDraftType(initialType);
+          setDraftEntityId(
+            c.referring_partner_id ??
+              c.referring_sub_agent_id ??
+              c.referring_office_id ??
+              null,
+          );
+        }}
+      >
+        <div className="text-xs">
+          <span className="text-gray-500">[{c.referring_source_type ?? 'DIRECT'}]</span>{' '}
+          {displayName || DASH}
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="relative bg-white p-2 border border-blue-500 rounded shadow-sm min-w-[260px] z-20">
+      <div className="space-y-1.5">
+        <label className="block text-xs font-medium text-gray-700">Type</label>
+        <select
+          value={draftType}
+          onChange={(e) => {
+            setDraftType(e.target.value as SourceType);
+            setDraftEntityId(null);
+          }}
+          className="w-full px-2 py-1 border border-gray-300 rounded text-xs"
+          disabled={state === 'saving'}
+        >
+          {refData.source_types.map((t) => (
+            <option key={t} value={t}>
+              {t}
+            </option>
+          ))}
+        </select>
+
+        {draftType !== 'DIRECT' && (
+          <>
+            <label className="block text-xs font-medium text-gray-700">Entity</label>
+            <select
+              value={draftEntityId ?? ''}
+              onChange={(e) =>
+                setDraftEntityId(e.target.value ? Number(e.target.value) : null)
+              }
+              className="w-full px-2 py-1 border border-gray-300 rounded text-xs"
+              disabled={state === 'saving'}
+            >
+              <option value="">— pick —</option>
+              {entityOptions.map((o) => (
+                <option key={o.id} value={o.id}>
+                  {o.name ?? o.code ?? `#${o.id}`}
+                </option>
+              ))}
+            </select>
+          </>
+        )}
+
+        <div className="flex gap-2 pt-1">
+          <button
+            type="button"
+            onClick={commit}
+            disabled={state === 'saving'}
+            className="px-2 py-1 bg-blue-600 text-white text-xs rounded hover:bg-blue-700 disabled:bg-gray-400"
+          >
+            {state === 'saving' ? 'Saving…' : 'Save'}
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              setEditing(false);
+              setError(null);
+            }}
+            className="px-2 py-1 bg-gray-200 text-gray-700 text-xs rounded hover:bg-gray-300"
+          >
+            Cancel
+          </button>
+        </div>
+        {error && (
+          <div className="bg-red-100 text-red-800 text-xs px-2 py-1 rounded">
+            {error}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ===========================================================================
+// Table primitives
+// ===========================================================================
+
+function Th({
+  children,
+  sticky,
+  left,
+  width,
+}: {
+  children: ReactNode;
+  sticky?: boolean;
+  left?: number;
+  width?: number;
+}) {
+  const stickyCls = sticky
+    ? `sticky bg-gray-50 z-10 border-r border-gray-200 shadow-[2px_0_2px_-2px_rgba(0,0,0,0.05)] overflow-hidden`
+    : '';
+  const style: CSSProperties = {};
+  if (sticky && left !== undefined) style.left = left;
+  if (width !== undefined) {
+    style.width = width;
+    style.minWidth = width;
+    style.maxWidth = width;
+  }
+  return (
+    <th
+      className={`px-3 py-2 text-left font-medium text-gray-600 whitespace-nowrap ${stickyCls}`}
+      style={Object.keys(style).length ? style : undefined}
     >
-      <div className="text-sm font-medium">{label}</div>
-      <div className="text-xs text-gray-500">{sub}</div>
-    </button>
-  )
+      {children}
+    </th>
+  );
 }
 
-function IndividualNote() {
+function Td({
+  children,
+  sticky,
+  left,
+  bg,
+  width,
+  wrap,
+}: {
+  children: ReactNode;
+  sticky?: boolean;
+  left?: number;
+  bg?: string;
+  width?: number;
+  wrap?: boolean;
+}) {
+  const stickyCls = sticky
+    ? `sticky z-10 border-r border-gray-200 ${bg ?? 'bg-white'} shadow-[2px_0_2px_-2px_rgba(0,0,0,0.05)] overflow-hidden`
+    : '';
+  const wrapCls = wrap ? '' : 'whitespace-nowrap';
+  const style: CSSProperties = {};
+  if (sticky && left !== undefined) style.left = left;
+  if (width !== undefined) {
+    style.width = width;
+    style.minWidth = width;
+    style.maxWidth = width;
+  }
   return (
-    <div className="mb-4 rounded border border-gray-200 bg-gray-50 px-4 py-3 text-xs text-gray-700">
-      <strong>Input sheet mode.</strong> Each file should be a single staff member&apos;s
-      closed-file report for one month, with a filename like{' '}
-      <code className="font-mono">Phạm Thị Lợi&apos;s report of closed file in July 2025.xlsx</code>.
-      Year and month are read from the filename automatically.
-    </div>
-  )
-}
-
-function ConsolidatedNote() {
-  return (
-    <div className="mb-4 rounded border border-amber-200 bg-amber-50 px-4 py-3 text-xs text-amber-900">
-      <strong>Mass Upload mode.</strong> A single consolidated xlsx containing every closed-file row across many
-      months and staff (the format we use for regression testing). The period for each row is derived from its
-      status + date columns. Cases land in the same Uploaded pillar as Input sheet imports — once loaded, they look identical in the Review Board.
-    </div>
-  )
+    <td
+      className={`px-3 py-2 ${wrapCls} ${stickyCls}`}
+      style={Object.keys(style).length ? style : undefined}
+    >
+      {children}
+    </td>
+  );
 }
