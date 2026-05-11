@@ -26,10 +26,10 @@ interface PillarMeta {
   title: string;
   blurb: string;
   href: string;
-  accent: string;       // background accent (tailwind)
-  pill: string;         // accent badge (tailwind)
-  border: string;       // border accent (tailwind)
-  dot: string;          // status dot (tailwind)
+  accent: string;
+  pill: string;
+  border: string;
+  dot: string;
 }
 
 const PILLARS: PillarMeta[] = [
@@ -37,7 +37,7 @@ const PILLARS: PillarMeta[] = [
     state: "uploaded",
     title: "Uploaded",
     blurb: "Just imported. Needs to be picked up for review.",
-    href: "/cases/uploaded",
+    href: "/import/review?workflow_state=uploaded",
     accent: "bg-slate-50",
     pill: "bg-slate-100 text-slate-700",
     border: "border-slate-300",
@@ -47,7 +47,7 @@ const PILLARS: PillarMeta[] = [
     state: "in_review",
     title: "In Review",
     blurb: "Under review by case staff, Data Quality, and Finance.",
-    href: "/cases/in_review",
+    href: "/import/review?workflow_state=in_review",
     accent: "bg-amber-50",
     pill: "bg-amber-100 text-amber-800",
     border: "border-amber-300",
@@ -57,7 +57,7 @@ const PILLARS: PillarMeta[] = [
     state: "submitted",
     title: "Submitted",
     blurb: "All review approvals collected. Ready for engine processing.",
-    href: "/cases/submitted",
+    href: "/import/review?workflow_state=submitted",
     accent: "bg-sky-50",
     pill: "bg-sky-100 text-sky-800",
     border: "border-sky-300",
@@ -67,7 +67,7 @@ const PILLARS: PillarMeta[] = [
     state: "closed",
     title: "Closed",
     blurb: "Engine complete. Senior Manager review for payment release.",
-    href: "/cases/closed",
+    href: "/import/review?workflow_state=closed",
     accent: "bg-emerald-50",
     pill: "bg-emerald-100 text-emerald-800",
     border: "border-emerald-300",
@@ -125,10 +125,6 @@ export default function HomePage() {
   );
 }
 
-/* -------------------------------------------------------------------------
- * Header
- * ----------------------------------------------------------------------- */
-
 function Header() {
   return (
     <header className="border-b border-slate-200 bg-white">
@@ -142,25 +138,17 @@ function Header() {
             <div className="text-xs text-slate-500">Case workflow</div>
           </div>
         </div>
-
-        {/* Acting-as picker — stub for now. Wired up in a later step. */}
-        <div className="flex items-center gap-3">
-          <button
-            className="rounded-md border border-slate-200 bg-white px-3 py-1.5 text-sm text-slate-700 hover:bg-slate-50"
-            disabled
-            title="Role switching not yet wired up"
-          >
-            Acting as: <span className="font-medium">Admin</span>
-          </button>
-        </div>
+        <button
+          className="rounded-md border border-slate-200 bg-white px-3 py-1.5 text-sm text-slate-700 hover:bg-slate-50"
+          disabled
+          title="Role switching not yet wired up"
+        >
+          Acting as: <span className="font-medium">Admin</span>
+        </button>
       </div>
     </header>
   );
 }
-
-/* -------------------------------------------------------------------------
- * Page intro
- * ----------------------------------------------------------------------- */
 
 function PageIntro({ total }: { total: number | null }) {
   return (
@@ -178,10 +166,6 @@ function PageIntro({ total }: { total: number | null }) {
     </div>
   );
 }
-
-/* -------------------------------------------------------------------------
- * Pillar card
- * ----------------------------------------------------------------------- */
 
 function PillarCard({
   meta,
@@ -222,10 +206,6 @@ function PillarCard({
     </Link>
   );
 }
-
-/* -------------------------------------------------------------------------
- * Upload CTA
- * ----------------------------------------------------------------------- */
 
 function UploadCallToAction() {
   return (

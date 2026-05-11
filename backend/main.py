@@ -171,21 +171,60 @@ EDITABLE_FIELDS = {
 @app.get("/api/cases")
 def list_cases(
     staff_id: Optional[int] = Query(None, description="ref_staff.id; if omitted, returns all cases for the period"),
-    year: int = Query(..., ge=2020, le=2030),
-    month: int = Query(..., ge=1, le=12),
+    year: Optional[int] = Query(None, ge=2020, le=2030, description="Required unless workflow_state is given"),
+    month: Optional[int] = Query(None, ge=1, le=12, description="Required unless workflow_state is given"),
+    workflow_state: Optional[str] = Query(None, description="One of uploaded/in_review/submitted/closed. Alternative filter mode (Phase 15) — when set, year/month are not required."),
 ) -> list[dict]:
-    """Cases for one (year, month). Optionally filtered by staff_id (any role)."""
-    where_extra = ""
-    params: list[Any] = [year, month]
+    """Cases either for one (year, month) period or for one workflow_state pillar.
+
+    Filter modes:
+        - Period mode (legacy): year + month required. Optionally narrow to staff_id.
+        - Workflow-state mode (Phase 15): workflow_state required. Returns all
+          cases at that state across all periods/staff.
+
+    Exactly one mode must be active.
+    """
+    # Determine which filter mode is in use
+    has_period = year is not None and month is not None
+    has_state = workflow_state is not None
+
+    if has_state and has_period:
+        raise HTTPException(
+            status_code=400,
+            detail="Provide either (year + month) OR workflow_state, not both.",
+        )
+    if not has_state and not has_period:
+        raise HTTPException(
+            status_code=400,
+            detail="Provide either (year + month) OR workflow_state.",
+        )
+
+    where_clauses: list[str] = []
+    params: list[Any] = []
+
+    if has_period:
+        where_clauses.append("c.run_year = %s AND c.run_month = %s")
+        params.extend([year, month])
+
+    if has_state:
+        valid = {"uploaded", "in_review", "submitted", "closed"}
+        if workflow_state not in valid:
+            raise HTTPException(
+                status_code=400,
+                detail=f"workflow_state must be one of {sorted(valid)}, got {workflow_state!r}",
+            )
+        where_clauses.append("c.workflow_state = %s")
+        params.append(workflow_state)
+
     if staff_id is not None:
-        where_extra = """
-          AND (
+        where_clauses.append("""(
                 c.counsellor_staff_id   = %s
              OR c.case_officer_staff_id = %s
              OR c.vp_staff_id           = %s
-          )
-        """
+          )""")
         params.extend([staff_id, staff_id, staff_id])
+
+    where_sql = " AND ".join(where_clauses)
 
     sql = f"""
         SELECT
@@ -214,7 +253,9 @@ def list_cases(
             c.presales_staff_id,      presales.canonical_name  AS presales_name,
             c.presales_share_pct,
             c.vp_staff_id,            vp.canonical_name        AS vp_name,
-            c.target_owner_staff_id,  target_owner.canonical_name AS target_owner_name
+            c.target_owner_staff_id,  target_owner.canonical_name AS target_owner_name,
+            c.workflow_state,
+            c.pre_sales_staff_id,     ps.canonical_name        AS pre_sales_name
 
         FROM tx_case c
         LEFT JOIN ref_institution inst         ON c.institution_id          = inst.id
@@ -231,9 +272,8 @@ def list_cases(
         LEFT JOIN ref_staff       presales     ON c.presales_staff_id       = presales.id
         LEFT JOIN ref_staff       vp           ON c.vp_staff_id             = vp.id
         LEFT JOIN ref_staff       target_owner ON c.target_owner_staff_id   = target_owner.id
-        WHERE c.run_year  = %s
-          AND c.run_month = %s
-          {where_extra}
+        LEFT JOIN ref_staff       ps           ON c.pre_sales_staff_id      = ps.id
+        WHERE {where_sql}
         ORDER BY c.contract_id
     """
     with get_connection() as conn:

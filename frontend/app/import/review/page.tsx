@@ -187,6 +187,7 @@ export default function ReviewPage() {
   const [staffId, setStaffId] = useState<number | null>(null);
   const [year, setYear] = useState(new Date().getFullYear());
   const [month, setMonth] = useState(new Date().getMonth() + 1);
+  const [workflowState, setWorkflowState] = useState<string | null>(null);  // Phase 15: pillar-view mode
   const [cases, setCases] = useState<Case[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -255,10 +256,12 @@ export default function ReviewPage() {
   }, []);
 
   // --- URL params bootstrap -----------------------------------------------
-  // Pre-fills year/month from URL whether or not staff_id is present.
-  // Auto-loads only when all three are present.
+  // Two filter modes supported:
+  //   - workflow_state mode (Phase 15 pillar drill-down): /import/review?workflow_state=uploaded
+  //   - legacy period mode: /import/review?staff_id=N&year=YYYY&month=M
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
+    const wState = params.get('workflow_state');
     const sid = params.get('staff_id');
     const y = params.get('year');
     const m = params.get('month');
@@ -266,7 +269,11 @@ export default function ReviewPage() {
     const mNum = m ? Number(m) : null;
     if (yNum && Number.isFinite(yNum)) setYear(yNum);
     if (mNum && Number.isFinite(mNum)) setMonth(mNum);
-    if (sid && yNum && mNum) {
+
+    if (wState) {
+      setWorkflowState(wState);
+      loadCasesByWorkflowState(wState);
+    } else if (sid && yNum && mNum) {
       const sidNum = Number(sid);
       setStaffId(sidNum);
       loadCases(sidNum, yNum, mNum);
@@ -281,6 +288,27 @@ export default function ReviewPage() {
     setEngineMessage(null);
     try {
       const res = await fetch(`/api/cases?staff_id=${sid}&year=${y}&month=${m}`);
+      if (!res.ok) {
+        const detail = await res.text();
+        throw new Error(`HTTP ${res.status}: ${detail}`);
+      }
+      setCases(await res.json());
+      setHasLoaded(true);
+    } catch (e: unknown) {
+      const message = e instanceof Error ? e.message : String(e);
+      setError(message);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function loadCasesByWorkflowState(state: string) {
+    setLoading(true);
+    setError(null);
+    setCases([]);
+    setEngineMessage(null);
+    try {
+      const res = await fetch(`/api/cases?workflow_state=${encodeURIComponent(state)}`);
       if (!res.ok) {
         const detail = await res.text();
         throw new Error(`HTTP ${res.status}: ${detail}`);
@@ -381,30 +409,72 @@ export default function ReviewPage() {
   );
 
   // ----------------------------------------------------------------------
+  // Title metadata for the workflow_state header banner.
+  const PILLAR_TITLES: Record<string, { label: string; chip: string; dot: string }> = {
+    uploaded:  { label: 'Uploaded',  chip: 'bg-slate-100 text-slate-700',   dot: 'bg-slate-400' },
+    in_review: { label: 'In Review', chip: 'bg-amber-100 text-amber-800',   dot: 'bg-amber-500' },
+    submitted: { label: 'Submitted', chip: 'bg-sky-100 text-sky-800',       dot: 'bg-sky-500' },
+    closed:    { label: 'Closed',    chip: 'bg-emerald-100 text-emerald-800', dot: 'bg-emerald-500' },
+  };
+  const pillarMeta = workflowState ? PILLAR_TITLES[workflowState] : null;
+
   return (
     <main className="min-h-screen bg-gray-50 p-4 md:p-6">
       <div className="max-w-[1800px] mx-auto">
         <div className="flex items-baseline justify-between mb-6 flex-wrap gap-3">
           <div>
-            <h1 className="text-2xl md:text-3xl font-bold">Imported Cases — Review</h1>
-            <p className="text-gray-600 mt-1 text-sm">
-              Click any cell to edit. Saves on Enter or blur. Esc cancels.
-            </p>
+            {workflowState ? (
+              <>
+                <nav className="text-sm text-gray-500 mb-2">
+                  <a href="/" className="hover:text-gray-900 hover:underline">Case workflow</a>
+                  <span className="mx-2">/</span>
+                  <span className="text-gray-900">{pillarMeta?.label ?? workflowState}</span>
+                </nav>
+                <div className="flex items-center gap-3">
+                  {pillarMeta && <span className={`h-2.5 w-2.5 rounded-full ${pillarMeta.dot}`} />}
+                  <h1 className="text-2xl md:text-3xl font-bold">
+                    {pillarMeta?.label ?? workflowState}
+                  </h1>
+                  <span className={`rounded-full px-2.5 py-0.5 text-xs font-medium ${pillarMeta?.chip ?? 'bg-gray-100 text-gray-700'}`}>
+                    {loading ? '…' : `${cases.length} case${cases.length === 1 ? '' : 's'}`}
+                  </span>
+                </div>
+                <p className="text-gray-600 mt-1 text-sm">
+                  Click any cell to edit. Saves on Enter or blur. Esc cancels.
+                </p>
+              </>
+            ) : (
+              <>
+                <h1 className="text-2xl md:text-3xl font-bold">Imported Cases — Review</h1>
+                <p className="text-gray-600 mt-1 text-sm">
+                  Click any cell to edit. Saves on Enter or blur. Esc cancels.
+                </p>
+              </>
+            )}
           </div>
           <div className="flex items-center gap-4">
-            <a
-              href={`/bonus/${year}/${month}`}
-              className="text-sm text-blue-600 hover:underline"
-            >
-              View bonus report →
-            </a>
-            <a href="/imports" className="text-sm text-blue-600 hover:underline">
-              ← Back to Importer
-            </a>
+            {!workflowState && (
+              <a
+                href={`/bonus/${year}/${month}`}
+                className="text-sm text-blue-600 hover:underline"
+              >
+                View bonus report →
+              </a>
+            )}
+            {workflowState ? (
+              <a href="/" className="text-sm text-blue-600 hover:underline">
+                ← Back to Case workflow
+              </a>
+            ) : (
+              <a href="/imports" className="text-sm text-blue-600 hover:underline">
+                ← Back to Importer
+              </a>
+            )}
           </div>
         </div>
 
-        {/* Filter form */}
+        {/* Filter form — hidden when in workflow_state mode */}
+        {!workflowState && (
         <form
           onSubmit={handleSubmit}
           className="flex flex-wrap gap-3 items-end bg-white p-4 rounded-lg shadow border border-gray-200 mb-4"
@@ -465,6 +535,7 @@ export default function ReviewPage() {
             {loading ? 'Loading…' : 'Load'}
           </button>
         </form>
+        )}
 
         {refError && (
           <div className="mb-4 p-3 bg-amber-50 border border-amber-300 rounded text-sm text-amber-800">
@@ -533,7 +604,8 @@ export default function ReviewPage() {
               ))}
             </div>
 
-            {/* Submit-to-Engine footer */}
+            {/* Submit-to-Engine footer (period mode only — engine runs are period-scoped) */}
+            {!workflowState && (
             <div className="border-t border-gray-200 bg-gray-50 px-4 py-4 flex flex-col gap-3">
               <div className="flex items-center justify-between flex-wrap gap-3">
                 <div className="text-sm text-gray-600">
@@ -596,6 +668,7 @@ export default function ReviewPage() {
                 </div>
               )}
             </div>
+            )}
           </div>
         )}
       </div>
