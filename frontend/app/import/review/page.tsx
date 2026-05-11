@@ -720,8 +720,8 @@ function CasesTable({ cases, refData, onSave }: { cases: Case[] } & CommonProps)
           </tr>
         </thead>
         <tbody>
-          {cases.map((c) => (
-            <CaseRow key={c.id} caseRow={c} refData={refData} onSave={onSave} />
+          {cases.map((c, idx) => (
+            <CaseRow key={c.id} caseRow={c} refData={refData} onSave={onSave} idx={idx} />
           ))}
         </tbody>
       </table>
@@ -733,9 +733,13 @@ function CaseRow({
   caseRow: c,
   refData,
   onSave,
-}: { caseRow: Case } & CommonProps) {
-  const rowBg = ROW_BG[c.import_status] ?? '';
-  const stickyBg = STICKY_BG[c.import_status] ?? 'bg-white';
+  idx,
+}: { caseRow: Case; idx: number } & CommonProps) {
+  // Alternating row background — applied to OK-status rows (the common case).
+  // Problematic statuses keep their status colour so they still stand out.
+  const altBg = idx % 2 === 0 ? 'bg-white' : 'bg-slate-50';
+  const rowBg = c.import_status === 'OK' ? altBg : (ROW_BG[c.import_status] ?? altBg);
+  const stickyBg = c.import_status === 'OK' ? altBg : (STICKY_BG[c.import_status] ?? 'bg-white');
 
   const save = (updates: Record<string, unknown>) => onSave(c.id, updates);
 

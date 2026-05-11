@@ -3,14 +3,17 @@
 /**
  * frontend/app/imports/page.tsx
  *
- * Imports list page. Shows every upload from tx_import_run, most recent
- * first. Each row links to the Review page for that period.
+ * Upload-event history. Every row here is one POST to /api/imports (or
+ * /api/imports/consolidated) from the web UI — i.e. one Upload action.
  *
- * Talks to: GET /api/imports
+ * Note: this is intentionally an audit log of UPLOAD EVENTS, not a count
+ * of cases. CLI-driven imports (e.g. regression-test bulk loads) are not
+ * tracked here yet; for total case counts see the home page pillars.
  */
 
 import { useEffect, useState } from 'react'
 import { useRouter } from 'next/navigation'
+import Link from 'next/link'
 
 type ImportRun = {
   id: number
@@ -69,22 +72,44 @@ export default function ImportsListPage() {
       })
   }, [])
 
+  // Aggregate counts across uploads (just for the reconciliation note)
+  const totalInsertedHere = imports.reduce((s, r) => s + (r.inserted_count ?? 0), 0)
+
   return (
-    <div className="p-6">
+    <div className="mx-auto max-w-7xl p-6">
+      <nav className="mb-4 text-sm text-gray-500">
+        <Link href="/" className="hover:text-gray-900 hover:underline">← Back to Case workflow</Link>
+      </nav>
+
       <header className="mb-4 flex items-center justify-between">
         <div>
-          <h1 className="text-2xl font-bold">Imports</h1>
+          <h1 className="text-2xl font-bold">Upload history</h1>
           <p className="mt-1 text-sm text-gray-600">
-            All CRM uploads, most recent first.
+            Every file you&apos;ve uploaded through the web UI, most recent first.
           </p>
         </div>
         <button
           onClick={() => router.push('/import')}
-          className="rounded bg-blue-600 px-4 py-2 text-white"
+          className="rounded bg-blue-600 px-4 py-2 text-white hover:bg-blue-700"
         >
           + New Upload
         </button>
       </header>
+
+      {/* Reconciliation note */}
+      <div className="mb-4 rounded border border-amber-200 bg-amber-50 px-4 py-3 text-xs text-amber-900">
+        <strong>About this list.</strong> These are <em>upload events</em>, not cases.
+        One upload can insert many cases (see the &ldquo;Inserted&rdquo; column).
+        {!loading && !error && imports.length > 0 && (
+          <>
+            {' '}This page shows <strong>{imports.length}</strong> upload event(s)
+            totalling <strong>{totalInsertedHere.toLocaleString()}</strong> case insertion(s).
+          </>
+        )}{' '}
+        <br />
+        Cases imported via the command-line (regression testing, bulk reloads)
+        are not tracked here — for the authoritative total see the pillar counts on the home page.
+      </div>
 
       {loading && (
         <div className="py-12 text-center text-gray-500">Loading…</div>
@@ -119,8 +144,13 @@ export default function ImportsListPage() {
               </tr>
             </thead>
             <tbody>
-              {imports.map((r) => (
-                <tr key={r.id} className="border-b border-gray-100 hover:bg-gray-50">
+              {imports.map((r, idx) => (
+                <tr
+                  key={r.id}
+                  className={`border-b border-gray-100 hover:bg-blue-50 ${
+                    idx % 2 === 0 ? 'bg-white' : 'bg-slate-50'
+                  }`}
+                >
                   <td className="px-3 py-2 font-mono">
                     {r.run_year}-{String(r.run_month).padStart(2, '0')}
                   </td>

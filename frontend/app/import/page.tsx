@@ -3,14 +3,26 @@
 /**
  * frontend/app/import/page.tsx
  *
- * CRM file upload page. Multi-file, drag-and-drop, year/month derived
- * from each filename by the backend.
+ * CRM file upload page.
  *
- * Talks to: POST /api/imports  (multipart, field name "files")
+ * Two upload modes (Phase 15+):
+ *   - 'individual'  : drag/drop one or more closed-file xlsx reports;
+ *                     year/month derived from filename, period validated
+ *                     against the file header. Posts to POST /api/imports.
+ *   - 'consolidated': single mass-upload xlsx (every status across many
+ *                     months in one sheet); period derived per row.
+ *                     Posts to POST /api/imports/consolidated (added next).
+ *
+ * The mass-upload backend endpoint is wired up in the next batch. For now
+ * the 'consolidated' tab UI is present but the upload button is disabled
+ * until the backend is live.
  */
 
 import { useRef, useState } from 'react'
 import { useRouter } from 'next/navigation'
+import Link from 'next/link'
+
+type Mode = 'individual' | 'consolidated'
 
 type FileSummary = {
   inserted: number
@@ -44,6 +56,7 @@ type UploadResponse = {
 
 export default function UploadPage() {
   const router = useRouter()
+  const [mode, setMode] = useState<Mode>('individual')
   const [files, setFiles] = useState<File[]>([])
   const [uploading, setUploading] = useState(false)
   const [response, setResponse] = useState<UploadResponse | null>(null)
@@ -55,7 +68,9 @@ export default function UploadPage() {
     if (!filelist) return
     const valid = Array.from(filelist).filter((f) => /\.(xlsx|xlsm)$/i.test(f.name))
     const invalid = Array.from(filelist).filter((f) => !/\.(xlsx|xlsm)$/i.test(f.name))
-    setFiles((prev) => [...prev, ...valid])
+    // Consolidated mode is single-file only
+    const next = mode === 'consolidated' ? valid.slice(0, 1) : [...files, ...valid]
+    setFiles(next)
     if (invalid.length) {
       setError(`Skipped ${invalid.length} non-Excel file(s): ${invalid.map((f) => f.name).join(', ')}`)
     } else {
@@ -67,6 +82,14 @@ export default function UploadPage() {
     setFiles((prev) => prev.filter((_, i) => i !== idx))
   }
 
+  const switchMode = (next: Mode) => {
+    if (next === mode) return
+    setMode(next)
+    setFiles([])
+    setResponse(null)
+    setError(null)
+  }
+
   const onUpload = async () => {
     if (files.length === 0) {
       setError('Please select at least one file.')
@@ -76,11 +99,17 @@ export default function UploadPage() {
     setError(null)
     setResponse(null)
 
+    const endpoint = mode === 'consolidated' ? '/api/imports/consolidated' : '/api/imports'
+
     const fd = new FormData()
-    for (const f of files) fd.append('files', f)
+    if (mode === 'consolidated') {
+      fd.append('file', files[0])
+    } else {
+      for (const f of files) fd.append('files', f)
+    }
 
     try {
-      const res = await fetch('/api/imports', { method: 'POST', body: fd })
+      const res = await fetch(endpoint, { method: 'POST', body: fd })
       if (!res.ok) {
         const body = await res.json().catch(() => ({}))
         throw new Error(body.detail || `Upload failed (${res.status})`)
@@ -97,21 +126,43 @@ export default function UploadPage() {
 
   return (
     <div className="mx-auto max-w-4xl p-6">
+      {/* Header with back-to-home link */}
+      <nav className="mb-4 text-sm text-gray-500">
+        <Link href="/" className="hover:text-gray-900 hover:underline">← Back to Case workflow</Link>
+      </nav>
+
       <header className="mb-6 flex items-center justify-between">
         <div>
-          <h1 className="text-2xl font-bold">Upload CRM Reports</h1>
+          <h1 className="text-2xl font-bold">Upload Cases</h1>
           <p className="mt-1 text-sm text-gray-600">
-            Drag and drop or pick one or more closed-file xlsx reports. Year and
-            month are read from each filename automatically.
+            Two formats supported. Pick the right one for your file.
           </p>
         </div>
         <button
           onClick={() => router.push('/imports')}
-          className="rounded bg-gray-200 px-3 py-1 text-sm"
+          className="rounded bg-gray-200 px-3 py-1 text-sm hover:bg-gray-300"
         >
-          View all imports
+          View upload history
         </button>
       </header>
+
+      {/* Mode tabs */}
+      <div className="mb-4 flex gap-0 border-b border-gray-200">
+        <ModeTab
+          label="Input sheet"
+          sub="One file per staff member per month"
+          active={mode === 'individual'}
+          onClick={() => switchMode('individual')}
+        />
+        <ModeTab
+          label="Mass Upload"
+          sub="Single consolidated file across all staff/months"
+          active={mode === 'consolidated'}
+          onClick={() => switchMode('consolidated')}
+        />
+      </div>
+
+      {mode === 'individual' ? <IndividualNote /> : <ConsolidatedNote />}
 
       {/* Drop zone */}
       <div
@@ -130,14 +181,18 @@ export default function UploadPage() {
         }`}
       >
         <p className="text-sm text-gray-700">
-          {dragOver ? 'Drop files here…' : 'Drag files here, or click to browse'}
+          {dragOver
+            ? 'Drop files here…'
+            : mode === 'consolidated'
+            ? 'Drag one file here, or click to browse'
+            : 'Drag files here, or click to browse'}
         </p>
         <p className="mt-1 text-xs text-gray-500">.xlsx or .xlsm only</p>
         <input
           ref={inputRef}
           type="file"
           accept=".xlsx,.xlsm"
-          multiple
+          multiple={mode === 'individual'}
           onChange={(e) => onPick(e.target.files)}
           className="hidden"
         />
@@ -215,26 +270,21 @@ export default function UploadPage() {
                 {r.success ? (
                   <div className="flex items-center justify-between">
                     <div>
-                      Period: <strong>{r.run_year}-{String(r.run_month).padStart(2, '0')}</strong>
-                      {' · '}
-                      Inserted: {r.summary?.inserted}, Updated: {r.summary?.updated}
+                      {r.run_year && r.run_month && (
+                        <>Period: <strong>{r.run_year}-{String(r.run_month).padStart(2, '0')}</strong>{' · '}</>
+                      )}
+                      Inserted: {r.summary?.inserted ?? 0}
+                      {r.summary && r.summary.updated > 0 && <>, Updated: {r.summary.updated}</>}
                       {r.summary?.error_count
                         ? <span className="text-amber-700">, Errors: {r.summary.error_count}</span>
                         : null}
                     </div>
-                    <button
-                      onClick={() => {
-                        const params = new URLSearchParams({
-                          year: String(r.run_year),
-                          month: String(r.run_month),
-                        })
-                        if (r.staff_id) params.set('staff_id', String(r.staff_id))
-                        router.push(`/import/review?${params.toString()}`)
-                      }}
-                      className="rounded bg-blue-600 px-3 py-1 text-xs text-white"
+                    <Link
+                      href="/"
+                      className="rounded bg-blue-600 px-3 py-1 text-xs text-white hover:bg-blue-700"
                     >
-                      Review →
-                    </button>
+                      View on home →
+                    </Link>
                   </div>
                 ) : (
                   <div className="text-red-700">{r.error}</div>
@@ -246,21 +296,63 @@ export default function UploadPage() {
             ))}
           </ul>
           <div className="mt-4 flex gap-2">
-            <button
-              onClick={() => router.push('/imports')}
-              className="rounded bg-gray-200 px-4 py-2 text-sm"
+            <Link
+              href="/"
+              className="rounded bg-blue-600 px-4 py-2 text-sm text-white hover:bg-blue-700"
             >
-              View all imports
-            </button>
+              Back to Case workflow
+            </Link>
             <button
               onClick={() => setResponse(null)}
-              className="rounded bg-blue-600 px-4 py-2 text-sm text-white"
+              className="rounded bg-gray-200 px-4 py-2 text-sm hover:bg-gray-300"
             >
               Upload more
             </button>
           </div>
         </div>
       )}
+    </div>
+  )
+}
+
+/* ---------------- helpers ---------------- */
+
+function ModeTab({
+  label, sub, active, onClick,
+}: { label: string; sub: string; active: boolean; onClick: () => void }) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={`px-4 py-2.5 text-left transition border-b-2 -mb-px ${
+        active
+          ? 'border-blue-600 text-blue-700 bg-blue-50/40'
+          : 'border-transparent text-gray-600 hover:text-gray-900 hover:bg-gray-50'
+      }`}
+    >
+      <div className="text-sm font-medium">{label}</div>
+      <div className="text-xs text-gray-500">{sub}</div>
+    </button>
+  )
+}
+
+function IndividualNote() {
+  return (
+    <div className="mb-4 rounded border border-gray-200 bg-gray-50 px-4 py-3 text-xs text-gray-700">
+      <strong>Input sheet mode.</strong> Each file should be a single staff member&apos;s
+      closed-file report for one month, with a filename like{' '}
+      <code className="font-mono">Phạm Thị Lợi&apos;s report of closed file in July 2025.xlsx</code>.
+      Year and month are read from the filename automatically.
+    </div>
+  )
+}
+
+function ConsolidatedNote() {
+  return (
+    <div className="mb-4 rounded border border-amber-200 bg-amber-50 px-4 py-3 text-xs text-amber-900">
+      <strong>Mass Upload mode.</strong> A single consolidated xlsx containing every closed-file row across many
+      months and staff (the format we use for regression testing). The period for each row is derived from its
+      status + date columns. Cases land in the same Uploaded pillar as Input sheet imports — once loaded, they look identical in the Review Board.
     </div>
   )
 }
