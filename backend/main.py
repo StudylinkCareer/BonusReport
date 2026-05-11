@@ -406,6 +406,34 @@ REF_LIST_QUERIES: dict[str, str] = {
 REF_LIST_STATIC: dict[str, list[str]] = {
     "source_types": ["DIRECT", "SUB_AGENT", "MASTER_AGENT", "GROUP", "OFFICE"],
     "import_statuses": ["OK", "UNRESOLVED", "FLAGGED", "SCRAP"],
+    # Client type / service category. Provided by the business; deduped and
+    # trimmed (the source list had a duplicate "Du lịch" with stray whitespace).
+    "client_types": [
+        "Du học (ghi danh + visa)",
+        "Du học (ghi danh)",
+        "Du học (visa)",
+        "Du học (chuyển trường)",
+        "Du học (điền đơn ghi danh)",
+        "Du học (điền đơn chuyển trường)",
+        "Du học (điền đơn visa)",
+        "Du học (điền đơn xin học bổng)",
+        "Du học (điền đơn, đăng ký lịch phỏng vấn, đóng phí SEVIS)",
+        "Du học (hướng dẫn phỏng vấn)",
+        "Du học hè",
+        "Du học tại chỗ (VN)",
+        "Du học/tham quan ngắn hạn theo đoàn",
+        "Du lịch",
+        "Điền đơn xin visa",
+        "Người phụ thuộc ở nước ngoài",
+        "Công tác nước ngoài",
+        "Giám hộ ở nước ngoài",
+        "Thay đổi Giám Hộ / Chỗ ở",
+        "Thị thực tạm trú cho sinh viên tốt nghiệp",
+        "Thị thực tạm trú cho sinh viên sau tốt nghiệp",
+        "Credential Evaluation",
+        "Travel Exemption",
+        "Kết hôn",
+    ],
 }
 
 

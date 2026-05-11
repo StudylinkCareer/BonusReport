@@ -138,13 +138,27 @@ function Header() {
             <div className="text-xs text-slate-500">Case workflow</div>
           </div>
         </div>
-        <button
-          className="rounded-md border border-slate-200 bg-white px-3 py-1.5 text-sm text-slate-700 hover:bg-slate-50"
-          disabled
-          title="Role switching not yet wired up"
-        >
-          Acting as: <span className="font-medium">Admin</span>
-        </button>
+        <nav className="flex items-center gap-2">
+          <Link
+            href="/import"
+            className="rounded-md border border-slate-200 bg-white px-3 py-1.5 text-sm text-slate-700 hover:bg-slate-50"
+          >
+            Import Board
+          </Link>
+          <Link
+            href="/imports"
+            className="rounded-md border border-slate-200 bg-white px-3 py-1.5 text-sm text-slate-700 hover:bg-slate-50"
+          >
+            Upload history
+          </Link>
+          <button
+            className="rounded-md border border-slate-200 bg-white px-3 py-1.5 text-sm text-slate-700 hover:bg-slate-50"
+            disabled
+            title="Role switching not yet wired up"
+          >
+            Acting as: <span className="font-medium">Admin</span>
+          </button>
+        </nav>
       </div>
     </header>
   );

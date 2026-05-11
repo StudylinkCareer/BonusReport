@@ -98,6 +98,9 @@ type Case = {
   case_officer_name: string | null;
   case_officer_role_id: number | null;
   case_officer_role_code: string | null;
+
+  pre_sales_staff_id: number | null;
+  pre_sales_name: string | null;
 };
 
 type RefItem = {
@@ -119,6 +122,7 @@ type RefData = {
   statuses: RefItem[];
   source_types: string[];
   import_statuses: string[];
+  client_types: string[];
 };
 
 const EMPTY_REF: RefData = {
@@ -131,6 +135,7 @@ const EMPTY_REF: RefData = {
   statuses: [],
   source_types: [],
   import_statuses: [],
+  client_types: [],
 };
 
 type EngineResult = {
@@ -228,6 +233,7 @@ export default function ReviewPage() {
         'statuses',
         'source_types',
         'import_statuses',
+        'client_types',
       ];
       try {
         const results = await Promise.all(
@@ -715,6 +721,7 @@ function CasesTable({ cases, refData, onSave }: { cases: Case[] } & CommonProps)
             <Th>Course Status</Th>
             <Th>Counsellor</Th>
             <Th>Case Officer</Th>
+            <Th>Pre-sales</Th>
             <Th>Office</Th>
             <Th>Notes</Th>
           </tr>
@@ -783,8 +790,9 @@ function CaseRow({
         />
       </Td>
       <Td>
-        <TextCell
+        <SelectCell
           value={c.client_type_code}
+          options={refData.client_types}
           onSave={(v) => save({ client_type_code: v })}
         />
       </Td>
@@ -859,6 +867,18 @@ function CaseRow({
         />
       </Td>
       <Td>
+        <StaffCell
+          staffId={c.pre_sales_staff_id}
+          staffName={c.pre_sales_name}
+          options={refData.staff_all}
+          onSave={(staffId, _roleId) =>
+            save({
+              pre_sales_staff_id: staffId,
+            })
+          }
+        />
+      </Td>
+      <Td>
         <FkCell
           value={c.case_office_id}
           label={c.case_office_code}
@@ -921,8 +941,9 @@ function CaseCard({
           />
         </Field>
         <Field label="Client Type">
-          <TextCell
+          <SelectCell
             value={c.client_type_code}
+            options={refData.client_types}
             onSave={(v) => save({ client_type_code: v })}
           />
         </Field>
@@ -992,6 +1013,18 @@ function CaseCard({
               save({
                 case_officer_staff_id: staffId,
                 case_officer_role_id: roleId,
+              })
+            }
+          />
+        </Field>
+        <Field label="Pre-sales">
+          <StaffCell
+            staffId={c.pre_sales_staff_id}
+            staffName={c.pre_sales_name}
+            options={refData.staff_all}
+            onSave={(staffId, _roleId) =>
+              save({
+                pre_sales_staff_id: staffId,
               })
             }
           />
