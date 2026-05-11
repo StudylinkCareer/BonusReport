@@ -1,14 +1,16 @@
 'use client';
 
 /**
- * frontend/app/import/review/[year]/[month]/page.tsx
+ * SAVE TO: frontend/app/import/review/page.tsx
  *
- * Imported-cases review screen. Displays one staff member's cases for one
- * (year, month). Every field that maps to a CRM column is inline-editable.
+ * Imported-cases review screen. Two filter modes:
+ *   - Period mode (legacy):       /import/review?staff_id=N&year=YYYY&month=M
+ *   - Workflow-state mode (P15):  /import/review?workflow_state=uploaded
  *
- * Layout:
- *   - md+ : wide horizontal-scroll table with sticky Status/Contract/Student
- *   - <md : card-per-case layout for mobile
+ * Every field that maps to a CRM column is inline-editable.
+ *
+ * Desktop view uses TanStack Table for sort / filter / resize / column reorder.
+ * Mobile (<md) falls back to a card layout (unchanged).
  *
  * Edit flow:
  *   - Click a cell -> input/select/datepicker
@@ -16,12 +18,8 @@
  *   - Escape cancels
  *   - Errors show inline beneath the cell, value reverts
  *
- * URL query string drives filter state:
- *   /import/review?staff_id=N&year=YYYY&month=M
- *
- * The "Submit to Engine" button at the bottom triggers POST /api/engine/run
- * for the WHOLE period (every staff for that year+month, not just the
- * staff being reviewed) and redirects to /bonus/{year}/{month}.
+ * The "Submit to Engine" button (only in period mode) triggers POST /api/engine/run
+ * for the WHOLE period and redirects to /bonus/{year}/{month}.
  */
 
 import {
@@ -34,6 +32,18 @@ import {
   useMemo,
   useState,
 } from 'react';
+import {
+  ColumnDef,
+  ColumnFiltersState,
+  ColumnOrderState,
+  ColumnSizingState,
+  SortingState,
+  flexRender,
+  getCoreRowModel,
+  getFilteredRowModel,
+  getSortedRowModel,
+  useReactTable,
+} from '@tanstack/react-table';
 import { useRouter } from 'next/navigation';
 
 // ===========================================================================
@@ -701,198 +711,600 @@ const STICKY_L = {
 } as const;
 
 function CasesTable({ cases, refData, onSave }: { cases: Case[] } & CommonProps) {
+  // ---- column ordering ------------------------------------------------
+  // Pinned (sticky) columns always stay leftmost: import_status, contract_id, student_name.
+  // Reordering only applies to the unpinned columns.
+  const PINNED = ['import_status', 'contract_id', 'student_name'];
+  const DEFAULT_ORDER = [
+    'import_status',
+    'contract_id',
+    'student_name',
+    'student_id',
+    'contract_signed_date',
+    'client_type_code',
+    'country',
+    'refer_source',
+    'application_status',
+    'visa_received_date',
+    'institution',
+    'course_start_date',
+    'course_status',
+    'counsellor',
+    'case_officer',
+    'pre_sales',
+    'office',
+    'notes',
+  ];
+
+  // Persisted view-state — these only affect the local table, never the DB.
+  const [sorting, setSorting] = useState<SortingState>([]);
+  const [columnFilters, setColumnFilters] = useState<ColumnFiltersState>([]);
+  const [columnOrder, setColumnOrder] = useState<ColumnOrderState>(DEFAULT_ORDER);
+  const [columnSizing, setColumnSizing] = useState<ColumnSizingState>({});
+
+  // ---- column definitions --------------------------------------------
+  // Each column declares: id, header label, optional accessor for sort/filter,
+  // size (px), and the cell renderer (which reuses the existing TextCell / SelectCell
+  // / FkCell / StaffCell / DateCell / TextAreaCell / ReferSourceCell components).
+  const columns = useMemo<ColumnDef<Case>[]>(
+    () => [
+      {
+        id: 'import_status',
+        header: 'Status',
+        accessorFn: (row) => row.import_status ?? '',
+        size: STICKY_W.status,
+        minSize: 100,
+        enableResizing: false, // sticky col — keep fixed width
+        cell: ({ row }) => {
+          const c = row.original;
+          return (
+            <SelectCell
+              value={c.import_status}
+              options={refData.import_statuses}
+              render={(v) => (
+                <span
+                  className={`text-xs px-2 py-0.5 rounded font-medium ${
+                    BADGE[v ?? ''] ?? 'bg-gray-200'
+                  }`}
+                >
+                  {v}
+                </span>
+              )}
+              onSave={(v) => onSave(c.id, { import_status: v })}
+            />
+          );
+        },
+      },
+      {
+        id: 'contract_id',
+        header: 'Contract',
+        accessorFn: (row) => row.contract_id ?? '',
+        size: STICKY_W.contract,
+        minSize: 100,
+        enableResizing: false,
+        cell: ({ row }) => {
+          const c = row.original;
+          return (
+            <TextCell
+              value={c.contract_id}
+              monospace
+              onSave={(v) => onSave(c.id, { contract_id: v })}
+            />
+          );
+        },
+      },
+      {
+        id: 'student_name',
+        header: 'Student',
+        accessorFn: (row) => row.student_name ?? '',
+        size: STICKY_W.student,
+        minSize: 140,
+        enableResizing: false,
+        cell: ({ row }) => {
+          const c = row.original;
+          return (
+            <TextCell
+              value={c.student_name}
+              onSave={(v) => onSave(c.id, { student_name: v })}
+            />
+          );
+        },
+      },
+      {
+        id: 'student_id',
+        header: 'Student ID',
+        accessorFn: (row) => row.student_id ?? '',
+        size: 130,
+        cell: ({ row }) => {
+          const c = row.original;
+          return (
+            <TextCell
+              value={c.student_id}
+              monospace
+              onSave={(v) => onSave(c.id, { student_id: v })}
+            />
+          );
+        },
+      },
+      {
+        id: 'contract_signed_date',
+        header: 'Signed',
+        accessorFn: (row) => row.contract_signed_date ?? '',
+        size: 120,
+        cell: ({ row }) => {
+          const c = row.original;
+          return (
+            <DateCell
+              value={c.contract_signed_date}
+              onSave={(v) => onSave(c.id, { contract_signed_date: v })}
+            />
+          );
+        },
+      },
+      {
+        id: 'client_type_code',
+        header: 'Client Type',
+        accessorFn: (row) => row.client_type_code ?? '',
+        size: 200,
+        cell: ({ row }) => {
+          const c = row.original;
+          return (
+            <SelectCell
+              value={c.client_type_code}
+              options={refData.client_types}
+              onSave={(v) => onSave(c.id, { client_type_code: v })}
+            />
+          );
+        },
+      },
+      {
+        id: 'country',
+        header: 'Country',
+        accessorFn: (row) => row.country_name ?? '',
+        size: 140,
+        cell: ({ row }) => {
+          const c = row.original;
+          return (
+            <FkCell
+              value={c.country_id}
+              label={c.country_name}
+              options={refData.countries}
+              onSave={(id) => onSave(c.id, { country_id: id })}
+            />
+          );
+        },
+      },
+      {
+        id: 'refer_source',
+        header: 'Refer Source',
+        accessorFn: (row) =>
+          row.referring_partner_name ??
+          row.referring_sub_agent_name ??
+          row.referring_office_code ??
+          row.referring_agent_text_raw ??
+          '',
+        size: 200,
+        cell: ({ row }) => (
+          <ReferSourceCell
+            caseRow={row.original}
+            refData={refData}
+            onSave={(updates) => onSave(row.original.id, updates)}
+          />
+        ),
+      },
+      {
+        id: 'application_status',
+        header: 'App Status',
+        accessorFn: (row) => row.application_status ?? '',
+        size: 160,
+        cell: ({ row }) => {
+          const c = row.original;
+          return (
+            <SelectCell
+              value={c.application_status}
+              options={refData.statuses.map((s) => s.name ?? '').filter(Boolean)}
+              onSave={(v) => onSave(c.id, { application_status: v })}
+            />
+          );
+        },
+      },
+      {
+        id: 'visa_received_date',
+        header: 'Visa Date',
+        accessorFn: (row) => row.visa_received_date ?? '',
+        size: 120,
+        cell: ({ row }) => {
+          const c = row.original;
+          return (
+            <DateCell
+              value={c.visa_received_date}
+              onSave={(v) => onSave(c.id, { visa_received_date: v })}
+            />
+          );
+        },
+      },
+      {
+        id: 'institution',
+        header: 'Institution',
+        accessorFn: (row) => row.institution_name ?? row.institution_text_raw ?? '',
+        size: 220,
+        cell: ({ row }) => {
+          const c = row.original;
+          return (
+            <FkCell
+              value={c.institution_id}
+              label={c.institution_name}
+              options={refData.institutions}
+              onSave={(id) => onSave(c.id, { institution_id: id })}
+            />
+          );
+        },
+      },
+      {
+        id: 'course_start_date',
+        header: 'Course Start',
+        accessorFn: (row) => row.course_start_date ?? '',
+        size: 130,
+        cell: ({ row }) => {
+          const c = row.original;
+          return (
+            <DateCell
+              value={c.course_start_date}
+              onSave={(v) => onSave(c.id, { course_start_date: v })}
+            />
+          );
+        },
+      },
+      {
+        id: 'course_status',
+        header: 'Course Status',
+        accessorFn: (row) => row.course_status ?? '',
+        size: 140,
+        cell: ({ row }) => {
+          const c = row.original;
+          return (
+            <TextCell
+              value={c.course_status}
+              onSave={(v) => onSave(c.id, { course_status: v })}
+            />
+          );
+        },
+      },
+      {
+        id: 'counsellor',
+        header: 'Counsellor',
+        accessorFn: (row) => row.counsellor_name ?? '',
+        size: 180,
+        cell: ({ row }) => {
+          const c = row.original;
+          return (
+            <StaffCell
+              staffId={c.counsellor_staff_id}
+              staffName={c.counsellor_name}
+              options={refData.staff_all}
+              onSave={(staffId, roleId) =>
+                onSave(c.id, {
+                  counsellor_staff_id: staffId,
+                  counsellor_role_id: roleId,
+                })
+              }
+            />
+          );
+        },
+      },
+      {
+        id: 'case_officer',
+        header: 'Case Officer',
+        accessorFn: (row) => row.case_officer_name ?? '',
+        size: 180,
+        cell: ({ row }) => {
+          const c = row.original;
+          return (
+            <StaffCell
+              staffId={c.case_officer_staff_id}
+              staffName={c.case_officer_name}
+              options={refData.staff_all}
+              onSave={(staffId, roleId) =>
+                onSave(c.id, {
+                  case_officer_staff_id: staffId,
+                  case_officer_role_id: roleId,
+                })
+              }
+            />
+          );
+        },
+      },
+      {
+        id: 'pre_sales',
+        header: 'Pre-sales',
+        accessorFn: (row) => row.pre_sales_name ?? '',
+        size: 180,
+        cell: ({ row }) => {
+          const c = row.original;
+          return (
+            <StaffCell
+              staffId={c.pre_sales_staff_id}
+              staffName={c.pre_sales_name}
+              options={refData.staff_all}
+              onSave={(staffId, _roleId) =>
+                onSave(c.id, { pre_sales_staff_id: staffId })
+              }
+            />
+          );
+        },
+      },
+      {
+        id: 'office',
+        header: 'Office',
+        accessorFn: (row) => row.case_office_code ?? '',
+        size: 120,
+        cell: ({ row }) => {
+          const c = row.original;
+          return (
+            <FkCell
+              value={c.case_office_id}
+              label={c.case_office_code}
+              options={refData.offices}
+              labelField="code"
+              onSave={(id) => onSave(c.id, { case_office_id: id })}
+            />
+          );
+        },
+      },
+      {
+        id: 'notes',
+        header: 'Notes',
+        accessorFn: (row) => row.notes ?? '',
+        size: 280,
+        cell: ({ row }) => {
+          const c = row.original;
+          return (
+            <TextAreaCell
+              value={c.notes}
+              onSave={(v) => onSave(c.id, { notes: v })}
+            />
+          );
+        },
+      },
+    ],
+    [refData, onSave],
+  );
+
+  // ---- table instance -------------------------------------------------
+  const table = useReactTable({
+    data: cases,
+    columns,
+    state: { sorting, columnFilters, columnOrder, columnSizing },
+    onSortingChange: setSorting,
+    onColumnFiltersChange: setColumnFilters,
+    onColumnOrderChange: setColumnOrder,
+    onColumnSizingChange: setColumnSizing,
+    getCoreRowModel: getCoreRowModel(),
+    getSortedRowModel: getSortedRowModel(),
+    getFilteredRowModel: getFilteredRowModel(),
+    columnResizeMode: 'onChange',
+    enableColumnResizing: true,
+    defaultColumn: { minSize: 80 },
+  });
+
+  // Move-column helpers (used by the small "←  →" buttons in each non-pinned header).
+  const moveCol = (id: string, direction: -1 | 1) => {
+    setColumnOrder((order) => {
+      const i = order.indexOf(id);
+      if (i === -1) return order;
+      const j = i + direction;
+      // Don't move into pinned zone
+      if (j < PINNED.length || j >= order.length) return order;
+      const next = order.slice();
+      [next[i], next[j]] = [next[j], next[i]];
+      return next;
+    });
+  };
+
+  const resetView = () => {
+    setSorting([]);
+    setColumnFilters([]);
+    setColumnOrder(DEFAULT_ORDER);
+    setColumnSizing({});
+  };
+
+  // Pinned (sticky) left offset calculations.
+  const pinnedLeft: Record<string, number> = {
+    import_status: 0,
+    contract_id: STICKY_W.status,
+    student_name: STICKY_W.status + STICKY_W.contract,
+  };
+
+  const visibleHeaders = table.getHeaderGroups()[0]?.headers ?? [];
+  const anyFilterActive = columnFilters.length > 0 || sorting.length > 0;
+
   return (
-    <div className="overflow-auto max-h-[calc(100vh-280px)] border border-gray-200 rounded">
-      <table className="w-full text-sm">
-        <thead className="bg-gray-50 border-b border-gray-200 text-xs uppercase tracking-wide sticky top-0 z-20">
-          <tr>
-            <Th sticky left={STICKY_L.status}    width={STICKY_W.status}>Status</Th>
-            <Th sticky left={STICKY_L.contract}  width={STICKY_W.contract}>Contract</Th>
-            <Th sticky left={STICKY_L.student}   width={STICKY_W.student}>Student</Th>
-            <Th>Student ID</Th>
-            <Th>Signed</Th>
-            <Th>Client Type</Th>
-            <Th>Country</Th>
-            <Th>Refer Source</Th>
-            <Th>App Status</Th>
-            <Th>Visa Date</Th>
-            <Th>Institution</Th>
-            <Th>Course Start</Th>
-            <Th>Course Status</Th>
-            <Th>Counsellor</Th>
-            <Th>Case Officer</Th>
-            <Th>Pre-sales</Th>
-            <Th>Office</Th>
-            <Th>Notes</Th>
-          </tr>
-        </thead>
-        <tbody>
-          {cases.map((c, idx) => (
-            <CaseRow key={c.id} caseRow={c} refData={refData} onSave={onSave} idx={idx} />
-          ))}
-        </tbody>
-      </table>
+    <div className="border border-gray-200 rounded">
+      {/* Toolbar */}
+      <div className="flex items-center justify-between border-b border-gray-200 bg-gray-50 px-3 py-2 text-xs">
+        <div className="text-gray-600">
+          {table.getRowModel().rows.length === cases.length
+            ? `${cases.length} case${cases.length === 1 ? '' : 's'}`
+            : `${table.getRowModel().rows.length} of ${cases.length} case${
+                cases.length === 1 ? '' : 's'
+              } (filtered)`}
+        </div>
+        <div className="flex items-center gap-2">
+          {anyFilterActive && (
+            <button
+              onClick={resetView}
+              className="rounded border border-gray-300 bg-white px-2 py-1 hover:bg-gray-100"
+            >
+              Reset view
+            </button>
+          )}
+        </div>
+      </div>
+
+      <div className="overflow-auto max-h-[calc(100vh-320px)] relative">
+        <table
+          className="text-sm border-collapse"
+          style={{ width: table.getTotalSize() }}
+        >
+          <thead className="bg-gray-50 text-xs uppercase tracking-wide sticky top-0 z-20">
+            <tr>
+              {visibleHeaders.map((header) => {
+                const id = header.column.id;
+                const isPinned = PINNED.includes(id);
+                const pinnedStyle: CSSProperties = isPinned
+                  ? {
+                      position: 'sticky',
+                      left: pinnedLeft[id] ?? 0,
+                      zIndex: 30,
+                      background: '#F9FAFB', // gray-50
+                    }
+                  : {};
+                return (
+                  <th
+                    key={header.id}
+                    style={{
+                      width: header.getSize(),
+                      ...pinnedStyle,
+                    }}
+                    className="border-b border-r border-gray-200 px-3 py-2 text-left font-semibold text-gray-700 align-bottom relative group"
+                  >
+                    <div className="flex items-center justify-between gap-1">
+                      <button
+                        type="button"
+                        onClick={header.column.getToggleSortingHandler()}
+                        className="flex-1 text-left truncate hover:text-gray-900"
+                        title="Click to sort"
+                      >
+                        {flexRender(header.column.columnDef.header, header.getContext())}
+                        <SortIndicator dir={header.column.getIsSorted()} />
+                      </button>
+                      {!isPinned && (
+                        <span className="opacity-0 group-hover:opacity-100 transition flex items-center gap-0.5">
+                          <button
+                            type="button"
+                            onClick={() => moveCol(id, -1)}
+                            className="text-gray-400 hover:text-gray-900 px-1"
+                            title="Move left"
+                          >
+                            ←
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => moveCol(id, 1)}
+                            className="text-gray-400 hover:text-gray-900 px-1"
+                            title="Move right"
+                          >
+                            →
+                          </button>
+                        </span>
+                      )}
+                    </div>
+                    {/* Filter input */}
+                    <input
+                      type="text"
+                      value={(header.column.getFilterValue() as string) ?? ''}
+                      onChange={(e) => header.column.setFilterValue(e.target.value)}
+                      placeholder="Filter…"
+                      className="mt-1 w-full text-xs font-normal normal-case px-1.5 py-0.5 border border-gray-200 rounded focus:outline-none focus:border-blue-400"
+                    />
+                    {/* Resize handle (not on pinned cols) */}
+                    {header.column.getCanResize() && (
+                      <div
+                        onMouseDown={header.getResizeHandler()}
+                        onTouchStart={header.getResizeHandler()}
+                        className={`absolute top-0 right-0 h-full w-1 cursor-col-resize select-none touch-none ${
+                          header.column.getIsResizing()
+                            ? 'bg-blue-500'
+                            : 'bg-transparent hover:bg-blue-300'
+                        }`}
+                      />
+                    )}
+                  </th>
+                );
+              })}
+            </tr>
+          </thead>
+          <tbody>
+            {table.getRowModel().rows.map((row, idx) => {
+              const c = row.original;
+              const altBg = idx % 2 === 0 ? 'bg-white' : 'bg-slate-50';
+              const rowBg =
+                c.import_status === 'OK' ? altBg : ROW_BG[c.import_status] ?? altBg;
+              const stickyBg =
+                c.import_status === 'OK'
+                  ? idx % 2 === 0
+                    ? '#FFFFFF'
+                    : '#F8FAFC' /* slate-50 */
+                  : STICKY_BG_HEX[c.import_status] ?? '#FFFFFF';
+
+              return (
+                <tr
+                  key={row.id}
+                  className={`${rowBg} border-b border-gray-100 align-top`}
+                >
+                  {row.getVisibleCells().map((cell) => {
+                    const id = cell.column.id;
+                    const isPinned = PINNED.includes(id);
+                    const pinnedStyle: CSSProperties = isPinned
+                      ? {
+                          position: 'sticky',
+                          left: pinnedLeft[id] ?? 0,
+                          zIndex: 10,
+                          background: stickyBg,
+                        }
+                      : {};
+                    return (
+                      <td
+                        key={cell.id}
+                        style={{
+                          width: cell.column.getSize(),
+                          ...pinnedStyle,
+                        }}
+                        className="border-r border-gray-100 px-3 py-2"
+                      >
+                        {flexRender(cell.column.columnDef.cell, cell.getContext())}
+                      </td>
+                    );
+                  })}
+                </tr>
+              );
+            })}
+            {table.getRowModel().rows.length === 0 && cases.length > 0 && (
+              <tr>
+                <td
+                  colSpan={visibleHeaders.length}
+                  className="px-3 py-8 text-center text-gray-500"
+                >
+                  No cases match the current filters.{' '}
+                  <button
+                    onClick={resetView}
+                    className="text-blue-600 underline hover:text-blue-800"
+                  >
+                    Reset
+                  </button>
+                </td>
+              </tr>
+            )}
+          </tbody>
+        </table>
+      </div>
     </div>
   );
 }
 
-function CaseRow({
-  caseRow: c,
-  refData,
-  onSave,
-  idx,
-}: { caseRow: Case; idx: number } & CommonProps) {
-  // Alternating row background — applied to OK-status rows (the common case).
-  // Problematic statuses keep their status colour so they still stand out.
-  const altBg = idx % 2 === 0 ? 'bg-white' : 'bg-slate-50';
-  const rowBg = c.import_status === 'OK' ? altBg : (ROW_BG[c.import_status] ?? altBg);
-  const stickyBg = c.import_status === 'OK' ? altBg : (STICKY_BG[c.import_status] ?? 'bg-white');
-
-  const save = (updates: Record<string, unknown>) => onSave(c.id, updates);
-
-  return (
-    <tr className={`${rowBg} border-b border-gray-100 align-top`}>
-      <Td sticky left={STICKY_L.status} width={STICKY_W.status} bg={stickyBg}>
-        <SelectCell
-          value={c.import_status}
-          options={refData.import_statuses}
-          render={(v) => (
-            <span
-              className={`text-xs px-2 py-0.5 rounded font-medium ${BADGE[v ?? ''] ?? 'bg-gray-200'}`}
-            >
-              {v}
-            </span>
-          )}
-          onSave={(v) => save({ import_status: v })}
-        />
-      </Td>
-      <Td sticky left={STICKY_L.contract} width={STICKY_W.contract} bg={stickyBg}>
-        <TextCell
-          value={c.contract_id}
-          monospace
-          onSave={(v) => save({ contract_id: v })}
-        />
-      </Td>
-      <Td sticky left={STICKY_L.student} width={STICKY_W.student} bg={stickyBg}>
-        <TextCell value={c.student_name} onSave={(v) => save({ student_name: v })} />
-      </Td>
-      <Td>
-        <TextCell
-          value={c.student_id}
-          monospace
-          onSave={(v) => save({ student_id: v })}
-        />
-      </Td>
-      <Td>
-        <DateCell
-          value={c.contract_signed_date}
-          onSave={(v) => save({ contract_signed_date: v })}
-        />
-      </Td>
-      <Td>
-        <SelectCell
-          value={c.client_type_code}
-          options={refData.client_types}
-          onSave={(v) => save({ client_type_code: v })}
-        />
-      </Td>
-      <Td>
-        <FkCell
-          value={c.country_id}
-          label={c.country_name}
-          options={refData.countries}
-          onSave={(id) => save({ country_id: id })}
-        />
-      </Td>
-      <Td>
-        <ReferSourceCell caseRow={c} refData={refData} onSave={save} />
-      </Td>
-      <Td>
-        <SelectCell
-          value={c.application_status}
-          options={refData.statuses.map((s) => s.name ?? '').filter(Boolean)}
-          onSave={(v) => save({ application_status: v })}
-        />
-      </Td>
-      <Td>
-        <DateCell
-          value={c.visa_received_date}
-          onSave={(v) => save({ visa_received_date: v })}
-        />
-      </Td>
-      <Td>
-        <FkCell
-          value={c.institution_id}
-          label={c.institution_name}
-          options={refData.institutions}
-          onSave={(id) => save({ institution_id: id })}
-        />
-      </Td>
-      <Td>
-        <DateCell
-          value={c.course_start_date}
-          onSave={(v) => save({ course_start_date: v })}
-        />
-      </Td>
-      <Td>
-        <TextCell
-          value={c.course_status}
-          onSave={(v) => save({ course_status: v })}
-        />
-      </Td>
-      <Td>
-        <StaffCell
-          staffId={c.counsellor_staff_id}
-          staffName={c.counsellor_name}
-          options={refData.staff_all}
-          onSave={(staffId, roleId) =>
-            save({
-              counsellor_staff_id: staffId,
-              counsellor_role_id: roleId,
-            })
-          }
-        />
-      </Td>
-      <Td>
-        <StaffCell
-          staffId={c.case_officer_staff_id}
-          staffName={c.case_officer_name}
-          options={refData.staff_all}
-          onSave={(staffId, roleId) =>
-            save({
-              case_officer_staff_id: staffId,
-              case_officer_role_id: roleId,
-            })
-          }
-        />
-      </Td>
-      <Td>
-        <StaffCell
-          staffId={c.pre_sales_staff_id}
-          staffName={c.pre_sales_name}
-          options={refData.staff_all}
-          onSave={(staffId, _roleId) =>
-            save({
-              pre_sales_staff_id: staffId,
-            })
-          }
-        />
-      </Td>
-      <Td>
-        <FkCell
-          value={c.case_office_id}
-          label={c.case_office_code}
-          options={refData.offices}
-          labelField="code"
-          onSave={(id) => save({ case_office_id: id })}
-        />
-      </Td>
-      <Td>
-        <TextAreaCell value={c.notes} onSave={(v) => save({ notes: v })} />
-      </Td>
-    </tr>
-  );
+function SortIndicator({ dir }: { dir: false | 'asc' | 'desc' }) {
+  if (!dir) return <span className="text-gray-300 ml-1">↕</span>;
+  return <span className="text-gray-700 ml-1">{dir === 'asc' ? '↑' : '↓'}</span>;
 }
+
+// STICKY_BG was a Tailwind class map; for inline-style use in sticky cells
+// we need explicit hex equivalents.
+const STICKY_BG_HEX: Record<string, string> = {
+  OK: '#F0FDF4', // green-50
+  FLAGGED: '#FFFBEB', // amber-50
+  UNRESOLVED: '#FEF2F2', // red-50
+  SCRAP: '#F3F4F6', // gray-100
+};
 
 // ===========================================================================
 // Mobile card view — same cells, vertical layout

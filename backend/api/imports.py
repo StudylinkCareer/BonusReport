@@ -1,5 +1,11 @@
 """
-backend/api/imports.py — CRM import endpoints.
+SAVE TO: backend/api/imports.py
+(Full path on your machine: C:\\Users\\rhod_\\Documents\\BonusReport\\Application\\backend\\api\\imports.py)
+
+IMPORTANT: this download is named "imports_api.py" but the deployed filename
+must be "imports.py" — rename it when you save.
+
+CRM import endpoints.
 
 POST /api/imports
     Accept one or more CRM closed-file xlsx uploads. For each file:
@@ -14,8 +20,14 @@ POST /api/imports
       6. Return a per-file result. One bad file does not block the
          others.
 
-    Engine is NOT auto-run. The user reviews cases and triggers the
-    engine separately via POST /api/engine/run.
+POST /api/imports/consolidated
+    Single mass-upload xlsx (regression-test format) containing every
+    closed-file row across many months/staff. Period derived per row by
+    the orchestrator. Same response shape as /api/imports so the
+    frontend handles both modes uniformly.
+
+Engine is NOT auto-run. The user reviews cases and triggers the
+engine separately via POST /api/engine/run.
 
 The volume mount path is configurable via env var BONUSREPORT_DATA_DIR
 (default /data) so this works locally without a volume too.

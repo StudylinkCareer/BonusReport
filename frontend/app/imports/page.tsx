@@ -1,7 +1,11 @@
 'use client'
 
 /**
- * frontend/app/imports/page.tsx
+ * SAVE TO: frontend/app/imports/page.tsx
+ * (Full path: C:\Users\rhod_\Documents\BonusReport\Application\frontend\app\imports\page.tsx)
+ *
+ * Note the trailing 's' — this is /imports (the upload-history list), NOT
+ * /import (the Import Board / upload page).
  *
  * Upload-event history. Every row here is one POST to /api/imports (or
  * /api/imports/consolidated) from the web UI — i.e. one Upload action.

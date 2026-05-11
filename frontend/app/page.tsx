@@ -1,5 +1,15 @@
 "use client";
 
+/**
+ * SAVE TO: frontend/app/page.tsx
+ * (Full path: C:\Users\rhod_\Documents\BonusReport\Application\frontend\app\page.tsx)
+ *
+ * Home page. Four-pillar case workflow dashboard: Uploaded / In Review /
+ * Submitted / Closed. Each pillar links into /import/review with a
+ * workflow_state filter. Header has nav links to Import Board and
+ * Upload history.
+ */
+
 import { useEffect, useState } from "react";
 import Link from "next/link";
 
