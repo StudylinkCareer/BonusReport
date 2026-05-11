@@ -520,6 +520,46 @@ def list_bonus_payments(
             return list(cur.fetchall())
 
 
+# ===========================================================================
+# Pillar counts — drives the 4-pillar home page tiles (Phase 15)
+# ===========================================================================
+
+@app.get("/api/pillars/counts")
+def pillar_counts() -> dict[str, int]:
+    """Per-workflow_state case counts for the 4-pillar home page.
+
+    Response:
+        { "uploaded": N, "in_review": N, "submitted": N, "closed": N, "total": N }
+
+    Missing states return as 0 so the frontend can read every key.
+    """
+    sql = """
+        SELECT workflow_state, COUNT(*) AS n
+          FROM tx_case
+         GROUP BY workflow_state
+    """
+    try:
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql)
+                rows = cur.fetchall()
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"DB error: {e}")
+
+    counts = {"uploaded": 0, "in_review": 0, "submitted": 0, "closed": 0}
+    for row in rows:
+        # Other endpoints in this file (list_imports, list_cases) use dict()
+        # on each row, so the cursor returns dict-like rows already.
+        if isinstance(row, dict):
+            state, n = row["workflow_state"], row["n"]
+        else:
+            state, n = row[0], row[1]
+        if state in counts:
+            counts[state] = int(n)
+    counts["total"] = sum(counts.values())
+    return counts
+
+
 # Note: The duplicate inline @app.post("/api/imports") that previously lived
 # at the bottom of this file has been removed. The router-based version in
 # backend.api.imports now solely handles uploads, with multi-file support
