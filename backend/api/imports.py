@@ -35,6 +35,10 @@ from fastapi import APIRouter, File, HTTPException, UploadFile
 
 from backend.data.connection import get_connection
 from backend.importer.orchestrator import run_file
+from backend.importer.consolidated_orchestrator import (
+    ConsolidatedRunResult,
+    run_consolidated,
+)
 from backend.importer.period_validator import (
     ReportPeriodMismatchError,
     ReportPeriodNotFoundError,
@@ -236,6 +240,174 @@ async def _process_one_file(upload: UploadFile) -> dict:
         "file_path": str(dest_path),
         "summary": _summary_from_result(result),
         "errors": result.errors,
+    }
+
+
+# ---------------------------------------------------------------------------
+# POST /api/imports/consolidated — single mass-upload file
+# ---------------------------------------------------------------------------
+
+@router.post("/consolidated")
+async def upload_consolidated_report(file: UploadFile = File(...)) -> dict:
+    """Accept a single mass-upload xlsx (every status across many months in
+    one file — the format we use for regression testing).
+
+    Unlike POST /api/imports:
+      - one file only
+      - no filename → period parsing (file spans many periods)
+      - period is derived per row inside the orchestrator
+      - tx_import_run is recorded with the *upload* date as run_year/run_month
+        (since the data spans many periods, this is the timestamp of the
+        action, not of the data)
+
+    Returns the same shape as POST /api/imports so the frontend handles
+    both modes uniformly.
+    """
+    result = await _process_consolidated_file(file)
+    return {
+        "total_files": 1,
+        "successful": 1 if result["success"] else 0,
+        "failed": 0 if result["success"] else 1,
+        "files": [result],
+    }
+
+
+async def _process_consolidated_file(upload: UploadFile) -> dict:
+    """Process one consolidated xlsx. Returns a result dict; never raises.
+
+    Result shape matches the per-file shape returned by POST /api/imports
+    so the frontend can render both upload modes with the same code.
+    """
+    if not upload.filename:
+        return {"success": False, "filename": None, "error": "No filename supplied."}
+
+    suffix = Path(upload.filename).suffix.lower()
+    if suffix not in ACCEPTED_EXTENSIONS:
+        return {
+            "success": False,
+            "filename": upload.filename,
+            "error": f"Unsupported file type {suffix!r}. Accepted: {sorted(ACCEPTED_EXTENSIONS)}.",
+        }
+
+    # Save into a dedicated sub-directory so consolidated files are easy to
+    # find later: /data/imports/consolidated/{utc-timestamp}_{filename}
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    dest_dir = IMPORTS_DIR / "consolidated"
+    try:
+        dest_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        return {
+            "success": False,
+            "filename": upload.filename,
+            "error": (
+                f"Could not create destination directory at {dest_dir}. "
+                f"Is the Railway volume attached at {DATA_DIR}? OSError: {exc!s}"
+            ),
+        }
+    dest_path = dest_dir / f"{timestamp}_{upload.filename}"
+
+    try:
+        content = await upload.read()
+        dest_path.write_bytes(content)
+    except OSError as exc:
+        return {
+            "success": False,
+            "filename": upload.filename,
+            "error": f"Failed to save file to {dest_path}: {exc!s}",
+        }
+
+    log.info(
+        "Saved consolidated upload %s to %s (%d bytes), running importer",
+        upload.filename, dest_path, len(content),
+    )
+
+    # ---- Run the consolidated importer ------------------------------------
+    # truncate_first=False — additive, never wipes existing cases.
+    try:
+        cresult: ConsolidatedRunResult = run_consolidated(
+            dest_path,
+            truncate_first=False,
+        )
+    except Exception as exc:
+        log.exception("run_consolidated raised for %s", dest_path)
+        _safely_delete(dest_path)
+        return {
+            "success": False,
+            "filename": upload.filename,
+            "error": f"Importer failed: {exc!r}",
+            "file_path": str(dest_path),
+        }
+
+    # Record the run in tx_import_run. Year/month here are the upload-action
+    # timestamp, not the data period (which spans many months). The /imports
+    # UI surfaces this with a "(consolidated)" label in the filename.
+    now = datetime.now(timezone.utc)
+    display_filename = f"{upload.filename} (consolidated)"
+    try:
+        import_run_id = _insert_import_run(
+            file_path=str(dest_path),
+            original_filename=display_filename,
+            run_year=now.year,
+            run_month=now.month,
+            result=cresult.write,
+        )
+    except Exception as exc:
+        log.exception("tx_import_run insert failed for consolidated %s", dest_path)
+        # Cases were inserted; only the audit-log row failed. Partial success.
+        return {
+            "success": True,
+            "filename": upload.filename,
+            "import_run_id": None,
+            "run_year": now.year,
+            "run_month": now.month,
+            "staff_id": None,
+            "file_path": str(dest_path),
+            "summary": _summary_from_consolidated(cresult),
+            "errors": cresult.write.errors,
+            "warning": f"Cases imported but tx_import_run row not created: {exc!s}",
+        }
+
+    # Build a single result row matching the individual-upload response shape.
+    response = {
+        "success": True,
+        "filename": upload.filename,
+        "import_run_id": import_run_id,
+        "run_year": now.year,
+        "run_month": now.month,
+        "staff_id": None,
+        "file_path": str(dest_path),
+        "summary": _summary_from_consolidated(cresult),
+        "errors": cresult.write.errors,
+    }
+    # Surface period-derivation failures as a warning so the user sees them
+    # without having to scroll a long errors list.
+    if cresult.rows_period_unresolved > 0:
+        sample = "; ".join(cresult.period_failures[:3])
+        response["warning"] = (
+            f"{cresult.rows_period_unresolved} row(s) skipped because the "
+            f"period could not be derived. Sample: {sample}"
+        )
+    return response
+
+
+def _summary_from_consolidated(cresult: ConsolidatedRunResult) -> dict:
+    """Map ConsolidatedRunResult onto the per-file summary shape used by the
+    frontend (same fields as _summary_from_result for the individual mode).
+    """
+    w = cresult.write
+    return {
+        "inserted": w.inserted,
+        "updated": w.updated,
+        # rows_skipped here is the writer's count (transformer returned None).
+        # rows_period_unresolved is exposed separately via the warning.
+        "rows_skipped": w.rows_skipped + cresult.rows_period_unresolved,
+        "notes_attached": w.notes_attached,
+        "notes_orphan": w.notes_orphan,
+        "error_count": len(w.errors),
+        # Extra fields specific to consolidated, ignored by the frontend
+        # but useful for debugging.
+        "rows_seen": cresult.rows_seen,
+        "rows_period_unresolved": cresult.rows_period_unresolved,
     }
 
 
