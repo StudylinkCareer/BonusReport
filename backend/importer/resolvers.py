@@ -37,9 +37,25 @@ def _normalize(s: Optional[str]) -> Optional[str]:
 
 
 def resolve_country(cursor, raw: Optional[str]) -> Optional[int]:
+    """Country text -> dim_country.id.
+
+    Checks ref_country_alias first (catches CRM variants like 'USA', 'UK',
+    typos like 'Switzeland'), then falls back to dim_country.name/code for
+    direct matches. Mirrors resolve_office's alias-first pattern.
+    """
     text = _normalize(raw)
     if not text:
         return None
+    # Try alias table first
+    cursor.execute(
+        """SELECT country_id FROM ref_country_alias
+           WHERE LOWER(alias) = LOWER(%s)""",
+        (text,),
+    )
+    row = cursor.fetchone()
+    if row:
+        return row["country_id"]
+    # Fallback: direct name/code lookup on dim_country
     cursor.execute(
         """SELECT id FROM dim_country
            WHERE LOWER(name) = LOWER(%s) OR LOWER(code) = LOWER(%s)""",

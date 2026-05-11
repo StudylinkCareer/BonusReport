@@ -132,13 +132,16 @@ class ResolverCache:
     def _load(self, cursor) -> None:
         log.info("Loading resolver cache from DB...")
 
-        # Countries: name OR code
+        # Countries: name OR code, plus alias overlay (Tier 1B addition)
         cursor.execute("SELECT id, name, code FROM dim_country")
         for r in cursor.fetchall():
             if r.get("name"):
                 self.countries[r["name"].strip().lower()] = r["id"]
             if r.get("code"):
                 self.countries[r["code"].strip().lower()] = r["id"]
+        cursor.execute("SELECT alias, country_id FROM ref_country_alias")
+        for r in cursor.fetchall():
+            self.countries[r["alias"].strip().lower()] = r["country_id"]
 
         # Offices: dim_office first, aliases override on conflict
         # (resolver checks alias first, so aliases must "win" in the dict)

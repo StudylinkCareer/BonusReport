@@ -10,7 +10,8 @@ Endpoints:
     GET /health
     GET /staff
     GET /payments?staff_id=X&year=Y&month=M
-    GET /docs              — auto Swagger UI
+    GET /api/pillars/counts          (Phase 15: 4-pillar home page)
+    GET /docs                        — auto Swagger UI
 """
 
 from __future__ import annotations
@@ -159,3 +160,50 @@ def get_payments(
             "net":   sum((r.get("net_payable") or 0) for r in rows),
         },
     }
+
+
+# ---------------------------------------------------------------------------
+# Pillar counts — drives the 4-pillar home page tiles (Phase 15)
+# ---------------------------------------------------------------------------
+
+@app.get("/api/pillars/counts")
+def pillar_counts() -> dict[str, int]:
+    """Return per-workflow_state case counts for the 4-pillar home page.
+
+    Response shape:
+        {
+            "uploaded":   123,
+            "in_review":  456,
+            "submitted":   78,
+            "closed":      90,
+            "total":      747
+        }
+
+    Missing states return as 0 so the frontend can blindly read every key
+    without null-handling.
+    """
+    sql = """
+        SELECT workflow_state, COUNT(*) AS n
+          FROM tx_case
+         GROUP BY workflow_state
+    """
+    try:
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql)
+                rows = cur.fetchall()
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"DB error: {e}")
+
+    counts = {"uploaded": 0, "in_review": 0, "submitted": 0, "closed": 0}
+    for row in rows:
+        # Support dict-row cursors (RealDictCursor) or tuple cursors
+        if isinstance(row, dict):
+            state, n = row["workflow_state"], row["n"]
+        else:
+            state, n = row[0], row[1]
+        if state in counts:
+            counts[state] = int(n)
+
+    counts["total"] = sum(counts.values())
+    return counts

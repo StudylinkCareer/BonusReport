@@ -1,215 +1,249 @@
-'use client';
+"use client";
 
-import { useEffect, useState } from 'react';
+import { useEffect, useState } from "react";
+import Link from "next/link";
 
-const API_BASE = 'http://localhost:8000';
+/* -------------------------------------------------------------------------
+ * Types
+ * ----------------------------------------------------------------------- */
 
-type Staff = {
-  id: number;
-  name: string;
-  role_code: string;
-  role_name: string;
-  office_code: string;
-  office_name: string;
-};
+type WorkflowState = "uploaded" | "in_review" | "submitted" | "closed";
 
-type Payment = {
-  payment_id: number;
-  contract_id: string;
-  student_name: string;
-  application_status: string;
-  institution_name: string | null;
-  country_name: string | null;
-  slot: string;
-  tier: string;
-  tier_bonus: number;
-  priority_bonus: number;
-  package_bonus: number;
-  gross_bonus: number;
-  net_payable: number;
-  staff_name: string;
-};
+interface PillarCounts {
+  uploaded: number;
+  in_review: number;
+  submitted: number;
+  closed: number;
+  total: number;
+}
 
-type PaymentResponse = {
-  staff_id: number;
-  year: number;
-  month: number;
-  payments: Payment[];
-  totals: { gross: number; net: number };
-};
+/* -------------------------------------------------------------------------
+ * Pillar metadata
+ * ----------------------------------------------------------------------- */
 
-export default function Home() {
-  const [staff, setStaff] = useState<Staff[]>([]);
-  const [staffId, setStaffId] = useState<number | ''>('');
-  const [year, setYear] = useState(2025);
-  const [month, setMonth] = useState(9);
-  const [data, setData] = useState<PaymentResponse | null>(null);
-  const [loading, setLoading] = useState(false);
+interface PillarMeta {
+  state: WorkflowState;
+  title: string;
+  blurb: string;
+  href: string;
+  accent: string;       // background accent (tailwind)
+  pill: string;         // accent badge (tailwind)
+  border: string;       // border accent (tailwind)
+  dot: string;          // status dot (tailwind)
+}
+
+const PILLARS: PillarMeta[] = [
+  {
+    state: "uploaded",
+    title: "Uploaded",
+    blurb: "Just imported. Needs to be picked up for review.",
+    href: "/cases/uploaded",
+    accent: "bg-slate-50",
+    pill: "bg-slate-100 text-slate-700",
+    border: "border-slate-300",
+    dot: "bg-slate-400",
+  },
+  {
+    state: "in_review",
+    title: "In Review",
+    blurb: "Under review by case staff, Data Quality, and Finance.",
+    href: "/cases/in_review",
+    accent: "bg-amber-50",
+    pill: "bg-amber-100 text-amber-800",
+    border: "border-amber-300",
+    dot: "bg-amber-500",
+  },
+  {
+    state: "submitted",
+    title: "Submitted",
+    blurb: "All review approvals collected. Ready for engine processing.",
+    href: "/cases/submitted",
+    accent: "bg-sky-50",
+    pill: "bg-sky-100 text-sky-800",
+    border: "border-sky-300",
+    dot: "bg-sky-500",
+  },
+  {
+    state: "closed",
+    title: "Closed",
+    blurb: "Engine complete. Senior Manager review for payment release.",
+    href: "/cases/closed",
+    accent: "bg-emerald-50",
+    pill: "bg-emerald-100 text-emerald-800",
+    border: "border-emerald-300",
+    dot: "bg-emerald-500",
+  },
+];
+
+/* -------------------------------------------------------------------------
+ * Page
+ * ----------------------------------------------------------------------- */
+
+export default function HomePage() {
+  const [counts, setCounts] = useState<PillarCounts | null>(null);
+  const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
-  // Load staff list on mount
   useEffect(() => {
-    fetch(`${API_BASE}/staff`)
-      .then((r) => r.json())
-      .then(setStaff)
-      .catch((e) => setError(`Failed to load staff: ${e.message}`));
+    fetch("/api/pillars/counts")
+      .then(async (r) => {
+        if (!r.ok) throw new Error(`HTTP ${r.status}: ${await r.text()}`);
+        return r.json() as Promise<PillarCounts>;
+      })
+      .then((d) => setCounts(d))
+      .catch((e) => setError(String(e.message ?? e)))
+      .finally(() => setLoading(false));
   }, []);
 
-  async function load() {
-    if (!staffId) return;
-    setLoading(true);
-    setError(null);
-    try {
-      const r = await fetch(
-        `${API_BASE}/payments?staff_id=${staffId}&year=${year}&month=${month}`
-      );
-      if (!r.ok) throw new Error(`HTTP ${r.status}`);
-      const d = await r.json();
-      setData(d);
-    } catch (e: unknown) {
-      const msg = e instanceof Error ? e.message : 'unknown';
-      setError(`Failed to load payments: ${msg}`);
-      setData(null);
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  const fmt = (n: number) => n.toLocaleString('en-US');
-
   return (
-    <main className="min-h-screen bg-gray-50 p-8">
-      <div className="max-w-7xl mx-auto">
-        <h1 className="text-3xl font-bold mb-6 text-gray-900">
-          StudyLink Bonus Report
-        </h1>
+    <main className="min-h-screen bg-white">
+      <Header />
 
-        {/* Form */}
-        <div className="bg-white rounded-lg shadow p-4 mb-6 flex gap-4 items-end flex-wrap">
-          <div>
-            <label className="block text-sm font-medium text-gray-700 mb-1">
-              Staff
-            </label>
-            <select
-              value={staffId}
-              onChange={(e) =>
-                setStaffId(e.target.value ? Number(e.target.value) : '')
-              }
-              className="border border-gray-300 rounded px-3 py-2 min-w-[280px] bg-white text-gray-900"
-            >
-              <option value="">-- pick a staff member --</option>
-              {staff.map((s) => (
-                <option key={s.id} value={s.id}>
-                  {s.name} ({s.role_code} / {s.office_code})
-                </option>
-              ))}
-            </select>
+      <div className="mx-auto max-w-7xl px-6 py-10">
+        <PageIntro total={counts?.total ?? null} />
+
+        {error && (
+          <div className="mt-8 rounded-lg border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-800">
+            Failed to load case counts: {error}
           </div>
-          <div>
-            <label className="block text-sm font-medium text-gray-700 mb-1">
-              Year
-            </label>
-            <input
-              type="number"
-              value={year}
-              onChange={(e) => setYear(Number(e.target.value))}
-              className="border border-gray-300 rounded px-3 py-2 w-24 bg-white text-gray-900"
+        )}
+
+        <div className="mt-8 grid grid-cols-1 gap-5 sm:grid-cols-2 lg:grid-cols-4">
+          {PILLARS.map((p) => (
+            <PillarCard
+              key={p.state}
+              meta={p}
+              count={counts ? counts[p.state] : null}
+              loading={loading}
             />
-          </div>
-          <div>
-            <label className="block text-sm font-medium text-gray-700 mb-1">
-              Month
-            </label>
-            <input
-              type="number"
-              min={1}
-              max={12}
-              value={month}
-              onChange={(e) => setMonth(Number(e.target.value))}
-              className="border border-gray-300 rounded px-3 py-2 w-20 bg-white text-gray-900"
-            />
-          </div>
-          <button
-            onClick={load}
-            disabled={!staffId || loading}
-            className="bg-blue-600 text-white px-4 py-2 rounded font-medium hover:bg-blue-700 disabled:bg-gray-400 disabled:cursor-not-allowed"
-          >
-            {loading ? 'Loading...' : 'Load'}
-          </button>
+          ))}
         </div>
 
-        {/* Error */}
-        {error && (
-          <div className="bg-red-50 border border-red-200 text-red-800 px-4 py-3 rounded mb-6">
-            {error}
-          </div>
-        )}
-
-        {/* Results */}
-        {data && (
-          <div className="bg-white rounded-lg shadow overflow-hidden">
-            <div className="px-4 py-3 border-b bg-gray-50 flex justify-between text-sm text-gray-700">
-              <span className="font-medium">
-                {data.payments.length} payment rows
-              </span>
-              <span>
-                Gross:{' '}
-                <span className="font-mono font-medium">
-                  {fmt(data.totals.gross)}
-                </span>
-                {' • '}
-                Net:{' '}
-                <span className="font-mono font-medium">
-                  {fmt(data.totals.net)}
-                </span>
-              </span>
-            </div>
-            <div className="overflow-x-auto">
-              <table className="w-full text-sm">
-                <thead className="bg-gray-100 text-left text-xs uppercase tracking-wider text-gray-600">
-                  <tr>
-                    <th className="px-3 py-2">Contract</th>
-                    <th className="px-3 py-2">Student</th>
-                    <th className="px-3 py-2">Status</th>
-                    <th className="px-3 py-2">Institution</th>
-                    <th className="px-3 py-2">Country</th>
-                    <th className="px-3 py-2">Slot</th>
-                    <th className="px-3 py-2">Tier</th>
-                    <th className="px-3 py-2 text-right">Tier $</th>
-                    <th className="px-3 py-2 text-right">Priority $</th>
-                    <th className="px-3 py-2 text-right">Net $</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y text-gray-900">
-                  {data.payments.map((p) => (
-                    <tr
-                      key={p.payment_id}
-                      className={p.net_payable === 0 ? 'text-gray-400' : ''}
-                    >
-                      <td className="px-3 py-2 font-mono">{p.contract_id}</td>
-                      <td className="px-3 py-2">{p.student_name}</td>
-                      <td className="px-3 py-2">{p.application_status}</td>
-                      <td className="px-3 py-2">{p.institution_name ?? '—'}</td>
-                      <td className="px-3 py-2">{p.country_name ?? '—'}</td>
-                      <td className="px-3 py-2 text-xs">{p.slot}</td>
-                      <td className="px-3 py-2 text-xs">{p.tier}</td>
-                      <td className="px-3 py-2 text-right font-mono">
-                        {fmt(p.tier_bonus)}
-                      </td>
-                      <td className="px-3 py-2 text-right font-mono">
-                        {fmt(p.priority_bonus)}
-                      </td>
-                      <td className="px-3 py-2 text-right font-mono font-medium">
-                        {fmt(p.net_payable)}
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          </div>
-        )}
+        <UploadCallToAction />
       </div>
     </main>
+  );
+}
+
+/* -------------------------------------------------------------------------
+ * Header
+ * ----------------------------------------------------------------------- */
+
+function Header() {
+  return (
+    <header className="border-b border-slate-200 bg-white">
+      <div className="mx-auto flex max-w-7xl items-center justify-between px-6 py-4">
+        <div className="flex items-center gap-3">
+          <div className="h-8 w-8 rounded-md bg-slate-900" />
+          <div>
+            <div className="text-sm font-semibold tracking-tight text-slate-900">
+              StudyLink Bonus
+            </div>
+            <div className="text-xs text-slate-500">Case workflow</div>
+          </div>
+        </div>
+
+        {/* Acting-as picker — stub for now. Wired up in a later step. */}
+        <div className="flex items-center gap-3">
+          <button
+            className="rounded-md border border-slate-200 bg-white px-3 py-1.5 text-sm text-slate-700 hover:bg-slate-50"
+            disabled
+            title="Role switching not yet wired up"
+          >
+            Acting as: <span className="font-medium">Admin</span>
+          </button>
+        </div>
+      </div>
+    </header>
+  );
+}
+
+/* -------------------------------------------------------------------------
+ * Page intro
+ * ----------------------------------------------------------------------- */
+
+function PageIntro({ total }: { total: number | null }) {
+  return (
+    <div className="flex items-end justify-between">
+      <div>
+        <h1 className="text-3xl font-semibold tracking-tight text-slate-900">
+          Case workflow
+        </h1>
+        <p className="mt-1 text-sm text-slate-600">
+          {total === null
+            ? "Loading case counts…"
+            : `${total.toLocaleString()} case${total === 1 ? "" : "s"} in the system.`}
+        </p>
+      </div>
+    </div>
+  );
+}
+
+/* -------------------------------------------------------------------------
+ * Pillar card
+ * ----------------------------------------------------------------------- */
+
+function PillarCard({
+  meta,
+  count,
+  loading,
+}: {
+  meta: PillarMeta;
+  count: number | null;
+  loading: boolean;
+}) {
+  return (
+    <Link
+      href={meta.href}
+      className={`group relative flex flex-col rounded-xl border ${meta.border} ${meta.accent} px-5 py-5 transition hover:shadow-md`}
+    >
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-2">
+          <span className={`h-2 w-2 rounded-full ${meta.dot}`} />
+          <span className={`rounded-full px-2 py-0.5 text-xs font-medium ${meta.pill}`}>
+            {meta.title}
+          </span>
+        </div>
+        <span className="text-xs text-slate-500 opacity-0 transition group-hover:opacity-100">
+          View →
+        </span>
+      </div>
+
+      <div className="mt-5">
+        {loading ? (
+          <div className="h-10 w-20 animate-pulse rounded bg-slate-200" />
+        ) : (
+          <div className="text-4xl font-semibold tracking-tight text-slate-900">
+            {(count ?? 0).toLocaleString()}
+          </div>
+        )}
+        <div className="mt-2 text-sm text-slate-600">{meta.blurb}</div>
+      </div>
+    </Link>
+  );
+}
+
+/* -------------------------------------------------------------------------
+ * Upload CTA
+ * ----------------------------------------------------------------------- */
+
+function UploadCallToAction() {
+  return (
+    <div className="mt-10 flex items-center justify-between rounded-xl border border-slate-200 bg-slate-50 px-6 py-5">
+      <div>
+        <div className="text-sm font-medium text-slate-900">
+          New cases to load?
+        </div>
+        <div className="text-sm text-slate-600">
+          Upload a closed-file Excel report to add new cases to the Uploaded pillar.
+        </div>
+      </div>
+      <Link
+        href="/import"
+        className="rounded-md bg-slate-900 px-4 py-2 text-sm font-medium text-white hover:bg-slate-800"
+      >
+        Upload file
+      </Link>
+    </div>
   );
 }

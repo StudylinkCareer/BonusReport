@@ -166,6 +166,7 @@ def run_consolidated(
     conn=None,
     truncate_first: bool = False,
     staff_names_lower: Optional[set[str]] = None,
+    contract_ids: Optional[set[str]] = None,
     contract_signed_from: Optional[datetime] = None,
     contract_signed_to:   Optional[datetime] = None,
     visa_received_from:   Optional[datetime] = None,
@@ -185,6 +186,11 @@ def run_consolidated(
     truncate_first : if True, TRUNCATE tx_case CASCADE before importing.
     staff_names_lower / *_from / *_to / limit : passed through to the
         reader; see consolidated_reader.iter_filtered_rows().
+    contract_ids : optional set of Contract ID strings to restrict import
+        to (e.g. {"SLC-12858", "SLC-12859"}). Applied at the orchestrator
+        level after the reader filters. Useful for targeted re-imports
+        when validating a fix against a subset of cases without doing a
+        full TRUNCATE + reload.
 
     Returns
     -------
@@ -217,6 +223,28 @@ def run_consolidated(
                         course_start_to=course_start_to,
                         limit=limit,
                     )
+
+                    # Optional Contract-ID filter — applied at the orchestrator
+                    # level so consolidated_reader.py doesn't need to change.
+                    # Useful for targeted re-imports of specific cases (e.g.
+                    # validating a transformer fix against the previously
+                    # flagged rows). Comparison is whitespace-trimmed string
+                    # match against the source row's "Contract ID" cell.
+                    if contract_ids is not None:
+                        target_ids = {str(c).strip() for c in contract_ids if c}
+                        log.info(
+                            "Contract-ID filter active: %d id(s) requested. Sample: %s",
+                            len(target_ids),
+                            ", ".join(sorted(target_ids))[:200],
+                        )
+                        def _contract_filter(it):
+                            for raw in it:
+                                cid = raw.data.get("Contract ID")
+                                if cid is None:
+                                    continue
+                                if str(cid).strip() in target_ids:
+                                    yield raw
+                        row_iter = _contract_filter(row_iter)
 
                     for raw in row_iter:
                         result.rows_seen += 1
@@ -257,14 +285,21 @@ def run_consolidated(
                 if own_conn:
                     active_conn.commit()
                 log.info(
-                    "Consolidated import done: rows_seen=%d inserted=%d updated=%d "
+                    "Consolidated import done: rows_seen=%d inserted=%d blocked=%d "
                     "rows_skipped=%d period_unresolved=%d notes_attached=%d "
                     "notes_orphan=%d errors=%d",
-                    result.rows_seen, result.write.inserted, result.write.updated,
+                    result.rows_seen, result.write.inserted, result.write.blocked,
                     result.write.rows_skipped, result.rows_period_unresolved,
                     result.write.notes_attached, result.write.notes_orphan,
                     len(result.write.errors),
                 )
+                if result.write.blocked > 0:
+                    log.info(
+                        "%d row(s) BLOCKED by existing (contract_id, application_status). "
+                        "See result.write.blocked_details — the frontend should prompt the "
+                        "user about replace/delete based on existing workflow_state.",
+                        result.write.blocked,
+                    )
 
             except Exception as exc:
                 if own_conn:

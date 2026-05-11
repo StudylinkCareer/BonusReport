@@ -4,19 +4,17 @@ backend/importer/orchestrator.py
 Run the full import pipeline (reader → transformer → writer) for a single
 closed-file report and return a WriteResult summarising what happened.
 
-Transaction policy (Q4 = Option A):
+Transaction policy:
   Per-file transactions. The orchestrator can either:
     * Open and own a connection itself (default — used by the CLI), or
-    * Borrow a caller-supplied connection (used by tests, so they can
-      roll back at the end without polluting the DB).
+    * Borrow a caller-supplied connection (used by tests / FastAPI).
 
   When owning the connection: commits on success, rolls back on any
-  unhandled exception, then re-raises. The CLI catches at its level and
-  proceeds with the next file.
+  unhandled exception, then re-raises (or swallows, see below).
 
-Per-row failures (transformer returning None, writer catching DB errors)
-do NOT abort the file — they're logged into result.errors and counted
-in result.rows_skipped / result.notes_orphan, per Q2 = Option A.
+Per-row failures (transformer returning None, writer catching DB errors,
+writer reporting BLOCKED) do NOT abort the file — they're counted in the
+WriteResult fields and the file processes to completion.
 """
 
 import logging
@@ -52,6 +50,9 @@ def run_file(
 
     Returns:
         WriteResult — populated with counts even if errors occurred.
+        Includes result.blocked and result.blocked_details listing any
+        rows rejected because (contract_id, application_status) already
+        existed in tx_case.
 
     Raises:
         FilenameParseError if year/month can't be derived from the filename.
@@ -69,8 +70,6 @@ def run_file(
         run_month = info.month
     log.info("Importing %s as run %d-%02d", path.name, run_year, run_month)
 
-    # Decide who owns the connection. nullcontext lets us write the same
-    # `with` regardless.
     own_conn = conn is None
     cm = get_connection() if own_conn else nullcontext(conn)
 
@@ -93,15 +92,23 @@ def run_file(
                 if own_conn:
                     active_conn.commit()
                 log.info(
-                    "Done %s: rows_seen=%d inserted=%d updated=%d skipped=%d "
+                    "Done %s: rows_seen=%d inserted=%d blocked=%d skipped=%d "
                     "notes_attached=%d notes_orphan=%d errors=%d",
-                    path.name, rows_seen, result.inserted, result.updated,
+                    path.name, rows_seen, result.inserted, result.blocked,
                     result.rows_skipped, result.notes_attached,
                     result.notes_orphan, len(result.errors),
                 )
+                if result.blocked > 0:
+                    log.info(
+                        "%d row(s) BLOCKED by existing (contract_id, application_status). "
+                        "See result.blocked_details for the list — the frontend should "
+                        "prompt the user about replace/delete based on existing "
+                        "workflow_state.",
+                        result.blocked,
+                    )
             except Exception as exc:
                 # Unhandled — usually a DB connection drop or bad SQL.
-                # Per-row failures are caught by writer.write_transformer_output
+                # Per-row failures are caught in writer.write_transformer_output
                 # and don't reach here.
                 if own_conn:
                     active_conn.rollback()
@@ -109,8 +116,6 @@ def run_file(
                 log.exception(msg)
                 result.errors.append(msg)
                 if not own_conn:
-                    # Caller manages the connection; let the exception
-                    # propagate so they can decide.
                     raise
                 # When we own the connection, swallow the exception and
                 # return the result so the CLI can move on to the next file.

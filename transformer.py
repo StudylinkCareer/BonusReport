@@ -102,7 +102,6 @@ COL_COURSE_START = "Course Start Date"
 COL_COURSE_STATUS = "Course Status"
 COL_COUNSELLOR = "Counsellor Name"
 COL_CASE_OFFICER = "Case Officer Name"
-COL_PRE_SALES = "Pre-sales Name"
 COL_NOTES = "Notes"
 COL_INCENTIVE_PREFIX = "Customer Incentive"
 
@@ -151,7 +150,6 @@ class CaseRecord:
     counsellor_role_id: Optional[int]
     case_officer_staff_id: Optional[int]
     case_officer_role_id: Optional[int]
-    pre_sales_staff_id: Optional[int]
     referring_source_type: str
     import_status: str
     incentive_amount: int
@@ -292,42 +290,6 @@ def _escalate(current: str, candidate: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Pre-sales name normalization (Phase 15 B2)
-# ---------------------------------------------------------------------------
-
-def _normalize_pre_sales_name(name: Optional[str]) -> Optional[str]:
-    """Convert 'SURNAME, Given Names' to Vietnamese natural order.
-
-    Some Pre-sales entries use a Western convention where the surname is
-    written first, in ALL CAPS, followed by a comma and the given names.
-    Example: 'MẠCH, Nguyễn Phi Vân' -> 'Mạch Nguyễn Phi Vân'.
-
-    Conversion rule:
-      * If no comma is present, the name is returned unchanged.
-      * Otherwise split on the first comma, title-case the surname segment
-        (since the source convention is all-caps), strip whitespace from
-        both halves, and join with a single space.
-
-    The original raw form is what we surface in NOTES so operators can
-    reconcile back to the source when an UNRESOLVED_PRE_SALES warning fires.
-    """
-    if name is None:
-        return None
-    if "," not in name:
-        return name.strip() or None
-    surname, given = name.split(",", 1)
-    surname = surname.strip().title()
-    given = given.strip()
-    if not surname and not given:
-        return None
-    if not given:
-        return surname
-    if not surname:
-        return given
-    return f"{surname} {given}"
-
-
-# ---------------------------------------------------------------------------
 # Header lookup (handles 17- vs 18-column variants)
 # ---------------------------------------------------------------------------
 
@@ -368,7 +330,7 @@ def transform_row(
 
     # ---- Date-in-text-field SCRAP detection -------------------------------
     for col in (COL_REFER_SOURCE, COL_INSTITUTION, COL_COUNSELLOR,
-                COL_CASE_OFFICER, COL_PRE_SALES, COL_NOTES, COL_CLIENT_TYPE,
+                COL_CASE_OFFICER, COL_NOTES, COL_CLIENT_TYPE,
                 COL_SYSTEM_TYPE, COL_APPLICATION_STATUS):
         if _is_datetime_value(data.get(col)):
             notes.append(NoteRecord(
@@ -430,53 +392,6 @@ def transform_row(
             ))
             import_status = _escalate(import_status, STATUS_SCRAP)
 
-    # ---- Pre-sales resolution (Phase 15 B2) -------------------------------
-    # Mirrors the counsellor/case_officer pattern but kept in a separate
-    # block to minimise the diff against the existing logic. Pre-sales has
-    # no role_id column on tx_case — the slot itself carries that meaning.
-    #
-    # Names in the source can use a Western surname-first-with-comma form
-    # (e.g. 'MẠCH, Nguyễn Phi Vân'). _normalize_pre_sales_name() converts
-    # that to the Vietnamese natural order before resolve_staff lookup.
-    pre_sales_text_raw = _string_or_none(data.get(COL_PRE_SALES))
-    pre_sales_text = _normalize_pre_sales_name(pre_sales_text_raw)
-
-    pre_sales_is_departed = bool(pre_sales_text) and pre_sales_text in DEPARTED_STAFF_NAMES
-    if pre_sales_is_departed:
-        notes.append(NoteRecord(
-            warning_type="DEPARTED_STAFF",
-            raw_value=pre_sales_text_raw,
-            note=f"Row {raw.row_number}: case attributed to a departed Pre-sales staff member.",
-        ))
-        import_status = _escalate(import_status, STATUS_SCRAP)
-
-    pre_sales_staff_id = resolve_staff(cursor, pre_sales_text) if pre_sales_text else None
-
-    if pre_sales_text and pre_sales_staff_id is None and not pre_sales_is_departed:
-        # Surface both forms in the note so operators can reconcile with the
-        # source if the normalization step changed the lookup string.
-        if pre_sales_text == pre_sales_text_raw:
-            note_msg = f"Row {raw.row_number}: pre-sales name {pre_sales_text!r} not found in ref_staff."
-        else:
-            note_msg = (
-                f"Row {raw.row_number}: pre-sales name not found in ref_staff "
-                f"(raw={pre_sales_text_raw!r}, normalized={pre_sales_text!r})."
-            )
-        notes.append(NoteRecord(
-            warning_type="UNRESOLVED_PRE_SALES",
-            raw_value=pre_sales_text_raw,
-            note=note_msg,
-        ))
-        import_status = _escalate(import_status, STATUS_UNRESOLVED)
-
-    if pre_sales_staff_id is not None and resolve_staff_employment(cursor, pre_sales_staff_id) == "DEPARTED":
-        notes.append(NoteRecord(
-            warning_type="DEPARTED_STAFF",
-            raw_value=str(pre_sales_staff_id),
-            note=f"Row {raw.row_number}: pre-sales marked DEPARTED in ref_staff.",
-        ))
-        import_status = _escalate(import_status, STATUS_SCRAP)
-
     # ---- CO_SUB slot rule -------------------------------------------------
     # CO_SUB staff always populate case_officer slot, never counsellor slot,
     # regardless of which Excel column they appeared in. Per the locked
@@ -516,7 +431,6 @@ def transform_row(
     case_office_id = (
         _get_staff_office(cursor, counsellor_staff_id)
         or _get_staff_office(cursor, case_officer_staff_id)
-        or _get_staff_office(cursor, pre_sales_staff_id)
     )
     if case_office_id is None:
         notes.append(NoteRecord(
@@ -657,7 +571,6 @@ def transform_row(
         counsellor_role_id=counsellor_role_id,
         case_officer_staff_id=case_officer_staff_id,
         case_officer_role_id=case_officer_role_id,
-        pre_sales_staff_id=pre_sales_staff_id,
         referring_source_type=source_type,
         import_status=import_status,
         incentive_amount=_parse_incentive(_get_incentive_value(data)),

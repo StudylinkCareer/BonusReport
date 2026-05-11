@@ -25,6 +25,16 @@ Most-common patterns:
     # Sample the first 50 rows (handy for smoke tests)
     python -m backend.importer.consolidated_cli "C:/path/Report.xlsx" --limit 50
 
+    # Targeted re-import of just a few cases (no truncate; existing rows
+    # are upserted in place). Useful for validating a fix without a full
+    # 13-min reload.
+    python -m backend.importer.consolidated_cli "C:/path/Report.xlsx" \\
+        --contract SLC-12858 --contract SLC-12859
+
+    # Targeted re-import from a file (one Contract ID per line)
+    python -m backend.importer.consolidated_cli "C:/path/Report.xlsx" \\
+        --contracts-file flagged_cases.txt
+
 The legacy per-staff per-month importer (backend.importer.cli) is unchanged
 and still works for one-off file re-imports.
 """
@@ -106,12 +116,25 @@ def _print_summary(result, dry_run: bool) -> None:
     print("=" * 60)
     print(f"  Rows seen (after filters):     {result.rows_seen}")
     print(f"  tx_case inserted:              {w.inserted}")
-    print(f"  tx_case updated:               {w.updated}")
+    print(f"  tx_case blocked (duplicate):   {w.blocked}")
     print(f"  Rows skipped (transformer):    {w.rows_skipped}")
     print(f"  Period unresolved (skipped):   {result.rows_period_unresolved}")
     print(f"  Notes attached to a case:      {w.notes_attached}")
     print(f"  Notes orphaned (no case):      {w.notes_orphan}")
     print(f"  Errors:                        {len(w.errors)}")
+
+    if w.blocked > 0 and w.blocked_details:
+        print()
+        print(f"  Sample blocked rows (first 10 of {w.blocked}):")
+        for d in w.blocked_details[:10]:
+            print(
+                f"    - {d.contract_id} | status={d.application_status!r} | "
+                f"existing case_id={d.existing_case_id} "
+                f"workflow_state={d.existing_workflow_state} "
+                f"run={d.existing_run_year}-{d.existing_run_month:02d}"
+            )
+        if w.blocked > 10:
+            print(f"    ... and {w.blocked - 10} more (see log file)")
 
     if result.period_failures:
         print()
@@ -159,6 +182,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--office", action="append", default=None, metavar="CODE",
                         help="Limit to staff with this home office code (e.g. HCM). Repeatable.")
 
+    # Row filters — contract IDs (targeted re-imports)
+    parser.add_argument("--contract", action="append", default=None, metavar="ID",
+                        help="Limit to this Contract ID (e.g. SLC-12858). Repeatable. "
+                             "Combine with --contracts-file to extend the set.")
+    parser.add_argument("--contracts-file", type=Path, default=None, metavar="PATH",
+                        help="Path to a text file with one Contract ID per line. "
+                             "Blank lines and lines starting with '#' are ignored. "
+                             "Combined with --contract entries (union).")
+
     # Row filters — dates (inclusive on both ends)
     parser.add_argument("--contract-signed-from", type=_parse_date_arg, default=None)
     parser.add_argument("--contract-signed-to",   type=_parse_date_arg, default=None)
@@ -198,6 +230,30 @@ def main(argv: list[str] | None = None) -> int:
                 ", ".join(sorted(staff_names_lower))[:200],
             )
 
+        # Build the optional Contract-ID filter set from --contract entries
+        # and/or --contracts-file. Both sources combine (union). None means
+        # "no contract filter".
+        contract_ids: set[str] | None = None
+        if args.contract or args.contracts_file:
+            contract_ids = set()
+            if args.contract:
+                contract_ids.update(c.strip() for c in args.contract if c and c.strip())
+            if args.contracts_file:
+                if not args.contracts_file.is_file():
+                    print(f"ERROR: contracts file not found: {args.contracts_file}",
+                          file=sys.stderr)
+                    return 2
+                with args.contracts_file.open(encoding="utf-8") as fh:
+                    for line in fh:
+                        s = line.strip()
+                        if s and not s.startswith("#"):
+                            contract_ids.add(s)
+            if not contract_ids:
+                print("ERROR: --contract/--contracts-file given but no IDs parsed.",
+                      file=sys.stderr)
+                return 2
+            log.info("Contract-ID filter: %d unique id(s) loaded.", len(contract_ids))
+
         # Run the import. Pass conn so we own commit/rollback at this layer.
         try:
             result = run_consolidated(
@@ -205,6 +261,7 @@ def main(argv: list[str] | None = None) -> int:
                 conn=conn,
                 truncate_first=args.truncate,
                 staff_names_lower=staff_names_lower,
+                contract_ids=contract_ids,
                 contract_signed_from=args.contract_signed_from,
                 contract_signed_to=args.contract_signed_to,
                 visa_received_from=args.visa_received_from,
