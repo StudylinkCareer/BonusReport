@@ -560,6 +560,73 @@ def pillar_counts() -> dict[str, int]:
     return counts
 
 
+# ===========================================================================
+# Pillar list view — cases at one workflow_state (Phase 15)
+# ===========================================================================
+
+VALID_WORKFLOW_STATES = {"uploaded", "in_review", "submitted", "closed"}
+
+
+@app.get("/api/pillars/{state}/cases")
+def list_cases_by_pillar(state: str = PathParam(..., min_length=1)) -> dict:
+    """List all cases at a given workflow_state. Used by the pillar drill-down views.
+
+    Returns:
+        {
+            "state": "uploaded",
+            "count": 65,
+            "cases": [
+                { id, contract_id, student_name, application_status,
+                  import_status, institution_name, country_name,
+                  counsellor_name, case_officer_name, pre_sales_name,
+                  run_year, run_month, updated_at },
+                ...
+            ]
+        }
+
+    The cases list reads from the importer's columns (pre_sales_staff_id),
+    not the engine's (presales_staff_id) — so it works for cases at any
+    stage including 'uploaded', before the engine has run.
+    """
+    if state not in VALID_WORKFLOW_STATES:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Unknown workflow_state {state!r}. Valid: {sorted(VALID_WORKFLOW_STATES)}",
+        )
+
+    sql = """
+        SELECT
+            c.id,
+            c.contract_id,
+            c.student_name,
+            c.application_status,
+            c.import_status,
+            c.workflow_state,
+            c.run_year,
+            c.run_month,
+            c.updated_at,
+            inst.canonical_name      AS institution_name,
+            cn.name                  AS country_name,
+            counsellor.canonical_name AS counsellor_name,
+            co.canonical_name         AS case_officer_name,
+            ps.canonical_name         AS pre_sales_name
+          FROM tx_case c
+          LEFT JOIN ref_institution inst       ON c.institution_id        = inst.id
+          LEFT JOIN dim_country     cn         ON c.country_id            = cn.id
+          LEFT JOIN ref_staff       counsellor ON c.counsellor_staff_id   = counsellor.id
+          LEFT JOIN ref_staff       co         ON c.case_officer_staff_id = co.id
+          LEFT JOIN ref_staff       ps         ON c.pre_sales_staff_id    = ps.id
+         WHERE c.workflow_state = %s
+         ORDER BY c.updated_at DESC, c.id DESC
+    """
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, (state,))
+            cases = [dict(row) for row in cur.fetchall()]
+
+    return {"state": state, "count": len(cases), "cases": cases}
+
+
 # Note: The duplicate inline @app.post("/api/imports") that previously lived
 # at the bottom of this file has been removed. The router-based version in
 # backend.api.imports now solely handles uploads, with multi-file support
