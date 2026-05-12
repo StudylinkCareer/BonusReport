@@ -30,6 +30,7 @@ import {
   useCallback,
   useEffect,
   useMemo,
+  useRef,
   useState,
 } from 'react';
 import {
@@ -37,6 +38,7 @@ import {
   ColumnFiltersState,
   ColumnOrderState,
   ColumnSizingState,
+  RowSelectionState,
   SortingState,
   flexRender,
   getCoreRowModel,
@@ -44,6 +46,13 @@ import {
   getSortedRowModel,
   useReactTable,
 } from '@tanstack/react-table';
+import { useRole, roleLabel } from '@/lib/role';
+import {
+  filtersFromQuery,
+  filtersToQuery,
+  urlHasFilters,
+  type Filters,
+} from '@/lib/filters';
 import { useRouter } from 'next/navigation';
 
 // ===========================================================================
@@ -111,6 +120,31 @@ type Case = {
 
   pre_sales_staff_id: number | null;
   pre_sales_name: string | null;
+
+  // Phase 5 + v6.2 — Package (single-select) + new tx_case columns
+  package_fee_id: number | null;
+  package_code: string | null;
+  package_label: string | null;
+  package_payment_basis: string | null;
+  service_review_pending: boolean;
+  system_type: string | null;
+  institution_type: string | null;
+  targets_name: string | null;
+
+  // Phase 5 — Services (multi-select via tx_case_service junction)
+  services: CaseService[];
+};
+
+type CaseService = {
+  id: number;            // tx_case_service.id
+  service_fee_id: number;
+  service_code: string;
+  service_label: string; // friendly label (description prefix or service_code)
+  category: string;      // SERVICE_FEE | ADDON
+  count: number;
+  bonus_event: string;
+  confirmed: boolean;
+  detection_source: string | null;
 };
 
 type RefItem = {
@@ -120,6 +154,10 @@ type RefItem = {
   classification?: string;
   primary_role_id?: number | null;
   employment_status?: string | null;
+  category?: string | null;             // for service_codes (SERVICE_FEE | ADDON)
+  counsellor_signing_bonus?: number;    // for service_codes / package_codes
+  co_signing_bonus?: number;
+  bonus_payment_basis?: string | null;
 };
 
 type RefData = {
@@ -133,6 +171,15 @@ type RefData = {
   source_types: string[];
   import_statuses: string[];
   client_types: string[];
+  course_statuses: string[];
+  // Phase 5 + v6.2 — new reference lists
+  service_codes: RefItem[];      // SERVICE_FEE + ADDON for multi-select
+  package_codes: RefItem[];      // PACKAGE for single-select
+  deferral_codes: string[];      // v6.2 col 21
+  system_types: string[];        // v6.2 col 9
+  institution_types: string[];   // v6.2 col 28
+  bonus_events: string[];        // tx_case_service.bonus_event
+  presales_agents: string[];     // v6.2 col 17 (curated 7-value list incl NONE)
 };
 
 const EMPTY_REF: RefData = {
@@ -146,6 +193,14 @@ const EMPTY_REF: RefData = {
   source_types: [],
   import_statuses: [],
   client_types: [],
+  course_statuses: [],
+  service_codes: [],
+  package_codes: [],
+  deferral_codes: [],
+  system_types: [],
+  institution_types: [],
+  bonus_events: [],
+  presales_agents: [],
 };
 
 type EngineResult = {
@@ -203,6 +258,7 @@ export default function ReviewPage() {
   const [year, setYear] = useState(new Date().getFullYear());
   const [month, setMonth] = useState(new Date().getMonth() + 1);
   const [workflowState, setWorkflowState] = useState<string | null>(null);  // Phase 15: pillar-view mode
+  const [role] = useRole();
   const [cases, setCases] = useState<Case[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -244,6 +300,15 @@ export default function ReviewPage() {
         'source_types',
         'import_statuses',
         'client_types',
+        'course_statuses',
+        // Phase 5 + v6.2
+        'service_codes',
+        'package_codes',
+        'deferral_codes',
+        'system_types',
+        'institution_types',
+        'bonus_events',
+        'presales_agents',
       ];
       try {
         const results = await Promise.all(
@@ -274,7 +339,12 @@ export default function ReviewPage() {
   // --- URL params bootstrap -----------------------------------------------
   // Two filter modes supported:
   //   - workflow_state mode (Phase 15 pillar drill-down): /import/review?workflow_state=uploaded
+  //     PLUS optional Case Workload filter bar params (signed_from etc.) which
+  //     get passed straight through to /api/cases so the Review Dashboard view
+  //     matches the filter that produced the pillar drill-down.
   //   - legacy period mode: /import/review?staff_id=N&year=YYYY&month=M
+  const [carriedFilters, setCarriedFilters] = useState<Filters | null>(null);
+
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
     const wState = params.get('workflow_state');
@@ -288,7 +358,10 @@ export default function ReviewPage() {
 
     if (wState) {
       setWorkflowState(wState);
-      loadCasesByWorkflowState(wState);
+      // Parse Case Workload filters from the URL (if any)
+      const filters = urlHasFilters(params) ? filtersFromQuery(params) : null;
+      setCarriedFilters(filters);
+      loadCasesByWorkflowState(wState, filters);
     } else if (sid && yNum && mNum) {
       const sidNum = Number(sid);
       setStaffId(sidNum);
@@ -318,13 +391,16 @@ export default function ReviewPage() {
     }
   }
 
-  async function loadCasesByWorkflowState(state: string) {
+  async function loadCasesByWorkflowState(state: string, filters?: Filters | null) {
     setLoading(true);
     setError(null);
     setCases([]);
     setEngineMessage(null);
     try {
-      const res = await fetch(`/api/cases?workflow_state=${encodeURIComponent(state)}`);
+      // Compose URL: workflow_state + any carried filters from Case Workload
+      const q = filters ? filtersToQuery(filters) : new URLSearchParams();
+      q.set('workflow_state', state);
+      const res = await fetch(`/api/cases?${q}`);
       if (!res.ok) {
         const detail = await res.text();
         throw new Error(`HTTP ${res.status}: ${detail}`);
@@ -371,6 +447,53 @@ export default function ReviewPage() {
       }
       const updated = (await r.json()) as Case;
       setCases((prev) => prev.map((c) => (c.id === caseId ? updated : c)));
+    },
+    [],
+  );
+
+  // Phase 5 — bulk-replace the services list for a case. The API replaces
+  // the full set (idempotent), so we just send what the UI has.
+  const saveServices = useCallback(
+    async (
+      caseId: number,
+      newList: Array<{ service_fee_id: number; count: number; bonus_event: string }>,
+      clearReview: boolean,
+    ) => {
+      const r = await fetch(`/api/cases/${caseId}/services`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          services: newList,
+          clear_review: clearReview,
+        }),
+      });
+      if (!r.ok) {
+        let detail: string;
+        try {
+          const body = await r.json();
+          detail = body.detail ?? `HTTP ${r.status}`;
+        } catch {
+          detail = `HTTP ${r.status}`;
+        }
+        throw new Error(detail);
+      }
+      const result = (await r.json()) as {
+        case_id: number;
+        services: CaseService[];
+        service_review_pending: boolean;
+      };
+      // Patch the case in place — only services + review flag have changed.
+      setCases((prev) =>
+        prev.map((c) =>
+          c.id === caseId
+            ? {
+                ...c,
+                services: result.services,
+                service_review_pending: result.service_review_pending,
+              }
+            : c,
+        ),
+      );
     },
     [],
   );
@@ -424,6 +547,26 @@ export default function ReviewPage() {
     [cases],
   );
 
+  // --- Pre-selected case IDs based on "acting as" role ---------------------
+  // When acting as a Staff member, their own cases (where they're the
+  // counsellor, case officer, or pre-sales) are pre-ticked so they only
+  // need to confirm. When acting as Admin, nothing is pre-ticked.
+  // Only applies in workflow_state pillar mode (not legacy period mode).
+  const preselectedIds = useMemo<Set<number>>(() => {
+    if (!workflowState || role.kind !== 'staff') return new Set();
+    const result = new Set<number>();
+    for (const c of cases) {
+      if (
+        c.counsellor_staff_id === role.staffId ||
+        c.case_officer_staff_id === role.staffId ||
+        c.pre_sales_staff_id === role.staffId
+      ) {
+        result.add(c.id);
+      }
+    }
+    return result;
+  }, [cases, role, workflowState]);
+
   // ----------------------------------------------------------------------
   // Title metadata for the workflow_state header banner.
   const PILLAR_TITLES: Record<string, { label: string; chip: string; dot: string }> = {
@@ -456,7 +599,13 @@ export default function ReviewPage() {
                   </span>
                 </div>
                 <p className="text-gray-600 mt-1 text-sm">
-                  Click any cell to edit. Saves on Enter or blur. Esc cancels.
+                  Click any cell to edit. Saves on Enter or blur. Esc cancels.{' '}
+                  <span className="ml-1 text-xs text-gray-500">
+                    Acting as: <span className="font-medium text-gray-700">{roleLabel(role)}</span>
+                    {role.kind === 'staff' && preselectedIds.size > 0 && (
+                      <> · {preselectedIds.size} of your case{preselectedIds.size === 1 ? '' : 's'} pre-selected</>
+                    )}
+                  </span>
                 </p>
               </>
             ) : (
@@ -605,7 +754,17 @@ export default function ReviewPage() {
 
             {/* Desktop table */}
             <div className="hidden md:block">
-              <CasesTable cases={cases} refData={refData} onSave={saveCase} />
+              <CasesTable
+                cases={cases}
+                refData={refData}
+                onSave={saveCase}
+                saveServices={saveServices}
+                workflowState={workflowState}
+                preselectedIds={preselectedIds}
+                onTransitioned={() => {
+                  if (workflowState) loadCasesByWorkflowState(workflowState, carriedFilters);
+                }}
+              />
             </div>
 
             {/* Mobile cards */}
@@ -616,6 +775,7 @@ export default function ReviewPage() {
                   caseRow={c}
                   refData={refData}
                   onSave={saveCase}
+                  saveServices={saveServices}
                 />
               ))}
             </div>
@@ -699,6 +859,12 @@ export default function ReviewPage() {
 type CommonProps = {
   refData: RefData;
   onSave: (caseId: number, updates: Record<string, unknown>) => Promise<void>;
+  // Phase 5 — bulk-replace services (and optionally clear review banner)
+  saveServices: (
+    caseId: number,
+    newList: Array<{ service_fee_id: number; count: number; bonus_event: string }>,
+    clearReview: boolean,
+  ) => Promise<void>;
 };
 
 // Fixed widths (px) for the three sticky columns. Cumulative lefts must
@@ -710,31 +876,83 @@ const STICKY_L = {
   student: STICKY_W.status + STICKY_W.contract,
 } as const;
 
-function CasesTable({ cases, refData, onSave }: { cases: Case[] } & CommonProps) {
+function CasesTable({
+  cases,
+  refData,
+  onSave,
+  saveServices,
+  workflowState,
+  preselectedIds,
+  onTransitioned,
+}: {
+  cases: Case[];
+  workflowState: string | null;
+  preselectedIds: Set<number>;
+  onTransitioned: () => void;
+} & CommonProps) {
   // ---- column ordering ------------------------------------------------
-  // Pinned (sticky) columns always stay leftmost: import_status, contract_id, student_name.
-  // Reordering only applies to the unpinned columns.
-  const PINNED = ['import_status', 'contract_id', 'student_name'];
-  const DEFAULT_ORDER = [
-    'import_status',
-    'contract_id',
-    'student_name',
-    'student_id',
-    'contract_signed_date',
-    'client_type_code',
-    'country',
-    'refer_source',
-    'application_status',
-    'visa_received_date',
-    'institution',
-    'course_start_date',
-    'course_status',
-    'counsellor',
-    'case_officer',
-    'pre_sales',
-    'office',
-    'notes',
-  ];
+  // Pinned (sticky) columns always stay leftmost: select (when shown),
+  // import_status, contract_id, student_name. Reordering only applies to
+  // unpinned columns.
+  const showSelect =
+    workflowState === 'uploaded' || workflowState === 'in_review';
+  const PINNED = showSelect
+    ? ['select', 'import_status', 'contract_id', 'student_name']
+    : ['import_status', 'contract_id', 'student_name'];
+  const DEFAULT_ORDER = showSelect
+    ? [
+        'select',
+        'import_status',
+        'contract_id',
+        'student_name',
+        'student_id',
+        'contract_signed_date',
+        'client_type_code',
+        'package',         // Phase 5
+        'services',        // Phase 5
+        'country',
+        'system_type',     // v6.2
+        'refer_source',
+        'application_status',
+        'visa_received_date',
+        'institution',
+        'institution_type', // v6.2
+        'course_start_date',
+        'course_status',
+        'counsellor',
+        'case_officer',
+        'pre_sales',
+        'office',
+        'deferral_code',   // v6.2
+        'targets_name',    // v6.2
+        'notes',
+      ]
+    : [
+        'import_status',
+        'contract_id',
+        'student_name',
+        'student_id',
+        'contract_signed_date',
+        'client_type_code',
+        'package',
+        'services',
+        'country',
+        'system_type',
+        'refer_source',
+        'application_status',
+        'visa_received_date',
+        'institution',
+        'institution_type',
+        'course_start_date',
+        'course_status',
+        'counsellor',
+        'case_officer',
+        'pre_sales',
+        'office',
+        'deferral_code',
+        'targets_name',
+        'notes',
+      ];
 
   // Persisted view-state — these only affect the local table, never the DB.
   const [sorting, setSorting] = useState<SortingState>([]);
@@ -742,12 +960,73 @@ function CasesTable({ cases, refData, onSave }: { cases: Case[] } & CommonProps)
   const [columnOrder, setColumnOrder] = useState<ColumnOrderState>(DEFAULT_ORDER);
   const [columnSizing, setColumnSizing] = useState<ColumnSizingState>({});
 
+  // Row selection (only used in workflow_state / pillar mode).
+  const [rowSelection, setRowSelection] = useState<RowSelectionState>({});
+  const [transitioning, setTransitioning] = useState(false);
+  const [transitionError, setTransitionError] = useState<string | null>(null);
+
+  // When preselectedIds changes (e.g. role switched, or cases reloaded after
+  // a transition), reset the selection to the new pre-selected set. This
+  // wipes any manual edits the user made — acceptable trade-off.
+  // We track the preselected set as a stable key so equal-but-new sets
+  // don't trigger spurious resets.
+  const preselectKey = useMemo(
+    () => Array.from(preselectedIds).sort((a, b) => a - b).join(','),
+    [preselectedIds],
+  );
+  useEffect(() => {
+    const next: RowSelectionState = {};
+    preselectedIds.forEach((id) => {
+      next[String(id)] = true;
+    });
+    setRowSelection(next);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [preselectKey]);
+
   // ---- column definitions --------------------------------------------
   // Each column declares: id, header label, optional accessor for sort/filter,
   // size (px), and the cell renderer (which reuses the existing TextCell / SelectCell
   // / FkCell / StaffCell / DateCell / TextAreaCell / ReferSourceCell components).
   const columns = useMemo<ColumnDef<Case>[]>(
     () => [
+      // Select column (only present in workflow_state / pillar mode)
+      ...(showSelect
+        ? [
+            {
+              id: 'select',
+              size: 44,
+              minSize: 44,
+              enableSorting: false,
+              enableColumnFilter: false,
+              enableResizing: false,
+              header: ({ table }) => (
+                <input
+                  type="checkbox"
+                  className="cursor-pointer"
+                  checked={table.getIsAllRowsSelected()}
+                  ref={(el) => {
+                    if (el) {
+                      el.indeterminate =
+                        table.getIsSomeRowsSelected() && !table.getIsAllRowsSelected();
+                    }
+                  }}
+                  onChange={table.getToggleAllRowsSelectedHandler()}
+                  aria-label="Select all cases"
+                />
+              ),
+              cell: ({ row }) => (
+                <input
+                  type="checkbox"
+                  className="cursor-pointer"
+                  checked={row.getIsSelected()}
+                  onChange={row.getToggleSelectedHandler()}
+                  onClick={(e) => e.stopPropagation()}
+                  aria-label={`Select case ${row.original.contract_id ?? row.original.id}`}
+                />
+              ),
+            } as ColumnDef<Case>,
+          ]
+        : []),
       {
         id: 'import_status',
         header: 'Status',
@@ -783,13 +1062,12 @@ function CasesTable({ cases, refData, onSave }: { cases: Case[] } & CommonProps)
         minSize: 100,
         enableResizing: false,
         cell: ({ row }) => {
+          // Display-only: identity field, never edited inline.
           const c = row.original;
           return (
-            <TextCell
-              value={c.contract_id}
-              monospace
-              onSave={(v) => onSave(c.id, { contract_id: v })}
-            />
+            <div className="px-1 font-mono text-xs text-gray-800">
+              {c.contract_id || <span className="text-gray-300">—</span>}
+            </div>
           );
         },
       },
@@ -801,12 +1079,12 @@ function CasesTable({ cases, refData, onSave }: { cases: Case[] } & CommonProps)
         minSize: 140,
         enableResizing: false,
         cell: ({ row }) => {
+          // Display-only.
           const c = row.original;
           return (
-            <TextCell
-              value={c.student_name}
-              onSave={(v) => onSave(c.id, { student_name: v })}
-            />
+            <div className="px-1 text-sm text-gray-900">
+              {c.student_name || <span className="text-gray-300">—</span>}
+            </div>
           );
         },
       },
@@ -816,13 +1094,12 @@ function CasesTable({ cases, refData, onSave }: { cases: Case[] } & CommonProps)
         accessorFn: (row) => row.student_id ?? '',
         size: 130,
         cell: ({ row }) => {
+          // Display-only.
           const c = row.original;
           return (
-            <TextCell
-              value={c.student_id}
-              monospace
-              onSave={(v) => onSave(c.id, { student_id: v })}
-            />
+            <div className="px-1 font-mono text-xs text-gray-800">
+              {c.student_id || <span className="text-gray-300">—</span>}
+            </div>
           );
         },
       },
@@ -853,6 +1130,49 @@ function CasesTable({ cases, refData, onSave }: { cases: Case[] } & CommonProps)
               value={c.client_type_code}
               options={refData.client_types}
               onSave={(v) => onSave(c.id, { client_type_code: v })}
+            />
+          );
+        },
+      },
+      // ---- Phase 5: Package (single-select) -----------------------------
+      {
+        id: 'package',
+        header: 'Package',
+        accessorFn: (row) => row.package_label ?? '',
+        size: 220,
+        cell: ({ row }) => {
+          const c = row.original;
+          return (
+            <FkCell
+              value={c.package_fee_id}
+              label={c.package_label}
+              options={refData.package_codes}
+              onSave={(id) => onSave(c.id, { package_fee_id: id })}
+            />
+          );
+        },
+      },
+      // ---- Phase 5: Services (multi-select chips) -----------------------
+      {
+        id: 'services',
+        header: 'Services',
+        // Sort/filter by a concatenation of service codes
+        accessorFn: (row) =>
+          (row.services ?? []).map((s) => `${s.service_code}×${s.count}`).join(' '),
+        size: 280,
+        enableSorting: false,
+        cell: ({ row }) => {
+          const c = row.original;
+          return (
+            <MultiSelectChipCell
+              caseId={c.id}
+              services={c.services ?? []}
+              serviceOptions={refData.service_codes}
+              bonusEvents={refData.bonus_events}
+              reviewPending={c.service_review_pending ?? false}
+              onSave={async (newList, clearReview) => {
+                await saveServices(c.id, newList, clearReview);
+              }}
             />
           );
         },
@@ -963,8 +1283,9 @@ function CasesTable({ cases, refData, onSave }: { cases: Case[] } & CommonProps)
         cell: ({ row }) => {
           const c = row.original;
           return (
-            <TextCell
+            <SelectCell
               value={c.course_status}
+              options={refData.course_statuses}
               onSave={(v) => onSave(c.id, { course_status: v })}
             />
           );
@@ -1022,13 +1343,12 @@ function CasesTable({ cases, refData, onSave }: { cases: Case[] } & CommonProps)
         cell: ({ row }) => {
           const c = row.original;
           return (
-            <StaffCell
+            <PresalesCell
               staffId={c.pre_sales_staff_id}
               staffName={c.pre_sales_name}
-              options={refData.staff_all}
-              onSave={(staffId, _roleId) =>
-                onSave(c.id, { pre_sales_staff_id: staffId })
-              }
+              presalesAgents={refData.presales_agents}
+              staffAll={refData.staff_all}
+              onSave={(staffId) => onSave(c.id, { pre_sales_staff_id: staffId })}
             />
           );
         },
@@ -1051,6 +1371,70 @@ function CasesTable({ cases, refData, onSave }: { cases: Case[] } & CommonProps)
           );
         },
       },
+      // ---- v6.2 spec: 4 new dropdown columns ----------------------------
+      {
+        id: 'system_type',
+        header: 'System Type',
+        accessorFn: (row) => row.system_type ?? '',
+        size: 160,
+        cell: ({ row }) => {
+          const c = row.original;
+          return (
+            <SelectCell
+              value={c.system_type}
+              options={refData.system_types}
+              onSave={(v) => onSave(c.id, { system_type: v })}
+            />
+          );
+        },
+      },
+      {
+        id: 'institution_type',
+        header: 'Institution Type',
+        accessorFn: (row) => row.institution_type ?? '',
+        size: 160,
+        cell: ({ row }) => {
+          const c = row.original;
+          return (
+            <SelectCell
+              value={c.institution_type}
+              options={refData.institution_types}
+              onSave={(v) => onSave(c.id, { institution_type: v })}
+            />
+          );
+        },
+      },
+      {
+        id: 'deferral_code',
+        header: 'Deferral',
+        accessorFn: (row) => row.deferral_code ?? '',
+        size: 160,
+        cell: ({ row }) => {
+          const c = row.original;
+          return (
+            <SelectCell
+              value={c.deferral_code}
+              options={refData.deferral_codes}
+              onSave={(v) => onSave(c.id, { deferral_code: v })}
+            />
+          );
+        },
+      },
+      {
+        id: 'targets_name',
+        header: 'Targets Name',
+        accessorFn: (row) => row.targets_name ?? '',
+        size: 160,
+        cell: ({ row }) => {
+          const c = row.original;
+          return (
+            <TextCell
+              value={c.targets_name}
+              onSave={(v) => onSave(c.id, { targets_name: v })}
+            />
+          );
+        },
+      },
       {
         id: 'notes',
         header: 'Notes',
@@ -1067,25 +1451,73 @@ function CasesTable({ cases, refData, onSave }: { cases: Case[] } & CommonProps)
         },
       },
     ],
-    [refData, onSave],
+    [refData, onSave, saveServices],
   );
 
   // ---- table instance -------------------------------------------------
   const table = useReactTable({
     data: cases,
     columns,
-    state: { sorting, columnFilters, columnOrder, columnSizing },
+    state: { sorting, columnFilters, columnOrder, columnSizing, rowSelection },
     onSortingChange: setSorting,
     onColumnFiltersChange: setColumnFilters,
     onColumnOrderChange: setColumnOrder,
     onColumnSizingChange: setColumnSizing,
+    onRowSelectionChange: setRowSelection,
     getCoreRowModel: getCoreRowModel(),
     getSortedRowModel: getSortedRowModel(),
     getFilteredRowModel: getFilteredRowModel(),
     columnResizeMode: 'onChange',
     enableColumnResizing: true,
+    enableRowSelection: showSelect,
+    getRowId: (row) => String(row.id),
     defaultColumn: { minSize: 80 },
   });
+
+  // ---- bulk transition (selected -> next state) ------------------------
+  const selectedIds = useMemo(
+    () =>
+      Object.entries(rowSelection)
+        .filter(([, v]) => v)
+        .map(([k]) => Number(k))
+        .filter((n) => Number.isFinite(n)),
+    [rowSelection],
+  );
+
+  // Map current pillar to the next state in the workflow.
+  const nextState: string | null =
+    workflowState === 'uploaded'  ? 'in_review' :
+    workflowState === 'in_review' ? 'submitted' :
+    workflowState === 'submitted' ? 'closed'    : null;
+
+  const nextStateLabel: string | null =
+    nextState === 'in_review' ? 'In Review' :
+    nextState === 'submitted' ? 'Submitted' :
+    nextState === 'closed'    ? 'Closed'    : null;
+
+  async function bulkTransition() {
+    if (!nextState || selectedIds.length === 0) return;
+    setTransitioning(true);
+    setTransitionError(null);
+    try {
+      const res = await fetch('/api/cases/transition', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ case_ids: selectedIds, to_state: nextState }),
+      });
+      if (!res.ok) {
+        const detail = await res.text();
+        throw new Error(`HTTP ${res.status}: ${detail}`);
+      }
+      setRowSelection({});
+      onTransitioned();
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e);
+      setTransitionError(msg);
+    } finally {
+      setTransitioning(false);
+    }
+  }
 
   // Move-column helpers (used by the small "←  →" buttons in each non-pinned header).
   const moveCol = (id: string, direction: -1 | 1) => {
@@ -1108,12 +1540,21 @@ function CasesTable({ cases, refData, onSave }: { cases: Case[] } & CommonProps)
     setColumnSizing({});
   };
 
-  // Pinned (sticky) left offset calculations.
-  const pinnedLeft: Record<string, number> = {
-    import_status: 0,
-    contract_id: STICKY_W.status,
-    student_name: STICKY_W.status + STICKY_W.contract,
-  };
+  // Pinned (sticky) left offset calculations. Includes the select column
+  // when shown (workflow_state pillar mode).
+  const SELECT_W = 44;
+  const pinnedLeft: Record<string, number> = showSelect
+    ? {
+        select: 0,
+        import_status: SELECT_W,
+        contract_id: SELECT_W + STICKY_W.status,
+        student_name: SELECT_W + STICKY_W.status + STICKY_W.contract,
+      }
+    : {
+        import_status: 0,
+        contract_id: STICKY_W.status,
+        student_name: STICKY_W.status + STICKY_W.contract,
+      };
 
   const visibleHeaders = table.getHeaderGroups()[0]?.headers ?? [];
   const anyFilterActive = columnFilters.length > 0 || sorting.length > 0;
@@ -1122,14 +1563,42 @@ function CasesTable({ cases, refData, onSave }: { cases: Case[] } & CommonProps)
     <div className="border border-gray-200 rounded">
       {/* Toolbar */}
       <div className="flex items-center justify-between border-b border-gray-200 bg-gray-50 px-3 py-2 text-xs">
-        <div className="text-gray-600">
-          {table.getRowModel().rows.length === cases.length
-            ? `${cases.length} case${cases.length === 1 ? '' : 's'}`
-            : `${table.getRowModel().rows.length} of ${cases.length} case${
-                cases.length === 1 ? '' : 's'
-              } (filtered)`}
+        <div className="flex items-center gap-3 text-gray-600">
+          <span>
+            {table.getRowModel().rows.length === cases.length
+              ? `${cases.length} case${cases.length === 1 ? '' : 's'}`
+              : `${table.getRowModel().rows.length} of ${cases.length} case${
+                  cases.length === 1 ? '' : 's'
+                } (filtered)`}
+          </span>
+          {showSelect && selectedIds.length > 0 && (
+            <span className="text-blue-700 font-medium">
+              {selectedIds.length} selected
+              <button
+                onClick={() => setRowSelection({})}
+                className="ml-2 text-blue-600 hover:underline"
+              >
+                clear
+              </button>
+            </span>
+          )}
         </div>
         <div className="flex items-center gap-2">
+          {showSelect && selectedIds.length > 0 && nextState && (
+            <button
+              onClick={bulkTransition}
+              disabled={transitioning}
+              className={`rounded px-3 py-1 font-medium text-white ${
+                transitioning
+                  ? 'bg-gray-400 cursor-not-allowed'
+                  : 'bg-blue-600 hover:bg-blue-700'
+              }`}
+            >
+              {transitioning
+                ? 'Moving…'
+                : `Move ${selectedIds.length} to ${nextStateLabel} →`}
+            </button>
+          )}
           {anyFilterActive && (
             <button
               onClick={resetView}
@@ -1140,6 +1609,12 @@ function CasesTable({ cases, refData, onSave }: { cases: Case[] } & CommonProps)
           )}
         </div>
       </div>
+
+      {transitionError && (
+        <div className="border-b border-red-200 bg-red-50 px-3 py-2 text-xs text-red-800">
+          <strong>Move failed:</strong> {transitionError}
+        </div>
+      )}
 
       <div className="overflow-auto max-h-[calc(100vh-320px)] relative">
         <table
@@ -1314,6 +1789,7 @@ function CaseCard({
   caseRow: c,
   refData,
   onSave,
+  saveServices,
 }: { caseRow: Case } & CommonProps) {
   const save = (updates: Record<string, unknown>) => onSave(c.id, updates);
   const rowBg = ROW_BG[c.import_status] ?? '';
@@ -1359,12 +1835,39 @@ function CaseCard({
             onSave={(v) => save({ client_type_code: v })}
           />
         </Field>
+        <Field label="Package">
+          <FkCell
+            value={c.package_fee_id}
+            label={c.package_label}
+            options={refData.package_codes}
+            onSave={(id) => save({ package_fee_id: id })}
+          />
+        </Field>
+        <Field label="Services">
+          <MultiSelectChipCell
+            caseId={c.id}
+            services={c.services ?? []}
+            serviceOptions={refData.service_codes}
+            bonusEvents={refData.bonus_events}
+            reviewPending={c.service_review_pending ?? false}
+            onSave={async (newList, clearReview) => {
+              await saveServices(c.id, newList, clearReview);
+            }}
+          />
+        </Field>
         <Field label="Country">
           <FkCell
             value={c.country_id}
             label={c.country_name}
             options={refData.countries}
             onSave={(id) => save({ country_id: id })}
+          />
+        </Field>
+        <Field label="System Type">
+          <SelectCell
+            value={c.system_type}
+            options={refData.system_types}
+            onSave={(v) => save({ system_type: v })}
           />
         </Field>
         <Field label="Refer Source">
@@ -1398,8 +1901,9 @@ function CaseCard({
           />
         </Field>
         <Field label="Course Status">
-          <TextCell
+          <SelectCell
             value={c.course_status}
+            options={refData.course_statuses}
             onSave={(v) => save({ course_status: v })}
           />
         </Field>
@@ -1430,15 +1934,12 @@ function CaseCard({
           />
         </Field>
         <Field label="Pre-sales">
-          <StaffCell
+          <PresalesCell
             staffId={c.pre_sales_staff_id}
             staffName={c.pre_sales_name}
-            options={refData.staff_all}
-            onSave={(staffId, _roleId) =>
-              save({
-                pre_sales_staff_id: staffId,
-              })
-            }
+            presalesAgents={refData.presales_agents}
+            staffAll={refData.staff_all}
+            onSave={(staffId) => save({ pre_sales_staff_id: staffId })}
           />
         </Field>
         <Field label="Office">
@@ -1448,6 +1949,26 @@ function CaseCard({
             options={refData.offices}
             labelField="code"
             onSave={(id) => save({ case_office_id: id })}
+          />
+        </Field>
+        <Field label="Institution Type">
+          <SelectCell
+            value={c.institution_type}
+            options={refData.institution_types}
+            onSave={(v) => save({ institution_type: v })}
+          />
+        </Field>
+        <Field label="Deferral">
+          <SelectCell
+            value={c.deferral_code}
+            options={refData.deferral_codes}
+            onSave={(v) => save({ deferral_code: v })}
+          />
+        </Field>
+        <Field label="Targets Name">
+          <TextCell
+            value={c.targets_name}
+            onSave={(v) => save({ targets_name: v })}
           />
         </Field>
         <Field label="Notes">
@@ -1727,9 +2248,14 @@ function SelectCell({
   onSave: (newValue: string | null) => Promise<void>;
 }) {
   const { state, setState, error, setError, editing, setEditing } = useCellState();
+  const [draft, setDraft] = useState(value ?? '');
+
+  useEffect(() => {
+    setDraft(value ?? '');
+  }, [value]);
 
   async function commit(newVal: string | null) {
-    if (newVal === (value ?? null)) {
+    if ((newVal ?? null) === (value ?? null)) {
       setEditing(false);
       return;
     }
@@ -1752,6 +2278,7 @@ function SelectCell({
         onClick={() => {
           setEditing(true);
           setError(null);
+          setDraft(value ?? '');
         }}
       >
         {render ? render(value) : value || DASH}
@@ -1759,29 +2286,78 @@ function SelectCell({
     );
   }
 
+  const lcDraft = draft.trim().toLowerCase();
+  const isUnchanged = lcDraft === (value ?? '').trim().toLowerCase();
+  const filtered = lcDraft && !isUnchanged
+    ? options.filter((o) => o.toLowerCase().includes(lcDraft))
+    : options;
+
   return (
     <div className="relative">
-      <select
+      <input
         autoFocus
-        defaultValue={value ?? ''}
-        onChange={(e) => commit(e.target.value || null)}
-        onBlur={() => setEditing(false)}
-        onKeyDown={(e) => {
-          if (e.key === 'Escape') {
+        value={draft}
+        onChange={(e) => setDraft(e.target.value)}
+        onFocus={(e) => e.target.select()}
+        onBlur={() => {
+          setTimeout(() => {
             setEditing(false);
             setError(null);
+            setDraft(value ?? '');
+          }, 150);
+        }}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter') {
+            // Enter commits whatever is in the draft (must match an option)
+            const trimmed = draft.trim();
+            const match = options.find((o) => o.toLowerCase() === trimmed.toLowerCase());
+            if (match) commit(match);
+            else if (trimmed === '') commit(null);
+            else {
+              setError(`No matching option for "${trimmed}"`);
+              setState('error');
+            }
+          } else if (e.key === 'Escape') {
+            setEditing(false);
+            setError(null);
+            setDraft(value ?? '');
           }
         }}
         disabled={state === 'saving'}
         className={INPUT_BASE}
+        placeholder={`type to search… (${options.length} options)`}
+      />
+      <div
+        className="absolute left-0 right-0 top-full mt-1 max-h-64 overflow-y-auto bg-white border border-gray-300 rounded shadow-xl z-30"
+        style={{ backgroundColor: '#ffffff' }}
       >
-        <option value="">—</option>
-        {options.map((opt) => (
-          <option key={opt} value={opt}>
-            {opt}
-          </option>
-        ))}
-      </select>
+        {filtered.length === 0 ? (
+          <div className="px-3 py-2 text-xs text-gray-400 bg-white">No matches</div>
+        ) : (
+          filtered.slice(0, 200).map((opt) => {
+            const isCurrent = opt === value;
+            return (
+              <div
+                key={opt}
+                onMouseDown={(e) => {
+                  e.preventDefault();
+                  commit(opt);
+                }}
+                className={`px-3 py-1.5 text-sm cursor-pointer bg-white hover:bg-blue-50 ${
+                  isCurrent ? 'bg-blue-100 font-medium' : ''
+                }`}
+              >
+                {opt}
+              </div>
+            );
+          })
+        )}
+        {filtered.length > 200 && (
+          <div className="px-3 py-1.5 text-xs text-gray-400 border-t border-gray-100 bg-white">
+            … and {filtered.length - 200} more. Refine the search.
+          </div>
+        )}
+      </div>
       <ErrorTooltip error={error} />
     </div>
   );
@@ -1858,7 +2434,7 @@ function FkCell({
         onClick={() => {
           setEditing(true);
           setError(null);
-          setDraft(''); // empty draft → show all options
+          setDraft(label ?? ''); // Keep existing value visible until user types
         }}
       >
         {label || DASH}
@@ -1867,7 +2443,11 @@ function FkCell({
   }
 
   const lcDraft = draft.trim().toLowerCase();
-  const filtered = lcDraft
+  // When the draft still matches the current label exactly, show ALL options
+  // (so the user sees the full picker without having to clear the input first).
+  // Otherwise filter by what they've typed.
+  const isUnchangedLabel = lcDraft === (label ?? '').trim().toLowerCase();
+  const filtered = lcDraft && !isUnchangedLabel
     ? options.filter((o) => {
         const txt = (labelField === 'code' ? o.code : o.name) ?? '';
         return txt.toLowerCase().includes(lcDraft);
@@ -1898,6 +2478,18 @@ function FkCell({
         autoFocus
         value={draft}
         onChange={(e) => setDraft(e.target.value)}
+        onFocus={(e) => e.target.select()}
+        onBlur={() => {
+          // Defer slightly so option clicks (onMouseDown) win the race.
+          // If user clicks an option, pick() runs first and setEditing(false)
+          // gets called there. Otherwise this onBlur closes the dropdown
+          // without saving, preserving the existing value.
+          setTimeout(() => {
+            setEditing(false);
+            setError(null);
+            setDraft(label ?? '');
+          }, 150);
+        }}
         onKeyDown={(e) => {
           if (e.key === 'Enter') commit();
           else if (e.key === 'Escape') {
@@ -1910,9 +2502,9 @@ function FkCell({
         className={INPUT_BASE}
         placeholder={`type to search… (${options.length} options)`}
       />
-      <div className="absolute left-0 right-0 top-full mt-1 max-h-64 overflow-y-auto bg-white border border-gray-200 rounded shadow-lg z-30">
+      <div className="absolute left-0 right-0 top-full mt-1 max-h-64 overflow-y-auto bg-white border border-gray-300 rounded shadow-xl z-30" style={{ backgroundColor: '#ffffff' }}>
         {filtered.length === 0 ? (
-          <div className="px-3 py-2 text-xs text-gray-400">No matches</div>
+          <div className="px-3 py-2 text-xs text-gray-400 bg-white">No matches</div>
         ) : (
           filtered.slice(0, 200).map((o) => {
             const txt = (labelField === 'code' ? o.code : o.name) ?? '';
@@ -1924,7 +2516,7 @@ function FkCell({
                   e.preventDefault(); // prevent input blur before click registers
                   pick(o);
                 }}
-                className={`px-3 py-1.5 text-sm cursor-pointer hover:bg-blue-50 ${
+                className={`px-3 py-1.5 text-sm cursor-pointer bg-white hover:bg-blue-50 ${
                   isCurrent ? 'bg-blue-100 font-medium' : ''
                 }`}
               >
@@ -1934,7 +2526,7 @@ function FkCell({
           })
         )}
         {filtered.length > 200 && (
-          <div className="px-3 py-1.5 text-xs text-gray-400 border-t border-gray-100">
+          <div className="px-3 py-1.5 text-xs text-gray-400 border-t border-gray-100 bg-white">
             … and {filtered.length - 200} more. Refine the search.
           </div>
         )}
@@ -2011,7 +2603,7 @@ function StaffCell({
         onClick={() => {
           setEditing(true);
           setError(null);
-          setDraft(''); // empty draft → show all staff
+          setDraft(staffName ?? ''); // Keep existing value visible until user types
         }}
       >
         {staffName || DASH}
@@ -2020,7 +2612,8 @@ function StaffCell({
   }
 
   const lcDraft = draft.trim().toLowerCase();
-  const filtered = lcDraft
+  const isUnchangedLabel = lcDraft === (staffName ?? '').trim().toLowerCase();
+  const filtered = lcDraft && !isUnchangedLabel
     ? options.filter((o) => (o.name ?? '').toLowerCase().includes(lcDraft))
     : options;
 
@@ -2048,6 +2641,14 @@ function StaffCell({
         autoFocus
         value={draft}
         onChange={(e) => setDraft(e.target.value)}
+        onFocus={(e) => e.target.select()}
+        onBlur={() => {
+          setTimeout(() => {
+            setEditing(false);
+            setError(null);
+            setDraft(staffName ?? '');
+          }, 150);
+        }}
         onKeyDown={(e) => {
           if (e.key === 'Enter') commit();
           else if (e.key === 'Escape') {
@@ -2060,9 +2661,12 @@ function StaffCell({
         className={INPUT_BASE}
         placeholder={`type to search… (${options.length} staff)`}
       />
-      <div className="absolute left-0 right-0 top-full mt-1 max-h-64 overflow-y-auto bg-white border border-gray-200 rounded shadow-lg z-30">
+      <div
+        className="absolute left-0 right-0 top-full mt-1 max-h-64 overflow-y-auto bg-white border border-gray-300 rounded shadow-xl z-30"
+        style={{ backgroundColor: '#ffffff' }}
+      >
         {filtered.length === 0 ? (
-          <div className="px-3 py-2 text-xs text-gray-400">No matches</div>
+          <div className="px-3 py-2 text-xs text-gray-400 bg-white">No matches</div>
         ) : (
           filtered.slice(0, 200).map((o) => {
             const isCurrent = o.id === staffId;
@@ -2073,7 +2677,7 @@ function StaffCell({
                   e.preventDefault();
                   pick(o);
                 }}
-                className={`px-3 py-1.5 text-sm cursor-pointer hover:bg-blue-50 ${
+                className={`px-3 py-1.5 text-sm cursor-pointer bg-white hover:bg-blue-50 ${
                   isCurrent ? 'bg-blue-100 font-medium' : ''
                 }`}
               >
@@ -2083,7 +2687,7 @@ function StaffCell({
           })
         )}
         {filtered.length > 200 && (
-          <div className="px-3 py-1.5 text-xs text-gray-400 border-t border-gray-100">
+          <div className="px-3 py-1.5 text-xs text-gray-400 border-t border-gray-100 bg-white">
             … and {filtered.length - 200} more. Refine the search.
           </div>
         )}
@@ -2092,6 +2696,374 @@ function StaffCell({
     </div>
   );
 }
+
+// ---- MultiSelectChipCell — Services multi-select with per-chip count + event
+//
+// State machine per cell:
+//   - idle: show chips inline + "+ Add" button (compact view, no popover)
+//   - adding: "+ Add" was clicked → show search popover to pick a new service
+//   - editing <chipId>: a chip label was clicked → show edit popover with
+//                       count input + bonus event dropdown + Remove button
+//
+// Save flow (any of: add, edit, remove):
+//   1. Build the full updated services array (the API replaces, not merges)
+//   2. Call onSave(serviceList) which PATCHes /api/cases/{id}/services
+//   3. Parent updates the Case row in its state with the response
+//
+// Compact display rules:
+//   - Chip text = service_label  (e.g. "AP Gói 2 Standard Plus")
+//   - If count > 1, append " ×N"
+//   - If review pending, show small "⚠ Review" tag on the cell
+function MultiSelectChipCell({
+  caseId,
+  services: servicesRaw,
+  serviceOptions,
+  bonusEvents,
+  reviewPending,
+  onSave,
+}: {
+  caseId: number;
+  services: CaseService[] | undefined;
+  serviceOptions: RefItem[];
+  bonusEvents: string[];
+  reviewPending: boolean;
+  onSave: (newList: Array<{ service_fee_id: number; count: number; bonus_event: string }>,
+           clearReview: boolean) => Promise<CaseService[] | void>;
+}) {
+  // Defensive: backend may still be returning rows that pre-date the
+  // services-array shape change, in which case it's undefined.
+  const services = servicesRaw ?? [];
+  type Mode = { kind: 'idle' } | { kind: 'adding' } | { kind: 'editing'; chipId: number };
+  const [mode, setMode] = useState<Mode>({ kind: 'idle' });
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  // Add-mode state
+  const [addQuery, setAddQuery] = useState('');
+
+  // Edit-mode state — pre-fill from the chip when we enter editing
+  const [draftCount, setDraftCount] = useState(1);
+  const [draftEvent, setDraftEvent] = useState<string>('');
+
+  function startAdd() {
+    setMode({ kind: 'adding' });
+    setAddQuery('');
+    setError(null);
+  }
+
+  function startEdit(s: CaseService) {
+    setMode({ kind: 'editing', chipId: s.id });
+    setDraftCount(s.count);
+    setDraftEvent(s.bonus_event);
+    setError(null);
+  }
+
+  function cancelMode() {
+    setMode({ kind: 'idle' });
+    setAddQuery('');
+    setError(null);
+  }
+
+  // Build a "next list" payload for the API by mutating one entry.
+  function buildPayload(transform: (list: typeof services) => typeof services) {
+    const next = transform(services);
+    return next.map((s) => ({
+      service_fee_id: s.service_fee_id,
+      count: s.count,
+      bonus_event: s.bonus_event,
+    }));
+  }
+
+  async function commit(transform: (list: typeof services) => typeof services, clearReview = true) {
+    setSaving(true);
+    setError(null);
+    try {
+      await onSave(buildPayload(transform), clearReview);
+      cancelMode();
+    } catch (e) {
+      setError(String(e instanceof Error ? e.message : e));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  function addService(opt: RefItem) {
+    // Default bonus_event = the option's default basis if available, else
+    // 'course_start_date' (sensible fallback that the engine knows)
+    const defaultEvent = opt.bonus_payment_basis || 'course_start_date';
+    commit((list) => [
+      ...list,
+      // Cast OK — the row will be replaced after save with the API response
+      {
+        id: -1,
+        service_fee_id: opt.id,
+        service_code: opt.code || opt.name || '',
+        service_label: opt.name || opt.code || '',
+        category: opt.category || 'SERVICE_FEE',
+        count: 1,
+        bonus_event: defaultEvent,
+        confirmed: true,
+        detection_source: 'user_manual',
+      },
+    ]);
+  }
+
+  function updateChip(chipId: number) {
+    if (draftCount < 1) {
+      setError('Count must be at least 1');
+      return;
+    }
+    if (!bonusEvents.includes(draftEvent)) {
+      setError(`Invalid bonus event: ${draftEvent}`);
+      return;
+    }
+    commit((list) =>
+      list.map((s) => (s.id === chipId ? { ...s, count: draftCount, bonus_event: draftEvent } : s)),
+    );
+  }
+
+  function removeChip(chipId: number) {
+    commit((list) => list.filter((s) => s.id !== chipId));
+  }
+
+  // Add-mode option filter (only show services NOT already on this case)
+  const usedIds = new Set(services.map((s) => s.service_fee_id));
+  const lcQ = addQuery.trim().toLowerCase();
+  const addOptions = serviceOptions
+    .filter((opt) => !usedIds.has(opt.id))
+    .filter((opt) => {
+      if (!lcQ) return true;
+      const txt = `${opt.name ?? ''} ${opt.code ?? ''}`.toLowerCase();
+      return txt.includes(lcQ);
+    });
+
+  // ---- Render -----------------------------------------------------------
+  return (
+    <div className="relative">
+      <div className="flex flex-wrap gap-1 items-start">
+        {services.length === 0 && mode.kind === 'idle' && (
+          <span className="text-gray-300 text-xs italic">—</span>
+        )}
+
+        {services.map((s) => (
+          <button
+            key={s.id}
+            type="button"
+            onClick={() => startEdit(s)}
+            disabled={saving}
+            className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs border ${
+              s.confirmed
+                ? 'bg-blue-50 border-blue-200 text-blue-900 hover:bg-blue-100'
+                : 'bg-yellow-50 border-yellow-300 text-yellow-900 hover:bg-yellow-100'
+            } ${saving ? 'opacity-50 cursor-wait' : 'cursor-pointer'}`}
+            title={`${s.service_code} (${s.category}) · ${s.bonus_event}${
+              s.detection_source ? ` · ${s.detection_source}` : ''
+            }`}
+          >
+            <span className="truncate max-w-[160px]">{s.service_label}</span>
+            {s.count > 1 && (
+              <span className="font-mono font-semibold">×{s.count}</span>
+            )}
+          </button>
+        ))}
+
+        <button
+          type="button"
+          onClick={startAdd}
+          disabled={saving || mode.kind !== 'idle'}
+          className="inline-flex items-center px-2 py-0.5 rounded-full text-xs border border-dashed border-gray-300 text-gray-500 hover:border-gray-500 hover:text-gray-700 disabled:opacity-50"
+        >
+          + Add
+        </button>
+
+        {reviewPending && (
+          <span
+            className="inline-flex items-center px-2 py-0.5 rounded-full text-xs bg-amber-100 text-amber-900 border border-amber-300"
+            title="Importer auto-detected these services. Click any chip to confirm."
+          >
+            ⚠ Review
+          </span>
+        )}
+      </div>
+
+      {/* Add-mode popover */}
+      {mode.kind === 'adding' && (
+        <div
+          className="absolute left-0 top-full mt-1 w-72 bg-white border border-gray-300 rounded shadow-xl z-30"
+          style={{ backgroundColor: '#ffffff' }}
+        >
+          <div className="p-2 border-b border-gray-100">
+            <input
+              autoFocus
+              value={addQuery}
+              onChange={(e) => setAddQuery(e.target.value)}
+              placeholder={`Search services… (${addOptions.length} available)`}
+              className="w-full px-2 py-1 text-sm border border-gray-300 rounded focus:outline-none focus:ring-1 focus:ring-blue-500"
+              onKeyDown={(e) => {
+                if (e.key === 'Escape') cancelMode();
+              }}
+            />
+          </div>
+          <div className="max-h-64 overflow-y-auto bg-white">
+            {addOptions.length === 0 ? (
+              <div className="px-3 py-2 text-xs text-gray-400 bg-white">No matches</div>
+            ) : (
+              addOptions.slice(0, 200).map((opt) => (
+                <div
+                  key={opt.id}
+                  onMouseDown={(e) => {
+                    e.preventDefault();
+                    addService(opt);
+                  }}
+                  className="px-3 py-1.5 text-sm cursor-pointer bg-white hover:bg-blue-50"
+                >
+                  <span className="font-medium">{opt.name}</span>
+                  {opt.category && (
+                    <span className="ml-2 text-xs text-gray-400">{opt.category}</span>
+                  )}
+                </div>
+              ))
+            )}
+          </div>
+          <div className="px-3 py-1 border-t border-gray-100 flex justify-end bg-white">
+            <button
+              type="button"
+              onClick={cancelMode}
+              className="text-xs text-gray-500 hover:text-gray-700"
+            >
+              Cancel
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Edit-mode popover */}
+      {mode.kind === 'editing' && (() => {
+        const chip = services.find((s) => s.id === mode.chipId);
+        if (!chip) return null;
+        return (
+          <div
+            className="absolute left-0 top-full mt-1 w-72 bg-white border border-gray-300 rounded shadow-xl z-30"
+            style={{ backgroundColor: '#ffffff' }}
+          >
+            <div className="p-3 space-y-2 bg-white">
+              <div className="text-sm font-medium text-gray-900 truncate" title={chip.service_label}>
+                {chip.service_label}
+              </div>
+              <div className="text-xs text-gray-500">
+                {chip.service_code} · {chip.category}
+              </div>
+              <div className="flex items-center gap-2 pt-1">
+                <label className="text-xs text-gray-700 w-16">Count:</label>
+                <input
+                  type="number"
+                  min={1}
+                  value={draftCount}
+                  onChange={(e) => setDraftCount(Math.max(1, Number(e.target.value) || 1))}
+                  className="w-20 px-2 py-0.5 text-sm border border-gray-300 rounded focus:outline-none focus:ring-1 focus:ring-blue-500"
+                />
+              </div>
+              <div className="flex items-center gap-2">
+                <label className="text-xs text-gray-700 w-16">Event:</label>
+                <select
+                  value={draftEvent}
+                  onChange={(e) => setDraftEvent(e.target.value)}
+                  className="flex-1 px-2 py-0.5 text-sm border border-gray-300 rounded focus:outline-none focus:ring-1 focus:ring-blue-500 bg-white"
+                  style={{ backgroundColor: '#ffffff' }}
+                >
+                  {bonusEvents.map((ev) => (
+                    <option key={ev} value={ev}>{ev}</option>
+                  ))}
+                </select>
+              </div>
+              {error && <div className="text-xs text-red-600">{error}</div>}
+              <div className="flex justify-between pt-2 border-t border-gray-100">
+                <button
+                  type="button"
+                  onClick={() => removeChip(chip.id)}
+                  disabled={saving}
+                  className="text-xs text-red-600 hover:text-red-800 disabled:opacity-50"
+                >
+                  Remove
+                </button>
+                <div className="flex gap-2">
+                  <button
+                    type="button"
+                    onClick={cancelMode}
+                    disabled={saving}
+                    className="text-xs text-gray-500 hover:text-gray-700 disabled:opacity-50"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => updateChip(chip.id)}
+                    disabled={saving}
+                    className="text-xs px-2 py-0.5 bg-blue-600 text-white rounded hover:bg-blue-700 disabled:opacity-50"
+                  >
+                    {saving ? 'Saving…' : 'Save'}
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
+
+      {error && mode.kind === 'idle' && (
+        <div className="absolute top-full mt-0.5 left-0 bg-red-100 text-red-800 text-xs px-2 py-1 rounded shadow z-20 max-w-[300px]">
+          {error}
+        </div>
+      )}
+    </div>
+  );
+}
+
+
+// ---- PresalesCell — locked dropdown for the curated 7-name list -----------
+// v6.2 col 17. The dropdown only shows the 7 names from refData.presales_agents
+// (NONE + 6 curated names). When user picks a name, look up the matching
+// ref_staff.id from refData.staff_all and PATCH tx_case.pre_sales_staff_id.
+// "NONE" → save NULL.
+function PresalesCell({
+  staffId,
+  staffName,
+  presalesAgents,
+  staffAll,
+  onSave,
+}: {
+  staffId: number | null;
+  staffName: string | null;
+  presalesAgents: string[];
+  staffAll: RefItem[];
+  onSave: (newStaffId: number | null) => Promise<void>;
+}) {
+  // Display label: the saved staffName if present, else "NONE" if explicitly
+  // cleared, else "—" if never set.
+  const display = staffName ?? (staffId === null ? null : 'NONE');
+
+  // SelectCell handles the dropdown UX. We translate name → staff_id here.
+  async function handleSave(name: string | null) {
+    if (name === null || name === 'NONE') {
+      await onSave(null);
+      return;
+    }
+    const match = staffAll.find((s) => (s.name ?? '') === name);
+    if (!match) {
+      throw new Error(`No staff record found with name "${name}". Add them to ref_staff first.`);
+    }
+    await onSave(match.id);
+  }
+
+  return (
+    <SelectCell
+      value={display}
+      options={presalesAgents}
+      onSave={handleSave}
+    />
+  );
+}
+
 
 // ---- ReferSourceCell — composite type + entity picker ------------------
 function ReferSourceCell({

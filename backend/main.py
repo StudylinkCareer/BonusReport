@@ -9,6 +9,8 @@ Endpoints live under /api/* to match the Netlify proxy redirect.
 # --- Make 'backend' importable as a package alias for the current dir ----
 import sys
 import types
+from calendar import monthrange
+from datetime import date
 from pathlib import Path
 
 _HERE = Path(__file__).resolve().parent
@@ -156,6 +158,127 @@ def list_imports(
 # Cases for review (extended — every reviewable column, all FKs joined)
 # ===========================================================================
 
+# ===========================================================================
+# Shared filter helper for Case Workload + Review Dashboard
+# ===========================================================================
+# Both GET /api/cases and GET /api/pillars/counts accept the same filter set
+# so that pillar counts on the home page match what the user sees when they
+# drill into a pillar. This helper builds the WHERE-clause fragments and
+# the matching parameter list. Caller composes them with its own clauses.
+# ---------------------------------------------------------------------------
+
+def _parse_month(month: Optional[str]) -> Optional[tuple[date, date]]:
+    """Convert 'YYYY-MM' to (first-of-month, last-of-month). Returns None
+    on bad input rather than raising — bad input just gets ignored.
+    """
+    if not month:
+        return None
+    try:
+        y_str, m_str = month.split("-")
+        y, m = int(y_str), int(m_str)
+        if not (2000 <= y <= 2100 and 1 <= m <= 12):
+            return None
+        return date(y, m, 1), date(y, m, monthrange(y, m)[1])
+    except (ValueError, AttributeError):
+        return None
+
+
+def _build_case_filters(
+    staff_id: Optional[int] = None,
+    signed_from: Optional[str] = None,
+    signed_to: Optional[str] = None,
+    course_from: Optional[str] = None,
+    course_to: Optional[str] = None,
+    visa_from: Optional[str] = None,
+    visa_to: Optional[str] = None,
+    bonus_month: Optional[str] = None,
+    q_student: Optional[str] = None,
+    q_contract: Optional[str] = None,
+    app_status: Optional[str] = None,
+    client_type: Optional[str] = None,
+    institution_id: Optional[int] = None,
+    office_id: Optional[int] = None,
+) -> tuple[list[str], list[Any]]:
+    """Build SQL WHERE-clause fragments + matching parameter values for
+    filtering tx_case rows. Every filter is optional.
+
+    Returns:
+        (where_clauses, params) — caller joins clauses with ' AND ' and
+        passes params to cursor.execute.
+
+    Notes:
+      - staff_id matches any of the four staff roles on a case
+        (counsellor, case officer, pre-sales, VP).
+      - Wildcards on q_student / q_contract use ILIKE %...%.
+      - 'bonus_month' is a convenience filter: 'YYYY-MM' expands to a date
+        range on contract_signed_date (typical bonus period). Named
+        bonus_month, not month, to avoid clash with the legacy 'month'
+        period param on /api/cases.
+    """
+    where: list[str] = []
+    params: list[Any] = []
+
+    if staff_id is not None:
+        where.append(
+            "("
+            "c.counsellor_staff_id   = %s OR "
+            "c.case_officer_staff_id = %s OR "
+            "c.pre_sales_staff_id    = %s OR "
+            "c.vp_staff_id           = %s"
+            ")"
+        )
+        params.extend([staff_id, staff_id, staff_id, staff_id])
+
+    # Date ranges (string ISO dates, e.g. '2024-01-15'). Postgres will cast.
+    for col, lo, hi in [
+        ("contract_signed_date", signed_from, signed_to),
+        ("course_start_date",    course_from, course_to),
+        ("visa_received_date",   visa_from,   visa_to),
+    ]:
+        if lo:
+            where.append(f"c.{col} >= %s")
+            params.append(lo)
+        if hi:
+            where.append(f"c.{col} <= %s")
+            params.append(hi)
+
+    # Bonus-month convenience filter — expands to a date range on contract_signed_date
+    month_range = _parse_month(bonus_month)
+    if month_range:
+        where.append("c.contract_signed_date >= %s AND c.contract_signed_date <= %s")
+        params.extend(month_range)
+
+    # Wildcards
+    if q_student:
+        where.append("(c.student_name ILIKE %s OR c.student_id ILIKE %s)")
+        token = f"%{q_student.strip()}%"
+        params.extend([token, token])
+    if q_contract:
+        where.append("c.contract_id ILIKE %s")
+        params.append(f"%{q_contract.strip()}%")
+
+    # Dropdowns
+    if app_status:
+        where.append("c.application_status = %s")
+        params.append(app_status)
+    if client_type:
+        where.append("c.client_type_code = %s")
+        params.append(client_type)
+    if institution_id is not None:
+        where.append("c.institution_id = %s")
+        params.append(institution_id)
+    if office_id is not None:
+        where.append("c.case_office_id = %s")
+        params.append(office_id)
+
+    return where, params
+
+
+# Common FastAPI Query() declarations for the filter parameters. Reused
+# by /api/cases and /api/pillars/counts so the two endpoints stay in sync.
+_FILTER_PARAMS_DOC = "Optional filter (see Case Workload filter bar)"
+
+
 EDITABLE_FIELDS = {
     "contract_id", "student_id", "student_name",
     "contract_signed_date", "course_start_date", "visa_received_date",
@@ -168,26 +291,51 @@ EDITABLE_FIELDS = {
     "case_officer_staff_id", "case_officer_role_id",
     "import_status",
     "incentive_amount", "notes",
+    # Phase 5: Package + service review flag (services managed via own endpoint)
+    "package_fee_id", "service_review_pending",
+    # v6.2 spec: new dropdown-controlled tx_case columns
+    "system_type", "institution_type", "targets_name",
+    # v6.2 spec: deferral code (column exists, now has reference list)
+    "deferral_code",
+    # v6.2 spec: pre-sales agent (column exists, locked to curated list)
+    "pre_sales_staff_id",
 }
 
 
 @app.get("/api/cases")
 def list_cases(
-    staff_id: Optional[int] = Query(None, description="ref_staff.id; if omitted, returns all cases for the period"),
+    # --- mode selectors (one of these mode sets must be active) ----------
+    staff_id: Optional[int] = Query(None, description="ref_staff.id; matches any role"),
     year: Optional[int] = Query(None, ge=2020, le=2030, description="Required unless workflow_state is given"),
     month: Optional[int] = Query(None, ge=1, le=12, description="Required unless workflow_state is given"),
-    workflow_state: Optional[str] = Query(None, description="One of uploaded/in_review/submitted/closed. Alternative filter mode (Phase 15) — when set, year/month are not required."),
+    workflow_state: Optional[str] = Query(None, description="One of uploaded/in_review/submitted/closed. When set, year/month are not required."),
+    # --- Case Workload filter bar (Phase 4) ------------------------------
+    signed_from: Optional[str] = Query(None, description="contract_signed_date >= (YYYY-MM-DD)"),
+    signed_to:   Optional[str] = Query(None, description="contract_signed_date <= (YYYY-MM-DD)"),
+    course_from: Optional[str] = Query(None, description="course_start_date >= (YYYY-MM-DD)"),
+    course_to:   Optional[str] = Query(None, description="course_start_date <= (YYYY-MM-DD)"),
+    visa_from:   Optional[str] = Query(None, description="visa_received_date >= (YYYY-MM-DD)"),
+    visa_to:     Optional[str] = Query(None, description="visa_received_date <= (YYYY-MM-DD)"),
+    bonus_month: Optional[str] = Query(None, description="Convenience: YYYY-MM expanded to a contract_signed_date month range"),
+    q_student:   Optional[str] = Query(None, description="Wildcard ILIKE on student_name OR student_id"),
+    q_contract:  Optional[str] = Query(None, description="Wildcard ILIKE on contract_id"),
+    app_status:  Optional[str] = Query(None, description="Exact match on application_status"),
+    client_type: Optional[str] = Query(None, description="Exact match on client_type_code"),
+    institution_id: Optional[int] = Query(None, description="Exact match on institution_id"),
+    office_id:      Optional[int] = Query(None, description="Exact match on case_office_id"),
 ) -> list[dict]:
-    """Cases either for one (year, month) period or for one workflow_state pillar.
+    """Cases either for one (year, month) period or for one workflow_state
+    pillar, optionally narrowed by the Case Workload filter bar.
 
-    Filter modes:
-        - Period mode (legacy): year + month required. Optionally narrow to staff_id.
-        - Workflow-state mode (Phase 15): workflow_state required. Returns all
-          cases at that state across all periods/staff.
+    Mode rules:
+      - Period mode (legacy): year + month required.
+      - Workflow-state mode (Phase 15): workflow_state required.
+      - Exactly one mode must be active.
 
-    Exactly one mode must be active.
+    All other filters (signed/course/visa date ranges, wildcards, dropdowns,
+    bonus_month) are optional and apply on top of the active mode.
     """
-    # Determine which filter mode is in use
+    # Determine which mode is in use
     has_period = year is not None and month is not None
     has_state = workflow_state is not None
 
@@ -219,13 +367,19 @@ def list_cases(
         where_clauses.append("c.workflow_state = %s")
         params.append(workflow_state)
 
-    if staff_id is not None:
-        where_clauses.append("""(
-                c.counsellor_staff_id   = %s
-             OR c.case_officer_staff_id = %s
-             OR c.vp_staff_id           = %s
-          )""")
-        params.extend([staff_id, staff_id, staff_id])
+    # Apply Case Workload filter bar (staff_id + all the other filters)
+    extra_where, extra_params = _build_case_filters(
+        staff_id=staff_id,
+        signed_from=signed_from, signed_to=signed_to,
+        course_from=course_from, course_to=course_to,
+        visa_from=visa_from,     visa_to=visa_to,
+        bonus_month=bonus_month,
+        q_student=q_student, q_contract=q_contract,
+        app_status=app_status, client_type=client_type,
+        institution_id=institution_id, office_id=office_id,
+    )
+    where_clauses.extend(extra_where)
+    params.extend(extra_params)
 
     where_sql = " AND ".join(where_clauses)
 
@@ -258,7 +412,42 @@ def list_cases(
             c.vp_staff_id,            vp.canonical_name        AS vp_name,
             c.target_owner_staff_id,  target_owner.canonical_name AS target_owner_name,
             c.workflow_state,
-            c.pre_sales_staff_id,     ps.canonical_name        AS pre_sales_name
+            c.pre_sales_staff_id,     ps.canonical_name        AS pre_sales_name,
+
+            -- Phase 5 + v6.2: new tx_case columns
+            c.package_fee_id,
+            COALESCE(NULLIF(TRIM(SPLIT_PART(pkg.description, ' — ', 1)), ''), pkg.service_code) AS package_label,
+            pkg.service_code          AS package_code,
+            pkg.bonus_payment_basis   AS package_payment_basis,
+            c.service_review_pending,
+            c.system_type,
+            c.institution_type,
+            c.targets_name,
+
+            -- Phase 5: Services (multi-select, aggregated as JSON array).
+            -- Friendly label uses COALESCE(description, service_code) — same
+            -- pattern as the reference list endpoints, so what the user sees
+            -- in the chip matches what they see in the dropdown.
+            COALESCE(
+                (SELECT json_agg(
+                    json_build_object(
+                        'id',             s.id,
+                        'service_fee_id', s.service_fee_id,
+                        'service_code',   rsf.service_code,
+                        'service_label',  COALESCE(NULLIF(TRIM(SPLIT_PART(rsf.description, ' — ', 1)), ''), rsf.service_code),
+                        'category',       rsf.category,
+                        'count',          s.count,
+                        'bonus_event',    s.bonus_event,
+                        'confirmed',      s.confirmed,
+                        'detection_source', s.detection_source
+                    )
+                    ORDER BY COALESCE(NULLIF(TRIM(SPLIT_PART(rsf.description, ' — ', 1)), ''), rsf.service_code)
+                )
+                FROM tx_case_service s
+                JOIN ref_service_fee rsf ON s.service_fee_id = rsf.id
+                WHERE s.case_id = c.id),
+                '[]'::json
+            ) AS services
 
         FROM tx_case c
         LEFT JOIN ref_institution inst         ON c.institution_id          = inst.id
@@ -268,6 +457,7 @@ def list_cases(
         LEFT JOIN ref_partner     partner      ON c.referring_partner_id    = partner.id
         LEFT JOIN ref_sub_agent   sub_agent    ON c.referring_sub_agent_id  = sub_agent.id
         LEFT JOIN ref_service_fee fee          ON c.service_fee_id          = fee.id
+        LEFT JOIN ref_service_fee pkg          ON c.package_fee_id          = pkg.id
         LEFT JOIN ref_staff       counsellor   ON c.counsellor_staff_id     = counsellor.id
         LEFT JOIN dim_role        counsellor_role ON c.counsellor_role_id   = counsellor_role.id
         LEFT JOIN ref_staff       co           ON c.case_officer_staff_id   = co.id
@@ -391,6 +581,347 @@ def _fetch_one_case(case_id: int) -> dict:
 
 
 # ===========================================================================
+# Bulk Services replace — PATCH /api/cases/{case_id}/services
+# ===========================================================================
+
+# Valid values for tx_case_service.bonus_event — must match the SQL CHECK
+# constraint on the column (see services_packages_migration.sql).
+VALID_BONUS_EVENTS = {
+    "contract_signed_date",
+    "visa_received_date",
+    "course_start_date",
+    "enrolment_date",
+    "manual_hold",
+}
+
+
+@app.patch("/api/cases/{case_id}/services")
+def replace_case_services(case_id: int, body: dict = Body(default_factory=dict)) -> dict:
+    """Replace the entire services list for a case (idempotent).
+
+    Each service entry carries:
+        service_fee_id   (required, BIGINT, FK to ref_service_fee, must be
+                          a SERVICE_FEE or ADDON row — not PACKAGE)
+        count            (optional, INT >= 1, defaults to 1)
+        bonus_event      (optional, one of VALID_BONUS_EVENTS; if omitted,
+                          defaults from ref_service_fee.bonus_payment_basis)
+
+    Request body (JSON):
+        {
+            "services": [
+                {"service_fee_id": 12, "count": 2, "bonus_event": "course_start_date"},
+                {"service_fee_id": 17}
+            ],
+            "confirmed":    true,    // optional; default true
+            "clear_review": true     // optional; if true, also set
+                                     // tx_case.service_review_pending = FALSE
+        }
+
+    Response:
+        { "case_id": N, "services": [ {...}, ... ], "service_review_pending": bool }
+
+    Errors:
+        400 — bad body / unknown service_fee_id / PACKAGE row / bad bonus_event /
+              service has no default bonus_payment_basis and the request didn't
+              provide one
+        404 — case not found
+    """
+    if not isinstance(body, dict):
+        raise HTTPException(400, "body must be a JSON object")
+
+    raw_services = body.get("services")
+    if not isinstance(raw_services, list):
+        raise HTTPException(400, "services must be a list (may be empty)")
+
+    # Normalize incoming entries into a dict keyed by service_fee_id so we
+    # naturally dedupe within the request (last-one-wins).
+    incoming: dict[int, dict] = {}
+    for entry in raw_services:
+        if not isinstance(entry, dict):
+            raise HTTPException(400, "each service entry must be a JSON object")
+        sid = entry.get("service_fee_id")
+        if not isinstance(sid, int):
+            raise HTTPException(400, "service_fee_id must be an integer")
+        count = entry.get("count", 1)
+        if not isinstance(count, int) or count < 1:
+            raise HTTPException(400, f"count must be an integer >= 1 (got {count!r})")
+        bonus_event = entry.get("bonus_event")
+        if bonus_event is not None:
+            if bonus_event not in VALID_BONUS_EVENTS:
+                raise HTTPException(
+                    400,
+                    f"bonus_event must be one of {sorted(VALID_BONUS_EVENTS)}, "
+                    f"got {bonus_event!r}",
+                )
+        incoming[sid] = {"count": count, "bonus_event": bonus_event}
+
+    confirmed = bool(body.get("confirmed", True))
+    clear_review = bool(body.get("clear_review", True))
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            # 1. Ensure case exists
+            cur.execute("SELECT id FROM tx_case WHERE id = %s", (case_id,))
+            if cur.fetchone() is None:
+                raise HTTPException(404, f"Case {case_id} not found")
+
+            # 2. Validate every service_fee_id and resolve its default bonus_event
+            #    (used when the request didn't specify one)
+            new_ids = list(incoming.keys())
+            ref_meta: dict[int, dict] = {}
+            if new_ids:
+                cur.execute(
+                    "SELECT id, category, service_code, bonus_payment_basis "
+                    "  FROM ref_service_fee "
+                    " WHERE id = ANY(%s)",
+                    (new_ids,),
+                )
+                rows = cur.fetchall()
+                ref_meta = {r["id"]: dict(r) for r in rows}
+                missing = [i for i in new_ids if i not in ref_meta]
+                if missing:
+                    raise HTTPException(400, f"Unknown service_fee_ids: {missing}")
+                packages = [i for i, m in ref_meta.items() if m["category"] == "PACKAGE"]
+                if packages:
+                    raise HTTPException(
+                        400,
+                        f"service_fee_ids {packages} are PACKAGE rows — "
+                        f"use PATCH /api/cases/{case_id} with package_fee_id instead.",
+                    )
+
+            # 3. Resolve each entry's final bonus_event
+            #    (use the request value if provided; otherwise the default from
+            #    ref_service_fee.bonus_payment_basis; error if both are missing)
+            for sid, entry in incoming.items():
+                if entry["bonus_event"] is None:
+                    default = ref_meta[sid].get("bonus_payment_basis")
+                    if not default:
+                        raise HTTPException(
+                            400,
+                            f"service_fee_id {sid} ({ref_meta[sid]['service_code']}) "
+                            f"has no default bonus_payment_basis set on "
+                            f"ref_service_fee, and the request did not specify "
+                            f"bonus_event for it.",
+                        )
+                    entry["bonus_event"] = default
+
+            # 4. Diff against current set
+            cur.execute(
+                "SELECT service_fee_id, count, bonus_event "
+                "  FROM tx_case_service "
+                " WHERE case_id = %s",
+                (case_id,),
+            )
+            current = {r["service_fee_id"]: dict(r) for r in cur.fetchall()}
+            new_set = set(incoming.keys())
+            current_set = set(current.keys())
+            to_add    = new_set    - current_set
+            to_remove = current_set - new_set
+            to_keep   = new_set    & current_set
+
+            # 5. Apply diff
+            if to_remove:
+                cur.execute(
+                    "DELETE FROM tx_case_service "
+                    " WHERE case_id = %s AND service_fee_id = ANY(%s)",
+                    (case_id, list(to_remove)),
+                )
+            for sid in to_add:
+                e = incoming[sid]
+                cur.execute(
+                    "INSERT INTO tx_case_service "
+                    "  (case_id, service_fee_id, count, bonus_event, confirmed, "
+                    "   detection_source) "
+                    "VALUES (%s, %s, %s, %s, %s, 'user_manual')",
+                    (case_id, sid, e["count"], e["bonus_event"], confirmed),
+                )
+            # For rows we're keeping, only UPDATE if count or bonus_event changed
+            # (or confirmed=True and current row is not confirmed)
+            for sid in to_keep:
+                e = incoming[sid]
+                cur_row = current[sid]
+                needs_update = (
+                    e["count"] != cur_row["count"]
+                    or e["bonus_event"] != cur_row["bonus_event"]
+                    or confirmed  # always set TRUE when user explicitly saves
+                )
+                if needs_update:
+                    cur.execute(
+                        "UPDATE tx_case_service "
+                        "   SET count = %s, "
+                        "       bonus_event = %s, "
+                        "       confirmed = CASE WHEN %s THEN TRUE ELSE confirmed END "
+                        " WHERE case_id = %s "
+                        "   AND service_fee_id = %s",
+                        (e["count"], e["bonus_event"], confirmed, case_id, sid),
+                    )
+
+            # 6. Optionally clear the case-level review banner
+            if clear_review:
+                cur.execute(
+                    "UPDATE tx_case "
+                    "   SET service_review_pending = FALSE, updated_at = NOW() "
+                    " WHERE id = %s",
+                    (case_id,),
+                )
+
+            # 7. Fetch fresh state to return — uses the same friendly-label
+            #    pattern as /api/cases so the frontend gets a consistent shape
+            cur.execute(
+                """
+                SELECT s.id,
+                       s.service_fee_id,
+                       s.count,
+                       s.bonus_event,
+                       s.confirmed,
+                       s.detection_source,
+                       rsf.service_code,
+                       rsf.category,
+                       COALESCE(NULLIF(TRIM(SPLIT_PART(rsf.description, ' — ', 1)), ''), rsf.service_code) AS service_label
+                  FROM tx_case_service s
+                  JOIN ref_service_fee rsf ON s.service_fee_id = rsf.id
+                 WHERE s.case_id = %s
+                 ORDER BY service_label
+                """,
+                (case_id,),
+            )
+            services = [dict(r) for r in cur.fetchall()]
+
+            cur.execute(
+                "SELECT service_review_pending FROM tx_case WHERE id = %s",
+                (case_id,),
+            )
+            review_row = cur.fetchone()
+
+            conn.commit()
+
+    return {
+        "case_id": case_id,
+        "services": services,
+        "service_review_pending": bool(review_row["service_review_pending"]) if review_row else False,
+    }
+
+
+# ===========================================================================
+# Bulk workflow_state transition — POST /api/cases/transition
+# ===========================================================================
+
+VALID_WORKFLOW_STATES = {"uploaded", "in_review", "submitted", "closed"}
+
+# Legal forward transitions. Reversals (e.g. submitted → in_review) are NOT
+# part of Phase 3 — they'll be added later for Finance/Senior Manager.
+LEGAL_TRANSITIONS: dict[str, set[str]] = {
+    "uploaded":  {"in_review"},
+    "in_review": {"submitted"},
+    "submitted": {"closed"},
+    "closed":    set(),  # terminal for now
+}
+
+
+@app.post("/api/cases/transition")
+def transition_cases(body: dict = Body(default_factory=dict)) -> dict:
+    """Bulk-transition a list of cases to a new workflow_state.
+
+    Request body (JSON):
+        {
+            "case_ids": [1, 2, 3, ...],     // tx_case.id values
+            "to_state": "in_review"         // one of: uploaded / in_review / submitted / closed
+        }
+
+    Validates:
+      - case_ids is a non-empty list of ints
+      - to_state is a valid workflow_state value
+      - All cases share the same current state (mixed batches rejected)
+      - The transition current_state -> to_state is legal
+
+    Response:
+        {
+            "transitioned": 3,
+            "from_state": "uploaded",
+            "to_state": "in_review",
+            "ids": [1, 2, 3]
+        }
+
+    Errors:
+        400 — bad body, invalid state, illegal transition, mixed current states
+        404 — one or more case_ids not found
+    """
+    case_ids = body.get("case_ids")
+    to_state = body.get("to_state")
+
+    # ---- input validation -------------------------------------------------
+    if not isinstance(case_ids, list) or not case_ids:
+        raise HTTPException(400, "case_ids must be a non-empty list of integers")
+    if not all(isinstance(x, int) for x in case_ids):
+        raise HTTPException(400, "case_ids must contain only integers")
+    if to_state not in VALID_WORKFLOW_STATES:
+        raise HTTPException(
+            400,
+            f"to_state must be one of {sorted(VALID_WORKFLOW_STATES)}, got {to_state!r}",
+        )
+
+    # Dedup while preserving order
+    case_ids = list(dict.fromkeys(case_ids))
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            # ---- fetch the current states of all selected cases ----------
+            cur.execute(
+                "SELECT id, workflow_state FROM tx_case WHERE id = ANY(%s)",
+                (case_ids,),
+            )
+            rows = cur.fetchall()
+            found_ids = {r["id"] for r in rows}
+            missing = [i for i in case_ids if i not in found_ids]
+            if missing:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Cases not found: {missing}",
+                )
+
+            current_states = {r["workflow_state"] for r in rows}
+            if len(current_states) > 1:
+                raise HTTPException(
+                    400,
+                    f"Selected cases are in mixed states {sorted(current_states)}; "
+                    f"transition one state at a time.",
+                )
+            from_state = current_states.pop()
+
+            # ---- transition legality -------------------------------------
+            if to_state == from_state:
+                raise HTTPException(
+                    400,
+                    f"All selected cases are already in state {from_state!r}.",
+                )
+            legal_next = LEGAL_TRANSITIONS.get(from_state, set())
+            if to_state not in legal_next:
+                raise HTTPException(
+                    400,
+                    f"Illegal transition {from_state!r} -> {to_state!r}. "
+                    f"Legal next states from {from_state!r}: {sorted(legal_next) or 'none'}",
+                )
+
+            # ---- apply the update ----------------------------------------
+            cur.execute(
+                "UPDATE tx_case "
+                "SET workflow_state = %s, updated_at = NOW() "
+                "WHERE id = ANY(%s) "
+                "RETURNING id",
+                (to_state, case_ids),
+            )
+            updated_ids = [r["id"] for r in cur.fetchall()]
+            conn.commit()
+
+    return {
+        "transitioned": len(updated_ids),
+        "from_state": from_state,
+        "to_state": to_state,
+        "ids": updated_ids,
+    }
+
+
+# ===========================================================================
 # Reference lists (dropdown options for the Review screen)
 # ===========================================================================
 
@@ -404,38 +935,161 @@ REF_LIST_QUERIES: dict[str, str] = {
     "staff_all":    "SELECT id, canonical_name AS name, employment_status, primary_role_id FROM ref_staff ORDER BY canonical_name",
     "statuses":     "SELECT id, status AS name FROM ref_status_split ORDER BY status",
     "roles":        "SELECT id, code, name FROM dim_role ORDER BY code",
+    # Phase 5 — ref_service_fee, split into:
+    #   service_codes — SERVICE_FEE + ADDON categories (the multi-select Services)
+    #   package_codes — PACKAGE category only (the single-select Package)
+    # Dropdown label: COALESCE(description, service_code) so we get the friendly
+    # name when available, otherwise the machine code.
+    "service_codes":
+        "SELECT id, "
+        "       COALESCE(NULLIF(TRIM(SPLIT_PART(description, ' — ', 1)), ''), service_code) AS name, "
+        "       service_code AS code, "
+        "       category, "
+        "       counsellor_signing_bonus, "
+        "       co_signing_bonus, "
+        "       bonus_payment_basis "
+        "  FROM ref_service_fee "
+        " WHERE is_active = TRUE "
+        "   AND category IN ('SERVICE_FEE', 'ADDON') "
+        " ORDER BY COALESCE(NULLIF(TRIM(SPLIT_PART(description, ' — ', 1)), ''), service_code)",
+    "package_codes":
+        "SELECT id, "
+        "       COALESCE(NULLIF(TRIM(SPLIT_PART(description, ' — ', 1)), ''), service_code) AS name, "
+        "       service_code AS code, "
+        "       counsellor_signing_bonus, "
+        "       co_signing_bonus, "
+        "       bonus_payment_basis "
+        "  FROM ref_service_fee "
+        " WHERE is_active = TRUE "
+        "   AND category = 'PACKAGE' "
+        " ORDER BY COALESCE(NULLIF(TRIM(SPLIT_PART(description, ' — ', 1)), ''), service_code)",
 }
 
 REF_LIST_STATIC: dict[str, list[str]] = {
     "source_types": ["DIRECT", "SUB_AGENT", "MASTER_AGENT", "GROUP", "OFFICE"],
     "import_statuses": ["OK", "UNRESOLVED", "FLAGGED", "SCRAP"],
-    # Client type / service category. Provided by the business; deduped and
-    # trimmed (the source list had a duplicate "Du lịch" with stray whitespace).
+    # Client type / service category. Union of original 24 + v6.2 template's
+    # 34 values (incl. diacritic variants and case differences), deduped.
+    # The diacritic variants ARE intentional — same business meaning, but the
+    # CRM has been recording them inconsistently and users need to be able to
+    # pick whichever spelling matches what the CRM has stored.
     "client_types": [
-        "Du học (ghi danh + visa)",
-        "Du học (ghi danh)",
-        "Du học (visa)",
+        "Credential Evaluation",
+        "Công tác nước ngoài",
+        "Du hoc (Ghi danh + visa)",
+        "Du hoc (Ghi danh)",
+        "Du hoc (ghi danh + visa)",
+        "Du hoc he",
+        "Du hoc hè",
+        "Du hoc tai cho",
+        "Du hoc tai cho (Vietnam)",
+        "Du học (Ghi danh + visa)",
+        "Du học (Ghi danh)",
+        "Du học (Ghi danh+visa)",
+        "Du học (Nộp đơn hỗ trợ tài chính)",
         "Du học (chuyển trường)",
-        "Du học (điền đơn ghi danh)",
+        "Du học (ghi danh + visa)",
+        "Du học (ghi danh chuyển trường)",
+        "Du học (ghi danh)",
+        "Du học (hướng dẫn phỏng vấn)",
+        "Du học (visa)",
         "Du học (điền đơn chuyển trường)",
+        "Du học (điền đơn ghi danh)",
         "Du học (điền đơn visa)",
         "Du học (điền đơn xin học bổng)",
         "Du học (điền đơn, đăng ký lịch phỏng vấn, đóng phí SEVIS)",
-        "Du học (hướng dẫn phỏng vấn)",
+        "Du học he",
         "Du học hè",
+        "Du học tại chỗ",
         "Du học tại chỗ (VN)",
+        "Du học tại chỗ (Vietnam)",
         "Du học/tham quan ngắn hạn theo đoàn",
         "Du lịch",
-        "Điền đơn xin visa",
-        "Người phụ thuộc ở nước ngoài",
-        "Công tác nước ngoài",
         "Giám hộ ở nước ngoài",
-        "Thay đổi Giám Hộ / Chỗ ở",
-        "Thị thực tạm trú cho sinh viên tốt nghiệp",
-        "Thị thực tạm trú cho sinh viên sau tốt nghiệp",
-        "Credential Evaluation",
-        "Travel Exemption",
         "Kết hôn",
+        "Người phụ thuộc ở nước ngoài",
+        "Thay đổi Giám Hộ / Chỗ ở",
+        "Thị thực tạm trú cho sinh viên sau tốt nghiệp",
+        "Thị thực tạm trú cho sinh viên tốt nghiệp",
+        "Travel Exemption",
+        "Visa Dinh cu",
+        "Visa Du Lịch",
+        "Visa Du hoc only",
+        "Visa Du học only",
+        "Visa Du lịch",
+        "Visa Giam ho",
+        "Visa Giám hộ",
+        "Visa Phu thuoc",
+        "Visa Phụ thuộc",
+        "Visa du học only",
+        "Visa du lich",
+        "Visa giám hộ",
+        "Visa phụ thuộc",
+        "Visa Định cư",
+        "Visa định cư",
+        "Điền đơn xin visa",
+    ],
+    "course_statuses": [
+        "Attending",
+        "Enrolled",
+        "Cancelled",
+    ],
+    # v6.2 col 21 — Deferral codes
+    "deferral_codes": [
+        "NONE",
+        "DEFERRED",
+        "FEE_TRANSFERRED",
+        "FEE_WAIVED",
+        "NO_SERVICE",
+    ],
+    # v6.2 col 9 — System Type
+    "system_types": [
+        "Trong hệ thống",
+        "Ngoài hệ thống",
+    ],
+    # v6.2 col 28 — Institution Type
+    "institution_types": [
+        "DIRECT",
+        "MASTER_AGENT",
+        "GROUP",
+        "OUT_OF_SYSTEM",
+        "RMIT_VN",
+        "OTHER_VN",
+    ],
+    # Phase 5 — valid values for tx_case_service.bonus_event
+    # (must match the CHECK constraint in the SQL migration)
+    "bonus_events": [
+        "contract_signed_date",
+        "visa_received_date",
+        "course_start_date",
+        "enrolment_date",
+        "manual_hold",
+    ],
+    # v6.2 col 17 — curated 6-person Pre-sales list (plus NONE).
+    # Locked: this is NOT all-staff; it's a specific subset that earns
+    # pre-sales splits. Names must match ref_staff.canonical_name when
+    # the importer / engine reads them.
+    "presales_agents": [
+        "NONE",
+        "Gia Mẫn",
+        "Hoàng Yến",
+        "Huỳnh Anh",
+        "Lê Thị Trường An",
+        "Trúc Quỳnh (HCM)",
+        "Trúc Quỳnh (HN)",
+    ],
+    # v6.2 cols 31–33 — legacy add-on codes used in old multi-row imports.
+    # Kept here for backward compatibility while the new junction-based
+    # model is rolled out. New cases should not need this.
+    "addon_codes": [
+        "EXTRA_SCHOOL",
+        "VISITOR_VISA",
+        "STUDY_PERMIT_RENEWAL",
+        "GUARDIAN_VISA_RENEWAL",
+        "SCHOOL_TRANSFER_DET",
+        "CAQ",
+        "GUARDIAN_HOMESTAY_CHANGE",
+        "EXCHANGE",
     ],
 }
 
@@ -596,31 +1250,62 @@ def list_bonus_payments(
 # ===========================================================================
 
 @app.get("/api/pillars/counts")
-def pillar_counts() -> dict[str, int]:
-    """Per-workflow_state case counts for the 4-pillar home page.
+def pillar_counts(
+    # Case Workload filter bar — same params as /api/cases. Counts per
+    # pillar reflect whatever filter the user has applied on the home page
+    # so that drilling into a pillar shows exactly that many cases.
+    staff_id: Optional[int] = Query(None),
+    signed_from: Optional[str] = Query(None),
+    signed_to:   Optional[str] = Query(None),
+    course_from: Optional[str] = Query(None),
+    course_to:   Optional[str] = Query(None),
+    visa_from:   Optional[str] = Query(None),
+    visa_to:     Optional[str] = Query(None),
+    bonus_month: Optional[str] = Query(None),
+    q_student:   Optional[str] = Query(None),
+    q_contract:  Optional[str] = Query(None),
+    app_status:  Optional[str] = Query(None),
+    client_type: Optional[str] = Query(None),
+    institution_id: Optional[int] = Query(None),
+    office_id:      Optional[int] = Query(None),
+) -> dict[str, int]:
+    """Per-workflow_state case counts for the 4-pillar home page,
+    narrowed by the Case Workload filter bar.
 
     Response:
         { "uploaded": N, "in_review": N, "submitted": N, "closed": N, "total": N }
 
     Missing states return as 0 so the frontend can read every key.
     """
-    sql = """
-        SELECT workflow_state, COUNT(*) AS n
-          FROM tx_case
-         GROUP BY workflow_state
+    # Compose filter clauses using the shared helper
+    extra_where, extra_params = _build_case_filters(
+        staff_id=staff_id,
+        signed_from=signed_from, signed_to=signed_to,
+        course_from=course_from, course_to=course_to,
+        visa_from=visa_from,     visa_to=visa_to,
+        bonus_month=bonus_month,
+        q_student=q_student, q_contract=q_contract,
+        app_status=app_status, client_type=client_type,
+        institution_id=institution_id, office_id=office_id,
+    )
+    where_sql = (" WHERE " + " AND ".join(extra_where)) if extra_where else ""
+
+    sql = f"""
+        SELECT c.workflow_state, COUNT(*) AS n
+          FROM tx_case c
+          {where_sql}
+         GROUP BY c.workflow_state
     """
     try:
         with get_connection() as conn:
             with conn.cursor() as cur:
-                cur.execute(sql)
+                cur.execute(sql, extra_params)
                 rows = cur.fetchall()
     except Exception as e:
         raise HTTPException(status_code=503, detail=f"DB error: {e}")
 
     counts = {"uploaded": 0, "in_review": 0, "submitted": 0, "closed": 0}
     for row in rows:
-        # Other endpoints in this file (list_imports, list_cases) use dict()
-        # on each row, so the cursor returns dict-like rows already.
         if isinstance(row, dict):
             state, n = row["workflow_state"], row["n"]
         else:
