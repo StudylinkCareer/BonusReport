@@ -715,6 +715,14 @@ export default function ReviewPage() {
                 View bonus report →
               </a>
             )}
+            {workflowState === 'closed' && (
+              <a
+                href="/bonus"
+                className="text-sm text-blue-600 hover:underline"
+              >
+                Bonus Reports →
+              </a>
+            )}
             {workflowState ? (
               <a href="/" className="text-sm text-blue-600 hover:underline">
                 ← Back to Case workflow

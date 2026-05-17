@@ -49,9 +49,15 @@ export default function BonusIndexPage() {
 
   return (
     <main className="mx-auto max-w-5xl p-6">
-      <nav className="mb-4 text-sm text-gray-500">
+      <nav className="mb-4 flex items-center justify-between text-sm text-gray-500">
         <Link href="/" className="hover:text-gray-900 hover:underline">
           ← Back to Case workflow
+        </Link>
+        <Link
+          href="/import/review?workflow_state=closed"
+          className="text-blue-600 hover:underline"
+        >
+          View Closed cases →
         </Link>
       </nav>
 
