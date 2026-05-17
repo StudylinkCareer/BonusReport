@@ -4,7 +4,7 @@
  * SAVE TO: frontend/app/page.tsx
  * (Full path: C:\Users\rhod_\Documents\BonusReport\Application\frontend\app\page.tsx)
  *
- * Case Workload — four-pillar home page with a filter bar above the tiles.
+ * Case Workload — four-pillar home page with a filter bar above the tiles
  *
  * Filter bar (Phase 4):
  *   - Staff: dropdown for review team; greyed-out current staff for staff role

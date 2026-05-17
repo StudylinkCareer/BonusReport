@@ -5,7 +5,7 @@
  *
  * Imported-cases review screen. Two filter modes:
  *   - Period mode (legacy):       /import/review?staff_id=N&year=YYYY&month=M
- *   - Workflow-state mode (P15):  /import/review?workflow_state=uploaded
+ *   - Workflow-state mode (P15):  /import/review?workflow_state=uploaded.
  *
  * Every field that maps to a CRM column is inline-editable.
  *
