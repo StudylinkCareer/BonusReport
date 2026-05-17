@@ -4379,7 +4379,7 @@ function dbSourceTypeToUi(
       // classification on the joined ref list. Fallback to MASTER_AGENT if
       // partner can't be found (defensive: most partners are MAs).
       const p = partners.find((q) => q.id === partnerId);
-      return p?.classification === 'Group' ? 'GROUP' : 'MASTER_AGENT';
+      return p?.classification === 'GROUP' ? 'GROUP' : 'MASTER_AGENT';
     }
     case 'SUB_AGENT':
       return 'SUB_AGENT';
@@ -4438,10 +4438,10 @@ function ReferSourceCell({
   if (draftType === 'SUB_AGENT') entityOptions = refData.sub_agents;
   else if (draftType === 'MASTER_AGENT')
     entityOptions = refData.partners.filter(
-      (p) => p.classification === 'Master agent',
+      (p) => p.classification === 'MASTER_AGENT',
     );
   else if (draftType === 'GROUP')
-    entityOptions = refData.partners.filter((p) => p.classification === 'Group');
+    entityOptions = refData.partners.filter((p) => p.classification === 'GROUP');
   else if (draftType === 'OFFICE') entityOptions = refData.offices;
 
   async function commit() {
