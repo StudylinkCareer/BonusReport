@@ -2049,21 +2049,22 @@ def list_reversal_reasons() -> dict:
 
     Excludes the system-only CASCADE_FROM_PRIORITY_IMPACT code, which the
     cascade orchestrator applies automatically to downstream-affected staff
-    and is never user-selected.
+    and is never user-selected. Only active rows are returned.
 
     Response:
         {
           "reasons": [
-            {"code": "DATA_ERROR", "label": "...", "description": "..."},
+            {"code": "DATA_ERROR", "display_name": "...", "notes": "..."},
             ...
           ]
         }
     """
     sql = """
-        SELECT code, label, description
+        SELECT code, display_name, notes
           FROM ref_reversal_reason
-         WHERE code <> 'CASCADE_FROM_PRIORITY_IMPACT'
-         ORDER BY label
+         WHERE active = true
+           AND code <> 'CASCADE_FROM_PRIORITY_IMPACT'
+         ORDER BY display_order, display_name
     """
     with get_connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
@@ -2133,10 +2134,12 @@ def reverse_and_rerun_cascade(body: dict = Body(default_factory=dict)) -> dict:
     # Authorisation gate — guard BEFORE doing any DB writes.
     # 403 (not 400) because the request is well-formed but the actor is
     # not permitted. 401 would imply auth was missing entirely.
+    # active=true filter prevents soft-deactivated personas from passing.
     auth_sql = """
         SELECT 1
           FROM ref_amendment_authorised_persona
          WHERE acting_as_key = %s
+           AND active = true
     """
     with get_connection() as conn:
         with conn.cursor() as cur:
@@ -2158,7 +2161,12 @@ def reverse_and_rerun_cascade(body: dict = Body(default_factory=dict)) -> dict:
             "initial_reason_code 'CASCADE_FROM_PRIORITY_IMPACT' is reserved "
             "for the cascade orchestrator and cannot be used as an initial reason",
         )
-    reason_check_sql = "SELECT 1 FROM ref_reversal_reason WHERE code = %s"
+    reason_check_sql = """
+        SELECT 1
+          FROM ref_reversal_reason
+         WHERE code = %s
+           AND active = true
+    """
     with get_connection() as conn:
         with conn.cursor() as cur:
             cur.execute(reason_check_sql, (initial_reason_code,))
