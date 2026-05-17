@@ -3170,17 +3170,28 @@ function SelectCell({
   onSave: (newValue: string | null) => Promise<void>;
 }) {
   const { state, setState, error, setError, editing, setEditing } = useCellState();
-  const [draft, setDraft] = useState(value ?? '');
+
+  // Optimistic local override — same rationale as FkCell. The backend's
+  // PATCH response sometimes returns a stale snapshot, so without this,
+  // the cell flashes back to the old value after a successful save until
+  // the page is reloaded. We hold the picked value locally and use it in
+  // place of the prop until the user re-edits, the save errors out, or
+  // the page is reloaded.
+  const [localValue, setLocalValue] = useState<string | null>(null);
+  const displayValue = localValue ?? value;
+
+  const [draft, setDraft] = useState(displayValue ?? '');
 
   useEffect(() => {
-    setDraft(value ?? '');
-  }, [value]);
+    setDraft(displayValue ?? '');
+  }, [displayValue]);
 
   async function commit(newVal: string | null) {
-    if ((newVal ?? null) === (value ?? null)) {
+    if ((newVal ?? null) === (displayValue ?? null)) {
       setEditing(false);
       return;
     }
+    setLocalValue(newVal);
     setState('saving');
     setError(null);
     try {
@@ -3190,13 +3201,14 @@ function SelectCell({
     } catch (e) {
       setError(String(e instanceof Error ? e.message : e));
       setState('error');
+      setLocalValue(null);
     }
   }
 
   function cancel() {
     setEditing(false);
     setError(null);
-    setDraft(value ?? '');
+    setDraft(displayValue ?? '');
   }
 
   if (!editing) {
@@ -3206,16 +3218,16 @@ function SelectCell({
         onClick={() => {
           setEditing(true);
           setError(null);
-          setDraft(value ?? '');
+          setDraft(displayValue ?? '');
         }}
       >
-        {render ? render(value) : value || DASH}
+        {render ? render(displayValue) : displayValue || DASH}
       </div>
     );
   }
 
   const lcDraft = draft.trim().toLowerCase();
-  const isUnchanged = lcDraft === (value ?? '').trim().toLowerCase();
+  const isUnchanged = lcDraft === (displayValue ?? '').trim().toLowerCase();
   const filtered =
     lcDraft && !isUnchanged
       ? options.filter((o) => o.toLowerCase().includes(lcDraft))
@@ -3224,7 +3236,7 @@ function SelectCell({
   const dropdownOptions = filtered.map((opt) => ({
     key: opt,
     label: opt,
-    isCurrent: opt === value,
+    isCurrent: opt === displayValue,
   }));
 
   return (
@@ -3927,16 +3939,43 @@ function PresalesCell({
   const display = staffName ?? (staffId === null ? null : 'NONE');
 
   // SelectCell handles the dropdown UX. We translate name → staff_id here.
+  // The curated presales list uses short or familiar names like "Gia Mẫn"
+  // or "Trúc Quỳnh (HCM)" while ref_staff stores canonical full names like
+  // "Trần Thanh Gia Mẫn" or "Đoàn Ngọc Trúc Quỳnh". Exact match would fail
+  // for almost every name. We strip any parenthetical office suffix and
+  // look for a ref_staff entry whose canonical name contains the short
+  // name (case-insensitive, accent-sensitive). If multiple ref_staff
+  // entries match the same short name, we throw — the curated list needs
+  // a more specific entry.
   async function handleSave(name: string | null) {
     if (name === null || name === 'NONE') {
       await onSave(null);
       return;
     }
-    const match = staffAll.find((s) => (s.name ?? '') === name);
-    if (!match) {
-      throw new Error(`No staff record found with name "${name}". Add them to ref_staff first.`);
+    const stripped = name.replace(/\s*\([^)]*\)\s*$/, '').trim();
+    const lc = stripped.toLowerCase();
+    // Try exact match first (strongest signal — handles names that ARE
+    // already canonical, like "Lê Thị Trường An").
+    const exact = staffAll.find((s) => (s.name ?? '').toLowerCase() === lc);
+    if (exact) {
+      await onSave(exact.id);
+      return;
     }
-    await onSave(match.id);
+    const substringMatches = staffAll.filter((s) =>
+      (s.name ?? '').toLowerCase().includes(lc),
+    );
+    if (substringMatches.length === 0) {
+      throw new Error(
+        `No staff record found matching "${name}". Add them to ref_staff or update the curated presales list.`,
+      );
+    }
+    if (substringMatches.length > 1) {
+      const names = substringMatches.map((s) => s.name).join(', ');
+      throw new Error(
+        `"${name}" matches multiple staff records (${names}). Make the curated presales list entry more specific.`,
+      );
+    }
+    await onSave(substringMatches[0].id);
   }
 
   return (
