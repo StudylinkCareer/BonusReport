@@ -3989,6 +3989,51 @@ function PresalesCell({
 
 
 // ---- ReferSourceCell — composite type + entity picker ------------------
+//
+// The UI uses 5 source types (DIRECT, SUB_AGENT, MASTER_AGENT, GROUP, OFFICE)
+// because MASTER_AGENT and GROUP have separate option lists (filtered by
+// partner.classification). The database uses a different 5-value enum
+// (PARTNER, SUB_AGENT, OFFICE_ONLY, UNRESOLVED, NONE) enforced by a CHECK
+// constraint. MASTER_AGENT and GROUP both collapse to PARTNER at the DB
+// level. We translate at the save/load boundary.
+const UI_TO_DB_SOURCE_TYPE: Record<SourceType, string> = {
+  DIRECT: 'NONE',
+  SUB_AGENT: 'SUB_AGENT',
+  MASTER_AGENT: 'PARTNER',
+  GROUP: 'PARTNER',
+  OFFICE: 'OFFICE_ONLY',
+};
+
+function dbSourceTypeToUi(
+  dbType: string | null | undefined,
+  partnerId: number | null,
+  partners: RefItem[],
+): SourceType {
+  switch (dbType) {
+    case 'PARTNER': {
+      // PARTNER alone doesn't tell us MA vs Group — look up the partner's
+      // classification on the joined ref list. Fallback to MASTER_AGENT if
+      // partner can't be found (defensive: most partners are MAs).
+      const p = partners.find((q) => q.id === partnerId);
+      return p?.classification === 'Group' ? 'GROUP' : 'MASTER_AGENT';
+    }
+    case 'SUB_AGENT':
+      return 'SUB_AGENT';
+    case 'OFFICE_ONLY':
+      return 'OFFICE';
+    case 'NONE':
+      return 'DIRECT';
+    case 'UNRESOLVED':
+      // System-set state for imports the resolver couldn't classify. We
+      // show it as DIRECT in the editor so the user can reclassify; the
+      // display label below shows the raw "UNRESOLVED" so the operator
+      // knows the row needs attention.
+      return 'DIRECT';
+    default:
+      return 'DIRECT';
+  }
+}
+
 function ReferSourceCell({
   caseRow: c,
   refData,
@@ -3999,7 +4044,11 @@ function ReferSourceCell({
   onSave: (updates: Record<string, unknown>) => Promise<void>;
 }) {
   const { state, setState, error, setError, editing, setEditing } = useCellState();
-  const initialType = (c.referring_source_type ?? 'DIRECT') as SourceType;
+  const initialType = dbSourceTypeToUi(
+    c.referring_source_type,
+    c.referring_partner_id,
+    refData.partners,
+  );
   const [draftType, setDraftType] = useState<SourceType>(initialType);
   const [draftEntityId, setDraftEntityId] = useState<number | null>(
     c.referring_partner_id ?? c.referring_sub_agent_id ?? c.referring_office_id ?? null,
@@ -4011,6 +4060,15 @@ function ReferSourceCell({
     c.referring_office_code ||
     c.referring_agent_text_raw ||
     null;
+
+  // The bracketed label shown next to the entity name in display mode. Use
+  // the UI-side name so it matches the dropdown the user will see when
+  // editing — except for UNRESOLVED, which we keep visible verbatim so the
+  // operator can see at a glance that the row needs reclassifying.
+  const displaySourceLabel =
+    c.referring_source_type === 'UNRESOLVED'
+      ? 'UNRESOLVED'
+      : initialType;
 
   let entityOptions: RefItem[] = [];
   if (draftType === 'SUB_AGENT') entityOptions = refData.sub_agents;
@@ -4029,7 +4087,8 @@ function ReferSourceCell({
       return;
     }
     const updates: Record<string, unknown> = {
-      referring_source_type: draftType,
+      // Translate to the DB enum the CHECK constraint requires.
+      referring_source_type: UI_TO_DB_SOURCE_TYPE[draftType],
       referring_partner_id: null,
       referring_sub_agent_id: null,
       referring_office_id: null,
@@ -4075,7 +4134,7 @@ function ReferSourceCell({
       >
         <div className="text-xs">
           <span className="text-gray-500">
-            [{c.referring_source_type ?? 'DIRECT'}]
+            [{displaySourceLabel}]
           </span>{' '}
           {displayName || DASH}
         </div>
