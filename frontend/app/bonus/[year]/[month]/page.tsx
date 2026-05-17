@@ -4,26 +4,38 @@
  * SAVE TO: frontend/app/bonus/[year]/[month]/page.tsx
  * (Full path: C:\Users\rhod_\Documents\BonusReport\Application\frontend\app\bonus\[year]\[month]\page.tsx)
  *
- * REPLACES the prior flat-table viewer. This is the per-staff bao cao
- * view — one report per staff member with cases in the period, switchable
- * via a dropdown at the top.
+ * Per-staff bao cao view for one (year, month). One report per staff member
+ * with cases in the period, switchable via a dropdown at the top.
  *
- * Each staff's report:
- *   - Sub-header: "Báo cáo {name} — tháng {MM}/{YYYY}"
- *   - Sections grouped by application_status (bao cao layout order)
- *   - 21-column table per section, including BONUS Enrolled, Note BONUS
- *     Enrolled, BONUS Priority, Note BONUS Priority
- *   - Subtotal row at the bottom of each section
- *   - TỔNG block at the bottom: Enrolled + Priority + Grand total
+ * Phase 13d additions (this revision):
+ *   - "Reverse this run" button in each staff's sub-header.
+ *   - ReverseModal — opens at the page level so a successful cascade can
+ *     refresh the entire report (the cascade may touch other staff via the
+ *     priority-quota impact propagation).
+ *   - Modal phases: loading dropdowns → form → submitting → result → error.
+ *   - Auth gate: the modal reads useRole() / actingAsKey() and checks the
+ *     current key against /api/bonus/reverse/authorised-keys before
+ *     enabling the Confirm button. Unauthorised personas see a clear
+ *     "switch your Acting As role to ..." message and the Confirm is
+ *     disabled.
+ *   - Reason dropdown sourced from /api/bonus/reverse/reasons (excludes
+ *     the system-only CASCADE_FROM_PRIORITY_IMPACT code).
+ *   - Result panel shows: cascade_complete badge, iterations used,
+ *     per-iteration reversals, per-iteration re-runs, any remaining
+ *     priority impact warnings, any pending_unprocessed staff IDs when the
+ *     iteration cap was hit.
  *
  * Data: GET /api/bonus/reports/{year}/{month}
- *
- * NOTE: Vietnamese justification notes are templated/approximate. To be
- * replaced by engine-emitted phrasing in a future phase.
+ * Action: POST /api/bonus/reverse-and-rerun-cascade
  */
 
-import { use, useEffect, useMemo, useState } from 'react';
+import { use, useCallback, useEffect, useMemo, useState } from 'react';
 import Link from 'next/link';
+import { actingAsKey, useRole } from '@/lib/role';
+
+// ---------------------------------------------------------------------------
+// Types — existing
+// ---------------------------------------------------------------------------
 
 type Case = {
   no: number;
@@ -75,10 +87,85 @@ type ReportData = {
   staff_reports: StaffReport[];
 };
 
+// ---------------------------------------------------------------------------
+// Types — Phase 13d (reversal modal)
+// ---------------------------------------------------------------------------
+
+type AuthorisedKey = {
+  acting_as_key: string;
+  display_name: string;
+};
+
+type ReversalReason = {
+  code: string;
+  display_name: string;
+  notes: string | null;
+};
+
+type CascadeReversal = {
+  iteration: number;
+  staff_id: number;
+  staff_name: string;
+  reversal_id: number;
+  reason_code: string;
+  payment_count: number;
+  total_reversed_amount: number;
+};
+
+type CascadeRerun = {
+  iteration: number;
+  staff_id: number;
+  staff_name: string;
+  total_cases: number;
+  adapted: number;
+  skipped: Array<{ contract_id: string; reason: string }>;
+  errored: Array<{ contract_id: string; error: string; phase: string }>;
+  payment_count: number;
+  gross_total: number;
+  net_total: number;
+};
+
+type AffectedPayment = {
+  staff_id: number;
+  staff_name: string;
+  case_count: number;
+  total_priority_bonus: number;
+};
+
+type PriorityWarning = {
+  partner_name: string;
+  priority_list_institution_id: number;
+  institution_id: number;
+  count_delta_direct: number;
+  count_delta_sub: number;
+  potentially_affected_payments: AffectedPayment[];
+};
+
+type CascadeResponse = {
+  year: number;
+  month: number;
+  trigger_staff_id: number;
+  max_iterations: number;
+  iterations_used: number;
+  cascade_complete: boolean;
+  reversals: CascadeReversal[];
+  reruns: CascadeRerun[];
+  final_warnings: PriorityWarning[];
+  pending_unprocessed: number[];
+};
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
 const fmtVnd = (n: number) => (n ? n.toLocaleString('vi-VN') : '0');
 const monthName = (m: number) =>
   ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
    'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'][m - 1] ?? `M${m}`;
+
+// ---------------------------------------------------------------------------
+// Main page
+// ---------------------------------------------------------------------------
 
 export default function BaoCaoPage({
   params,
@@ -92,12 +179,19 @@ export default function BaoCaoPage({
   const [data, setData] = useState<ReportData | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [selectedStaffId, setSelectedStaffId] = useState<number | null>(null);
+  const [refreshKey, setRefreshKey] = useState(0);
+  const [showReverseModal, setShowReverseModal] = useState(false);
+
+  // Bump refreshKey to trigger a refetch (used after a successful cascade,
+  // which may have touched other staff via priority-quota propagation).
+  const refreshReport = useCallback(() => {
+    setRefreshKey((k) => k + 1);
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
     setData(null);
     setError(null);
-    setSelectedStaffId(null);
     fetch(`/api/bonus/reports/${year}/${month}`)
       .then((r) => {
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
@@ -106,9 +200,17 @@ export default function BaoCaoPage({
       .then((d: ReportData) => {
         if (cancelled) return;
         setData(d);
-        if (d.staff_reports.length > 0) {
-          setSelectedStaffId(d.staff_reports[0].staff_id);
-        }
+        // Preserve the user's selected staff if still present after a
+        // refetch (e.g. cascade refresh); otherwise fall back to the first.
+        setSelectedStaffId((prev) => {
+          if (
+            prev != null &&
+            d.staff_reports.some((s) => s.staff_id === prev)
+          ) {
+            return prev;
+          }
+          return d.staff_reports[0]?.staff_id ?? null;
+        });
       })
       .catch((e) => {
         if (!cancelled) setError(String(e));
@@ -116,7 +218,7 @@ export default function BaoCaoPage({
     return () => {
       cancelled = true;
     };
-  }, [year, month]);
+  }, [year, month, refreshKey]);
 
   const selectedStaff = useMemo(() => {
     if (!data || selectedStaffId == null) return null;
@@ -208,35 +310,71 @@ export default function BaoCaoPage({
           </section>
 
           {selectedStaff && (
-            <StaffBaoCao staff={selectedStaff} year={year} month={month} />
+            <StaffBaoCao
+              staff={selectedStaff}
+              year={year}
+              month={month}
+              onReverseClick={() => setShowReverseModal(true)}
+            />
           )}
         </>
+      )}
+
+      {showReverseModal && selectedStaff && (
+        <ReverseModal
+          staff={selectedStaff}
+          year={year}
+          month={month}
+          onClose={() => setShowReverseModal(false)}
+          onComplete={() => {
+            setShowReverseModal(false);
+            refreshReport();
+          }}
+        />
       )}
     </main>
   );
 }
 
+// ---------------------------------------------------------------------------
+// StaffBaoCao — existing, with Reverse button added to sub-header
+// ---------------------------------------------------------------------------
+
 function StaffBaoCao({
   staff,
   year,
   month,
+  onReverseClick,
 }: {
   staff: StaffReport;
   year: number;
   month: number;
+  onReverseClick: () => void;
 }) {
   return (
     <section className="space-y-5">
-      {/* Staff sub-header */}
+      {/* Staff sub-header with Reverse button */}
       <div className="rounded border border-gray-200 bg-gray-50 px-4 py-3">
-        <h2 className="text-lg font-semibold">
-          Báo cáo {staff.staff_name} — tháng{' '}
-          {String(month).padStart(2, '0')}/{year}
-        </h2>
-        <p className="text-xs text-gray-600">
-          {staff.role_code ?? '—'}
-          {staff.office_code ? ` · ${staff.office_code}` : ''}
-        </p>
+        <div className="flex items-center justify-between gap-3">
+          <div>
+            <h2 className="text-lg font-semibold">
+              Báo cáo {staff.staff_name} — tháng{' '}
+              {String(month).padStart(2, '0')}/{year}
+            </h2>
+            <p className="text-xs text-gray-600">
+              {staff.role_code ?? '—'}
+              {staff.office_code ? ` · ${staff.office_code}` : ''}
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={onReverseClick}
+            className="rounded border border-amber-300 bg-amber-50 px-3 py-1.5 text-xs font-medium text-amber-900 hover:bg-amber-100"
+            title="Reverse this staff's bonus run and re-calculate"
+          >
+            Reverse this run
+          </button>
+        </div>
       </div>
 
       {staff.sections.map((section) => (
@@ -436,5 +574,523 @@ function Td({
     >
       {children}
     </td>
+  );
+}
+
+// ===========================================================================
+// Phase 13d — ReverseModal
+// ===========================================================================
+
+type ModalPhase = 'loading' | 'form' | 'submitting' | 'result' | 'error';
+
+function ReverseModal({
+  staff,
+  year,
+  month,
+  onClose,
+  onComplete,
+}: {
+  staff: StaffReport;
+  year: number;
+  month: number;
+  onClose: () => void;
+  onComplete: () => void;
+}) {
+  const [role] = useRole();
+  const currentKey = actingAsKey(role);
+
+  const [phase, setPhase] = useState<ModalPhase>('loading');
+  const [authorisedKeys, setAuthorisedKeys] = useState<AuthorisedKey[]>([]);
+  const [reasons, setReasons] = useState<ReversalReason[]>([]);
+  const [selectedReason, setSelectedReason] = useState<string>('');
+  const [notes, setNotes] = useState<string>('');
+  const [result, setResult] = useState<CascadeResponse | null>(null);
+  const [errorMsg, setErrorMsg] = useState<string>('');
+
+  // Lazy-fetch the two dropdowns when the modal opens
+  useEffect(() => {
+    let cancelled = false;
+    Promise.all([
+      fetch('/api/bonus/reverse/authorised-keys').then((r) => {
+        if (!r.ok) throw new Error(`authorised-keys HTTP ${r.status}`);
+        return r.json();
+      }),
+      fetch('/api/bonus/reverse/reasons').then((r) => {
+        if (!r.ok) throw new Error(`reasons HTTP ${r.status}`);
+        return r.json();
+      }),
+    ])
+      .then(([keysResp, reasonsResp]) => {
+        if (cancelled) return;
+        setAuthorisedKeys(keysResp.authorised_keys ?? []);
+        setReasons(reasonsResp.reasons ?? []);
+        setPhase('form');
+      })
+      .catch((e) => {
+        if (cancelled) return;
+        setErrorMsg(`Failed to load reversal options: ${e}`);
+        setPhase('error');
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const isAuthorised = authorisedKeys.some(
+    (k) => k.acting_as_key === currentKey,
+  );
+
+  const submit = async () => {
+    if (!selectedReason || !isAuthorised) return;
+    setPhase('submitting');
+    try {
+      const res = await fetch('/api/bonus/reverse-and-rerun-cascade', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          year,
+          month,
+          trigger_staff_id: staff.staff_id,
+          reversed_by_acting_as: currentKey,
+          initial_reason_code: selectedReason,
+          notes: notes.trim() || null,
+        }),
+      });
+      if (!res.ok) {
+        // FastAPI errors are JSON: {"detail": "..."}.
+        // Fall back to text if parse fails.
+        const text = await res.text();
+        let detail = text;
+        try {
+          const parsed = JSON.parse(text);
+          if (parsed?.detail) detail = parsed.detail;
+        } catch {
+          /* ignore */
+        }
+        throw new Error(`HTTP ${res.status} — ${detail}`);
+      }
+      const data: CascadeResponse = await res.json();
+      setResult(data);
+      setPhase('result');
+    } catch (e) {
+      setErrorMsg(e instanceof Error ? e.message : String(e));
+      setPhase('error');
+    }
+  };
+
+  return (
+    <div
+      className="fixed inset-0 bg-black/40 flex items-start justify-center z-50 p-4 overflow-y-auto"
+      onClick={onClose}
+    >
+      <div
+        className="bg-white rounded-lg shadow-lg max-w-3xl w-full my-8"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <header className="px-5 py-3 border-b flex items-center justify-between">
+          <h3 className="text-lg font-semibold">
+            Reverse bonus run — {staff.staff_name} · {monthName(month)} {year}
+          </h3>
+          <button
+            type="button"
+            onClick={onClose}
+            className="text-gray-400 hover:text-gray-700 text-xl leading-none"
+            aria-label="Close"
+          >
+            ×
+          </button>
+        </header>
+
+        <div className="p-5">
+          {phase === 'loading' && (
+            <div className="py-8 text-center text-sm text-gray-500">
+              Loading reversal options…
+            </div>
+          )}
+
+          {phase === 'form' && (
+            <ReverseForm
+              currentKey={currentKey}
+              isAuthorised={isAuthorised}
+              authorisedKeys={authorisedKeys}
+              reasons={reasons}
+              selectedReason={selectedReason}
+              setSelectedReason={setSelectedReason}
+              notes={notes}
+              setNotes={setNotes}
+              onCancel={onClose}
+              onSubmit={submit}
+            />
+          )}
+
+          {phase === 'submitting' && (
+            <div className="py-8 text-center">
+              <div className="text-sm text-gray-700 mb-1">
+                Running cascade…
+              </div>
+              <div className="text-xs text-gray-500">
+                Reverses {staff.staff_name}'s payments, re-runs the engine,
+                and propagates to any other staff with affected priority
+                bonuses. This may take 10–30 seconds.
+              </div>
+            </div>
+          )}
+
+          {phase === 'result' && result && (
+            <ResultView result={result} onDone={onComplete} />
+          )}
+
+          {phase === 'error' && (
+            <ErrorView
+              errorMsg={errorMsg}
+              onRetry={() => setPhase('form')}
+              onClose={onClose}
+            />
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Modal sub-views
+// ---------------------------------------------------------------------------
+
+function ReverseForm({
+  currentKey,
+  isAuthorised,
+  authorisedKeys,
+  reasons,
+  selectedReason,
+  setSelectedReason,
+  notes,
+  setNotes,
+  onCancel,
+  onSubmit,
+}: {
+  currentKey: string;
+  isAuthorised: boolean;
+  authorisedKeys: AuthorisedKey[];
+  reasons: ReversalReason[];
+  selectedReason: string;
+  setSelectedReason: (s: string) => void;
+  notes: string;
+  setNotes: (s: string) => void;
+  onCancel: () => void;
+  onSubmit: () => void;
+}) {
+  return (
+    <div className="space-y-4 text-sm">
+      <div>
+        <div className="text-xs font-medium text-gray-600 uppercase tracking-wide mb-1">
+          Acting as
+        </div>
+        <div className="rounded border bg-gray-50 px-3 py-2 font-mono text-xs">
+          {currentKey}
+        </div>
+        {isAuthorised ? (
+          <div className="mt-1.5 text-xs text-emerald-700">
+            ✓ Authorised to reverse bonus runs.
+          </div>
+        ) : (
+          <div className="mt-1.5 rounded border border-amber-300 bg-amber-50 px-3 py-2 text-xs text-amber-900">
+            <div className="font-medium mb-1">
+              ✗ Not authorised to reverse bonus runs.
+            </div>
+            <div>
+              Switch your Acting As role using the picker in the top bar to
+              one of:{' '}
+              <span className="font-medium">
+                {authorisedKeys.map((k) => k.display_name).join(', ')}
+              </span>
+              .
+            </div>
+          </div>
+        )}
+      </div>
+
+      <div>
+        <label className="text-xs font-medium text-gray-600 uppercase tracking-wide block mb-1">
+          Reason <span className="text-red-600">*</span>
+        </label>
+        <select
+          value={selectedReason}
+          onChange={(e) => setSelectedReason(e.target.value)}
+          disabled={!isAuthorised}
+          className="w-full rounded border px-3 py-1.5 text-sm bg-white disabled:bg-gray-100"
+        >
+          <option value="">— Select a reason —</option>
+          {reasons.map((r) => (
+            <option key={r.code} value={r.code}>
+              {r.display_name}
+            </option>
+          ))}
+        </select>
+        {selectedReason &&
+          reasons.find((r) => r.code === selectedReason)?.notes && (
+            <p className="mt-1 text-xs text-gray-500 italic">
+              {reasons.find((r) => r.code === selectedReason)?.notes}
+            </p>
+          )}
+      </div>
+
+      <div>
+        <label className="text-xs font-medium text-gray-600 uppercase tracking-wide block mb-1">
+          Notes <span className="text-gray-400">(optional)</span>
+        </label>
+        <textarea
+          value={notes}
+          onChange={(e) => setNotes(e.target.value)}
+          disabled={!isAuthorised}
+          rows={3}
+          maxLength={500}
+          placeholder="Optional context for the audit log (max 500 chars)…"
+          className="w-full rounded border px-3 py-2 text-sm disabled:bg-gray-100"
+        />
+        <div className="mt-0.5 text-[11px] text-gray-400 text-right">
+          {notes.length}/500
+        </div>
+      </div>
+
+      <div className="rounded border border-blue-200 bg-blue-50 px-3 py-2 text-xs text-blue-900">
+        <strong>What happens:</strong> The current bonus payments for this
+        staff/period are flagged reversed in the audit log, then the engine
+        re-runs for this staff. If the re-run changes the priority quota
+        tracker in ways that affect other staff's live priority bonuses,
+        those staff get auto-reversed and re-run too, with reason{' '}
+        <code className="bg-white px-1 rounded">CASCADE_FROM_PRIORITY_IMPACT</code>.
+        All within one transaction.
+      </div>
+
+      <div className="flex items-center justify-end gap-2 pt-2 border-t">
+        <button
+          type="button"
+          onClick={onCancel}
+          className="rounded border px-4 py-1.5 text-sm hover:bg-gray-50"
+        >
+          Cancel
+        </button>
+        <button
+          type="button"
+          onClick={onSubmit}
+          disabled={!isAuthorised || !selectedReason}
+          className="rounded bg-amber-600 px-4 py-1.5 text-sm font-medium text-white hover:bg-amber-700 disabled:bg-gray-300 disabled:cursor-not-allowed"
+        >
+          Reverse &amp; Re-run
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function ResultView({
+  result,
+  onDone,
+}: {
+  result: CascadeResponse;
+  onDone: () => void;
+}) {
+  return (
+    <div className="space-y-4 text-sm">
+      {/* Top status banner */}
+      {result.cascade_complete ? (
+        <div className="rounded border border-emerald-200 bg-emerald-50 px-4 py-3">
+          <div className="font-semibold text-emerald-800">
+            ✓ Cascade complete
+          </div>
+          <div className="text-xs text-emerald-900 mt-0.5">
+            {result.iterations_used} iteration
+            {result.iterations_used === 1 ? '' : 's'}.{' '}
+            {result.reversals.length} staff reversed and re-run.
+          </div>
+        </div>
+      ) : (
+        <div className="rounded border border-amber-300 bg-amber-50 px-4 py-3">
+          <div className="font-semibold text-amber-900">
+            ⚠ Cascade incomplete — iteration limit reached
+          </div>
+          <div className="text-xs text-amber-900 mt-0.5">
+            Used {result.iterations_used} of {result.max_iterations}{' '}
+            iterations. {result.pending_unprocessed.length} staff still
+            pending: {result.pending_unprocessed.join(', ')}
+          </div>
+        </div>
+      )}
+
+      {/* Reversals */}
+      {result.reversals.length > 0 && (
+        <div>
+          <h4 className="text-xs font-medium text-gray-600 uppercase tracking-wide mb-1.5">
+            Reversals ({result.reversals.length})
+          </h4>
+          <div className="rounded border divide-y">
+            {result.reversals.map((rv) => (
+              <div
+                key={rv.reversal_id}
+                className="px-3 py-2 text-xs flex items-center justify-between"
+              >
+                <div>
+                  <span className="font-medium">{rv.staff_name}</span>
+                  <span className="text-gray-500">
+                    {' '}— iter {rv.iteration} ·{' '}
+                  </span>
+                  <code className="bg-gray-100 px-1 rounded text-[10px]">
+                    {rv.reason_code}
+                  </code>
+                </div>
+                <div className="text-right">
+                  <div>
+                    {rv.payment_count} payment
+                    {rv.payment_count === 1 ? '' : 's'}
+                  </div>
+                  <div className="text-gray-500">
+                    {fmtVnd(rv.total_reversed_amount)} đ reversed
+                  </div>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Re-runs */}
+      {result.reruns.length > 0 && (
+        <div>
+          <h4 className="text-xs font-medium text-gray-600 uppercase tracking-wide mb-1.5">
+            Re-runs ({result.reruns.length})
+          </h4>
+          <div className="rounded border divide-y">
+            {result.reruns.map((rr) => (
+              <div
+                key={`${rr.staff_id}-${rr.iteration}`}
+                className="px-3 py-2 text-xs"
+              >
+                <div className="flex items-center justify-between">
+                  <div>
+                    <span className="font-medium">{rr.staff_name}</span>
+                    <span className="text-gray-500">
+                      {' '}— iter {rr.iteration} · {rr.total_cases} case
+                      {rr.total_cases === 1 ? '' : 's'} · {rr.adapted} adapted
+                    </span>
+                  </div>
+                  <div className="text-right">
+                    <div>
+                      {rr.payment_count} payment
+                      {rr.payment_count === 1 ? '' : 's'}
+                    </div>
+                    <div className="text-gray-500">
+                      gross {fmtVnd(rr.gross_total)} · net{' '}
+                      {fmtVnd(rr.net_total)} đ
+                    </div>
+                  </div>
+                </div>
+                {(rr.skipped.length > 0 || rr.errored.length > 0) && (
+                  <div className="mt-1 text-[11px] text-gray-500">
+                    {rr.skipped.length > 0 &&
+                      `${rr.skipped.length} skipped`}
+                    {rr.skipped.length > 0 && rr.errored.length > 0 && ' · '}
+                    {rr.errored.length > 0 &&
+                      `${rr.errored.length} errored`}
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Remaining warnings */}
+      {result.final_warnings.length > 0 && (
+        <div>
+          <h4 className="text-xs font-medium text-gray-600 uppercase tracking-wide mb-1.5">
+            Remaining priority impact warnings ({result.final_warnings.length})
+          </h4>
+          <div className="rounded border border-amber-200 bg-amber-50 divide-y divide-amber-200">
+            {result.final_warnings.map((w) => (
+              <div
+                key={w.priority_list_institution_id}
+                className="px-3 py-2 text-xs"
+              >
+                <div className="font-medium text-amber-900">
+                  {w.partner_name}
+                </div>
+                <div className="text-amber-800 text-[11px]">
+                  Δ direct: {w.count_delta_direct >= 0 ? '+' : ''}
+                  {w.count_delta_direct} · Δ sub:{' '}
+                  {w.count_delta_sub >= 0 ? '+' : ''}
+                  {w.count_delta_sub}
+                  {w.potentially_affected_payments.length > 0 && (
+                    <>
+                      {' '}· still touching:{' '}
+                      {w.potentially_affected_payments
+                        .map((p) => `${p.staff_name} (${p.case_count})`)
+                        .join(', ')}
+                    </>
+                  )}
+                </div>
+              </div>
+            ))}
+          </div>
+          <p className="mt-1 text-[11px] text-gray-500 italic">
+            These warnings persisted after the cascade exhausted its
+            iterations. Manual review may be needed.
+          </p>
+        </div>
+      )}
+
+      <div className="flex items-center justify-end pt-2 border-t">
+        <button
+          type="button"
+          onClick={onDone}
+          className="rounded bg-emerald-600 px-4 py-1.5 text-sm font-medium text-white hover:bg-emerald-700"
+        >
+          Done — refresh report
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function ErrorView({
+  errorMsg,
+  onRetry,
+  onClose,
+}: {
+  errorMsg: string;
+  onRetry: () => void;
+  onClose: () => void;
+}) {
+  return (
+    <div className="space-y-4 text-sm">
+      <div className="rounded border border-red-200 bg-red-50 px-4 py-3">
+        <div className="font-semibold text-red-800 mb-1">
+          Cascade failed
+        </div>
+        <div className="text-xs text-red-900 whitespace-pre-wrap break-words">
+          {errorMsg}
+        </div>
+      </div>
+      <p className="text-xs text-gray-500">
+        Any changes have been rolled back — the engine state is unchanged.
+        You can adjust your inputs and retry, or close this dialog.
+      </p>
+      <div className="flex items-center justify-end gap-2 pt-2 border-t">
+        <button
+          type="button"
+          onClick={onClose}
+          className="rounded border px-4 py-1.5 text-sm hover:bg-gray-50"
+        >
+          Close
+        </button>
+        <button
+          type="button"
+          onClick={onRetry}
+          className="rounded bg-amber-600 px-4 py-1.5 text-sm font-medium text-white hover:bg-amber-700"
+        >
+          Back to form
+        </button>
+      </div>
+    </div>
   );
 }
