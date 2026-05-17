@@ -21,7 +21,7 @@
 
 import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
-import { useRole } from "@/lib/role";
+import { useRole, PERSONAS } from "@/lib/role";
 import {
   EMPTY_FILTERS,
   type Filters,
@@ -179,12 +179,30 @@ function RoleSwitcher() {
       .finally(() => setLoading(false));
   }, []);
 
-  const value = role.kind === "admin" ? "admin" : `s:${role.staffId}`;
+  // Encode the active role into a single string for the <select>:
+  //   admin                → "admin"
+  //   persona:director     → "p:director"
+  //   staff (id=42)        → "s:42"
+  const value =
+    role.kind === "admin"
+      ? "admin"
+      : role.kind === "persona"
+      ? `p:${role.personaCode}`
+      : `s:${role.staffId}`;
+
   const onChange = (v: string) => {
     if (v === "admin") return setRole({ kind: "admin" });
-    const id = Number(v.slice(2));
-    const found = staff.find((s) => s.id === id);
-    if (found) setRole({ kind: "staff", staffId: found.id, staffName: found.name });
+    if (v.startsWith("p:")) {
+      const code = v.slice(2);
+      const p = PERSONAS.find((x) => x.code === code);
+      if (p) setRole({ kind: "persona", personaCode: p.code, personaName: p.label });
+      return;
+    }
+    if (v.startsWith("s:")) {
+      const id = Number(v.slice(2));
+      const found = staff.find((s) => s.id === id);
+      if (found) setRole({ kind: "staff", staffId: found.id, staffName: found.name });
+    }
   };
 
   return (
@@ -193,6 +211,11 @@ function RoleSwitcher() {
       <select value={value} onChange={(e) => onChange(e.target.value)} disabled={loading}
         className="border-none bg-transparent text-slate-900 font-medium focus:outline-none cursor-pointer">
         <option value="admin">Admin</option>
+        <optgroup label="Roles">
+          {PERSONAS.map((p) => (
+            <option key={p.code} value={`p:${p.code}`}>{p.label}</option>
+          ))}
+        </optgroup>
         {staff.length > 0 && (
           <optgroup label="Staff">
             {staff.map((s) => <option key={s.id} value={`s:${s.id}`}>{s.name}</option>)}

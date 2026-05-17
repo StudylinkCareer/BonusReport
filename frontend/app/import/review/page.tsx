@@ -86,7 +86,7 @@ import {
   Pin,
   PinOff,
 } from 'lucide-react';
-import { useRole, roleLabel } from '@/lib/role';
+import { useRole, roleLabel, actingAsKey } from '@/lib/role';
 import {
   filtersFromQuery,
   filtersToQuery,
@@ -861,6 +861,7 @@ export default function ReviewPage() {
                 onTransitioned={() => {
                   if (workflowState) loadCasesByWorkflowState(workflowState, carriedFilters);
                 }}
+                actingAs={actingAsKey(role)}
               />
             </div>
 
@@ -1235,6 +1236,312 @@ function PinMenuItem({
   );
 }
 
+// ============================================================================
+// VariantSwitcher — Phase 17a UI for saved column layouts
+// ============================================================================
+//
+// A toolbar widget that lets the operator save, recall, and delete named
+// layouts of the case table (column order, pinning, sizing, sort). Variants
+// are scoped by (acting_as, page_key='import_review'). The one marked
+// is_default loads automatically when the page mounts for that role.
+
+type LayoutJson = {
+  columnOrder?: ColumnOrderState;
+  columnPinning?: { left?: string[]; right?: string[] };
+  columnSizing?: ColumnSizingState;
+  sorting?: SortingState;
+};
+
+type VariantRow = {
+  id: number;
+  acting_as: string;
+  page_key: string;
+  variant_name: string;
+  is_default: boolean;
+  layout_json: LayoutJson;
+  created_at: string;
+  updated_at: string;
+};
+
+function VariantSwitcher({
+  actingAs,
+  pageKey,
+  columnOrder,
+  columnPinning,
+  columnSizing,
+  sorting,
+  setColumnOrder,
+  setColumnPinning,
+  setColumnSizing,
+  setSorting,
+}: {
+  actingAs: string;
+  pageKey: string;
+  columnOrder: ColumnOrderState;
+  columnPinning: ColumnPinningState;
+  columnSizing: ColumnSizingState;
+  sorting: SortingState;
+  setColumnOrder: (next: ColumnOrderState) => void;
+  setColumnPinning: (next: ColumnPinningState) => void;
+  setColumnSizing: (next: ColumnSizingState) => void;
+  setSorting: (next: SortingState) => void;
+}) {
+  const [variants, setVariants] = useState<VariantRow[]>([]);
+  const [selectedId, setSelectedId] = useState<number | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const initialAppliedRef = useRef(false);
+
+  // Apply a serialized layout to the table state.
+  const applyLayout = useCallback(
+    (layout: LayoutJson) => {
+      if (layout.columnOrder)  setColumnOrder(layout.columnOrder);
+      if (layout.columnPinning) {
+        setColumnPinning({
+          left:  layout.columnPinning.left  ?? [],
+          right: layout.columnPinning.right ?? [],
+        });
+      }
+      if (layout.columnSizing) setColumnSizing(layout.columnSizing);
+      if (layout.sorting)      setSorting(layout.sorting);
+    },
+    [setColumnOrder, setColumnPinning, setColumnSizing, setSorting],
+  );
+
+  // Snapshot the current table state into a LayoutJson blob.
+  const currentLayout = useCallback(
+    (): LayoutJson => ({
+      columnOrder,
+      columnPinning: {
+        left:  columnPinning.left  ?? [],
+        right: columnPinning.right ?? [],
+      },
+      columnSizing,
+      sorting,
+    }),
+    [columnOrder, columnPinning, columnSizing, sorting],
+  );
+
+  // Fetch variants whenever the acting role or page changes.
+  useEffect(() => {
+    let cancelled = false;
+    setError(null);
+    initialAppliedRef.current = false;
+    const qs = new URLSearchParams({ acting_as: actingAs, page_key: pageKey });
+    fetch(`/api/user_layout?${qs}`)
+      .then((r) => {
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        return r.json();
+      })
+      .then((data: { items: VariantRow[] }) => {
+        if (cancelled) return;
+        setVariants(data.items);
+        if (!initialAppliedRef.current) {
+          const def = data.items.find((v) => v.is_default);
+          if (def) {
+            applyLayout(def.layout_json);
+            setSelectedId(def.id);
+          } else {
+            setSelectedId(null);
+          }
+          initialAppliedRef.current = true;
+        }
+      })
+      .catch((e) => {
+        if (!cancelled) setError(String(e));
+      });
+    return () => {
+      cancelled = true;
+    };
+  // applyLayout deliberately omitted — it's stable across renders thanks to
+  // useCallback, and including it would cause the layout-state update inside
+  // applyLayout to retrigger the fetch in a loop.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [actingAs, pageKey]);
+
+  function onSelectVariant(id: number) {
+    const v = variants.find((x) => x.id === id);
+    if (!v) return;
+    applyLayout(v.layout_json);
+    setSelectedId(id);
+  }
+
+  async function onSaveCurrent() {
+    if (selectedId === null) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const r = await fetch(`/api/user_layout/${selectedId}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ layout_json: currentLayout() }),
+      });
+      if (!r.ok) throw new Error(`HTTP ${r.status}: ${await r.text()}`);
+      const updated: VariantRow = await r.json();
+      setVariants((vs) => vs.map((v) => (v.id === updated.id ? updated : v)));
+    } catch (e) {
+      setError(String(e instanceof Error ? e.message : e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function onSaveAsNew() {
+    const suggested = `Variant ${variants.length + 1}`;
+    const name = window.prompt('Name for this layout:', suggested);
+    if (!name) return;
+    if (variants.some((v) => v.variant_name === name)) {
+      setError(`A variant named "${name}" already exists.`);
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    try {
+      const r = await fetch('/api/user_layout', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          acting_as:    actingAs,
+          page_key:     pageKey,
+          variant_name: name,
+          is_default:   variants.length === 0, // first variant → auto-default
+          layout_json:  currentLayout(),
+        }),
+      });
+      if (!r.ok) throw new Error(`HTTP ${r.status}: ${await r.text()}`);
+      const created: VariantRow = await r.json();
+      setVariants((vs) => [...vs, created].sort((a, b) =>
+        Number(b.is_default) - Number(a.is_default) ||
+        a.variant_name.localeCompare(b.variant_name),
+      ));
+      setSelectedId(created.id);
+    } catch (e) {
+      setError(String(e instanceof Error ? e.message : e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function onSetDefault() {
+    if (selectedId === null) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const r = await fetch(`/api/user_layout/${selectedId}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ is_default: true }),
+      });
+      if (!r.ok) throw new Error(`HTTP ${r.status}: ${await r.text()}`);
+      // Only one default per (acting_as, page_key) — clear the flag on the
+      // others locally too so the UI matches.
+      setVariants((vs) =>
+        vs.map((v) => ({ ...v, is_default: v.id === selectedId })),
+      );
+    } catch (e) {
+      setError(String(e instanceof Error ? e.message : e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function onDelete() {
+    if (selectedId === null) return;
+    const v = variants.find((x) => x.id === selectedId);
+    if (!v) return;
+    if (!window.confirm(`Delete variant "${v.variant_name}"?`)) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const r = await fetch(`/api/user_layout/${selectedId}`, {
+        method: 'DELETE',
+      });
+      if (!r.ok) throw new Error(`HTTP ${r.status}: ${await r.text()}`);
+      setVariants((vs) => vs.filter((x) => x.id !== selectedId));
+      setSelectedId(null);
+    } catch (e) {
+      setError(String(e instanceof Error ? e.message : e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const currentVariant =
+    selectedId !== null ? variants.find((v) => v.id === selectedId) : null;
+
+  return (
+    <div className="flex items-center gap-2">
+      <span className="text-xs text-gray-500">Layout:</span>
+      <select
+        value={selectedId ?? ''}
+        onChange={(e) => {
+          const v = e.target.value;
+          if (v === '') {
+            setSelectedId(null);
+          } else {
+            onSelectVariant(Number(v));
+          }
+        }}
+        disabled={busy}
+        className="rounded border border-gray-300 bg-white px-2 py-1 text-xs"
+        title="Switch to a saved layout variant"
+      >
+        <option value="">(ad hoc)</option>
+        {variants.map((v) => (
+          <option key={v.id} value={v.id}>
+            {v.variant_name}
+            {v.is_default ? ' ★' : ''}
+          </option>
+        ))}
+      </select>
+      {currentVariant && (
+        <button
+          onClick={onSaveCurrent}
+          disabled={busy}
+          className="rounded border border-gray-300 bg-white px-2 py-1 text-xs hover:bg-gray-100 disabled:opacity-50"
+          title={`Overwrite "${currentVariant.variant_name}" with the current view`}
+        >
+          Save
+        </button>
+      )}
+      <button
+        onClick={onSaveAsNew}
+        disabled={busy}
+        className="rounded border border-gray-300 bg-white px-2 py-1 text-xs hover:bg-gray-100 disabled:opacity-50"
+        title="Save current view as a new variant"
+      >
+        Save as…
+      </button>
+      {currentVariant && !currentVariant.is_default && (
+        <button
+          onClick={onSetDefault}
+          disabled={busy}
+          className="rounded border border-gray-300 bg-white px-2 py-1 text-xs hover:bg-gray-100 disabled:opacity-50"
+          title="Load this variant by default for this role"
+        >
+          Make default
+        </button>
+      )}
+      {currentVariant && (
+        <button
+          onClick={onDelete}
+          disabled={busy}
+          className="rounded border border-red-300 bg-white px-2 py-1 text-xs text-red-700 hover:bg-red-50 disabled:opacity-50"
+          title="Delete this variant"
+        >
+          Delete
+        </button>
+      )}
+      {error && (
+        <span className="text-xs text-red-700" title={error}>
+          {error.length > 60 ? error.slice(0, 57) + '…' : error}
+        </span>
+      )}
+    </div>
+  );
+}
+
+
 function CasesTable({
   cases,
   refData,
@@ -1243,11 +1550,13 @@ function CasesTable({
   workflowState,
   preselectedIds,
   onTransitioned,
+  actingAs,
 }: {
   cases: Case[];
   workflowState: string | null;
   preselectedIds: Set<number>;
   onTransitioned: () => void;
+  actingAs: string;
 } & CommonProps) {
   // ---- column ordering ------------------------------------------------
   // Pinned (sticky) columns always stay leftmost: select (when shown),
@@ -2171,6 +2480,18 @@ function CasesTable({
                 : `Move ${selectedIds.length} to ${nextStateLabel} →`}
             </button>
           )}
+          <VariantSwitcher
+            actingAs={actingAs}
+            pageKey="import_review"
+            columnOrder={columnOrder}
+            columnPinning={columnPinning}
+            columnSizing={columnSizing}
+            sorting={sorting}
+            setColumnOrder={setColumnOrder}
+            setColumnPinning={setColumnPinning}
+            setColumnSizing={setColumnSizing}
+            setSorting={setSorting}
+          />
           {anyFilterActive && (
             <button
               onClick={resetView}
