@@ -895,7 +895,9 @@ function CasesTable({
   // import_status, contract_id, student_name. Reordering only applies to
   // unpinned columns.
   const showSelect =
-    workflowState === 'uploaded' || workflowState === 'in_review';
+    workflowState === 'uploaded' ||
+    workflowState === 'in_review' ||
+    workflowState === 'submitted';
   const PINNED = showSelect
     ? ['select', 'import_status', 'contract_id', 'student_name']
     : ['import_status', 'contract_id', 'student_name'];
@@ -964,6 +966,17 @@ function CasesTable({
   const [rowSelection, setRowSelection] = useState<RowSelectionState>({});
   const [transitioning, setTransitioning] = useState(false);
   const [transitionError, setTransitionError] = useState<string | null>(null);
+
+  // Calculate flow (only used on workflow_state === 'submitted').
+  // bulkCalculate posts case_ids to the engine, then transitions them to
+  // 'closed' on success. Result message stays visible until next selection
+  // change or another action.
+  const [calculating, setCalculating] = useState(false);
+  const [calculateError, setCalculateError] = useState<string | null>(null);
+  const [calculateMessage, setCalculateMessage] = useState<
+    | { ok: true; payment_count: number; net_total: number; skipped: number; errored: number }
+    | null
+  >(null);
 
   // When preselectedIds changes (e.g. role switched, or cases reloaded after
   // a transition), reset the selection to the new pre-selected set. This
@@ -1519,6 +1532,124 @@ function CasesTable({
     }
   }
 
+  // ---- bulk calculate (selected -> engine, then transition to closed) ----
+  // Only used when workflowState === 'submitted'.
+  //
+  // Calls the existing /api/engine/run endpoint (period-scoped) once per
+  // distinct (run_year, run_month) found in the selection. This matches
+  // how the engine is designed to operate: monthly batches. Each call
+  // recalculates EVERY staff member's cases for that period — not just
+  // the ticked ones (and not just the current staff).
+  //
+  // On success, the selected cases are transitioned to 'closed' so they
+  // disappear from the Submitted view.
+  async function bulkCalculate() {
+    if (selectedIds.length === 0) return;
+
+    // Derive distinct (year, month) periods from the selected cases.
+    const selectedSet = new Set(selectedIds);
+    const periodMap = new Map<string, { year: number; month: number }>();
+    for (const c of cases) {
+      if (!selectedSet.has(c.id)) continue;
+      const key = `${c.run_year}-${c.run_month}`;
+      if (!periodMap.has(key)) {
+        periodMap.set(key, { year: c.run_year, month: c.run_month });
+      }
+    }
+    const periods = Array.from(periodMap.values()).sort((a, b) => {
+      if (a.year !== b.year) return a.year - b.year;
+      return a.month - b.month;
+    });
+
+    if (periods.length === 0) return;
+
+    const periodList = periods
+      .map((p) => `  • ${p.year}-${String(p.month).padStart(2, '0')}`)
+      .join('\n');
+
+    const confirmed = window.confirm(
+      `Fire the bonus engine for ${periods.length} period(s)?\n\n` +
+        periodList +
+        `\n\n` +
+        `For each period, the engine will:\n` +
+        `  • DELETE all existing bonus payments for that period\n` +
+        `  • Re-calculate from imported tx_case rows (ALL staff, not just yours)\n` +
+        `  • Write fresh tx_bonus_payment rows\n\n` +
+        `On success, your selected cases will be moved to "Closed".\n\n` +
+        `This is idempotent — safe to re-run.`,
+    );
+    if (!confirmed) return;
+
+    setCalculating(true);
+    setCalculateError(null);
+    setCalculateMessage(null);
+
+    let totalPayments = 0;
+    let totalNet = 0;
+    let totalSkipped = 0;
+    let totalErrored = 0;
+
+    try {
+      // 1. Run engine once per period (sequential — safer for shared state).
+      for (const p of periods) {
+        const res = await fetch('/api/engine/run', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ year: p.year, month: p.month, persist: true }),
+        });
+        if (!res.ok) {
+          const detail = await res.text();
+          throw new Error(
+            `Engine HTTP ${res.status} for ${p.year}-${String(p.month).padStart(
+              2,
+              '0',
+            )}: ${detail}`,
+          );
+        }
+        const result = (await res.json()) as {
+          payment_count?: number;
+          net_total?: number;
+          skipped?: unknown[];
+          errored?: unknown[];
+        };
+        totalPayments += result.payment_count ?? 0;
+        totalNet += result.net_total ?? 0;
+        totalSkipped += result.skipped?.length ?? 0;
+        totalErrored += result.errored?.length ?? 0;
+      }
+
+      // 2. Transition the calculated cases to 'closed'.
+      const tRes = await fetch('/api/cases/transition', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ case_ids: selectedIds, to_state: 'closed' }),
+      });
+      if (!tRes.ok) {
+        const detail = await tRes.text();
+        throw new Error(
+          `Calculation succeeded but transition to Closed failed ` +
+            `(HTTP ${tRes.status}: ${detail}). The bonus rows have been ` +
+            `written; you can manually move the cases.`,
+        );
+      }
+
+      setCalculateMessage({
+        ok: true,
+        payment_count: totalPayments,
+        net_total: totalNet,
+        skipped: totalSkipped,
+        errored: totalErrored,
+      });
+      setRowSelection({});
+      onTransitioned();
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e);
+      setCalculateError(msg);
+    } finally {
+      setCalculating(false);
+    }
+  }
+
   // Move-column helpers (used by the small "←  →" buttons in each non-pinned header).
   const moveCol = (id: string, direction: -1 | 1) => {
     setColumnOrder((order) => {
@@ -1584,7 +1715,23 @@ function CasesTable({
           )}
         </div>
         <div className="flex items-center gap-2">
-          {showSelect && selectedIds.length > 0 && nextState && (
+          {showSelect && selectedIds.length > 0 && workflowState === 'submitted' && (
+            <button
+              onClick={bulkCalculate}
+              disabled={calculating}
+              className={`rounded px-3 py-1 font-medium text-white ${
+                calculating
+                  ? 'bg-gray-400 cursor-not-allowed'
+                  : 'bg-emerald-600 hover:bg-emerald-700'
+              }`}
+              title="Run the engine on the selected cases, then move them to Closed"
+            >
+              {calculating
+                ? 'Running engine…'
+                : `Calculate ${selectedIds.length} & Close →`}
+            </button>
+          )}
+          {showSelect && selectedIds.length > 0 && workflowState !== 'submitted' && nextState && (
             <button
               onClick={bulkTransition}
               disabled={transitioning}
@@ -1613,6 +1760,29 @@ function CasesTable({
       {transitionError && (
         <div className="border-b border-red-200 bg-red-50 px-3 py-2 text-xs text-red-800">
           <strong>Move failed:</strong> {transitionError}
+        </div>
+      )}
+
+      {calculateError && (
+        <div className="border-b border-red-200 bg-red-50 px-3 py-2 text-xs text-red-800">
+          <strong>Calculate failed:</strong> {calculateError}
+        </div>
+      )}
+
+      {calculateMessage?.ok && (
+        <div className="border-b border-emerald-200 bg-emerald-50 px-3 py-2 text-xs text-emerald-800">
+          <strong>Engine run complete.</strong>{' '}
+          {calculateMessage.payment_count} payment row(s) written. Net total:{' '}
+          <span className="font-semibold">
+            {fmtVnd(calculateMessage.net_total)}
+          </span>
+          {calculateMessage.skipped > 0 && (
+            <> · skipped {calculateMessage.skipped}</>
+          )}
+          {calculateMessage.errored > 0 && (
+            <> · <span className="font-medium text-red-700">errored {calculateMessage.errored}</span></>
+          )}
+          .
         </div>
       )}
 
