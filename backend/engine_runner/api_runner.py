@@ -115,7 +115,11 @@ class NoLivePaymentsToReverseError(Exception):
 # ---------------------------------------------------------------------------
 
 def _get_amendment_window_days(conn) -> int:
-    """Read ref_setting.amendment_window_days; default 30 if missing."""
+    """Read ref_setting.amendment_window_days; default 30 if missing.
+
+    Note: get_connection() configures dict_row as the default row factory,
+    so cursors return dicts. Access by column name, not index.
+    """
     with conn.cursor() as cur:
         cur.execute(
             "SELECT value FROM ref_setting WHERE key = 'amendment_window_days'"
@@ -123,7 +127,7 @@ def _get_amendment_window_days(conn) -> int:
         row = cur.fetchone()
     if row is None:
         return 30
-    return int(row[0])
+    return int(row["value"])
 
 
 # ---------------------------------------------------------------------------
