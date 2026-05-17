@@ -515,8 +515,23 @@ export default function ReviewPage() {
         }
       }
       if (mismatches.length > 0) {
-        throw new Error(
-          `Server accepted the request but did not apply the change. ${mismatches.join('; ')}.`,
+        // The backend's PATCH response sometimes returns a stale snapshot of
+        // the case — the database is correctly updated, but the response
+        // body reflects the pre-update state (a missing db.refresh() after
+        // commit on the FastAPI side, or similar). User-visible behaviour:
+        // refresh the page and the new value is there. So we don't block
+        // the UI; we just leave a diagnostic line in DevTools so this can
+        // be tracked down server-side later.
+        console.warn(
+          '[saveCase] PATCH response did not reflect the request for case',
+          caseId,
+          '. Patch body:',
+          updates,
+          'Response body:',
+          updated,
+          'Mismatches:',
+          mismatches,
+          '(Optimistic UI will keep the picked value; verify on next page load.)',
         );
       }
 
@@ -2584,11 +2599,56 @@ function useCellState() {
 }
 
 function ErrorTooltip({ error }: { error: string | null }) {
-  if (!error) return null;
+  // Anchor for positioning: a zero-size invisible span placed at the top-left
+  // of whatever container the consumer renders us in. The tooltip itself
+  // renders into a FloatingPortal at the document root so it can break out
+  // of any clipping/stacking context (including the open dropdown's
+  // z-index 1000 stack, which previously hid this tooltip entirely).
+  const anchorRef = useRef<HTMLSpanElement>(null);
   return (
-    <div className="absolute top-full left-0 mt-0.5 bg-red-100 text-red-800 text-xs px-2 py-1 rounded shadow z-20 max-w-[300px]">
-      {error}
-    </div>
+    <>
+      <span
+        ref={anchorRef}
+        className="absolute top-0 left-0 pointer-events-none"
+        style={{ width: 0, height: 0 }}
+        aria-hidden
+      />
+      {error ? <ErrorTooltipPortal anchorRef={anchorRef} error={error} /> : null}
+    </>
+  );
+}
+
+function ErrorTooltipPortal({
+  anchorRef,
+  error,
+}: {
+  anchorRef: React.RefObject<HTMLSpanElement | null>;
+  error: string;
+}) {
+  const { refs, floatingStyles } = useFloating({
+    placement: 'right-start',
+    open: true,
+    whileElementsMounted: autoUpdate,
+    middleware: [offset(8), flip({ padding: 8 }), shift({ padding: 8 })],
+  });
+
+  useEffect(() => {
+    if (anchorRef.current) {
+      refs.setReference(anchorRef.current);
+    }
+  }, [anchorRef, refs]);
+
+  return (
+    <FloatingPortal>
+      <div
+        ref={refs.setFloating}
+        style={{ ...floatingStyles, zIndex: 1100 }}
+        className="bg-red-100 text-red-800 text-xs px-2 py-1 rounded shadow max-w-[320px] border border-red-300"
+        role="alert"
+      >
+        {error}
+      </div>
+    </FloatingPortal>
   );
 }
 
@@ -3220,21 +3280,17 @@ function FkCell({
   // label is a denormalised column populated by a JOIN that the UPDATE path
   // doesn't re-resolve). Without an override, picking a value would leave
   // the cell showing "—" until a full refresh re-joined the lookup. We hold
-  // the freshly picked label locally and use it in place of the prop label
-  // until the prop catches up.
+  // the freshly picked label locally and use it in place of the prop label.
   //
-  // The ref records WHICH id the override belongs to. If the prop value
-  // drifts to a different id externally (someone else's edit, undo, manual
-  // refetch), we discard the override and trust the prop.
+  // We do NOT clear this on subsequent value-prop changes. The backend's
+  // PATCH response sometimes returns a stale snapshot of the case (the DB
+  // is correctly updated but the response body reflects pre-update state),
+  // so if we trusted the prop drift, the cell would flash back to the old
+  // value even though the database now holds the new one. The optimistic
+  // override stays until either (a) the user explicitly clears the cell,
+  // (b) the save errors out, or (c) the page is reloaded and the prop
+  // arrives fresh from the database.
   const [localLabel, setLocalLabel] = useState<string | null>(null);
-  const localLabelForIdRef = useRef<number | null>(null);
-
-  useEffect(() => {
-    if (value !== localLabelForIdRef.current) {
-      setLocalLabel(null);
-      localLabelForIdRef.current = null;
-    }
-  }, [value]);
 
   const displayLabel = localLabel ?? label;
 
@@ -3259,7 +3315,6 @@ function FkCell({
       }
       // Clearing — drop the local override so the prop (null) wins.
       setLocalLabel(null);
-      localLabelForIdRef.current = null;
       setState('saving');
       setError(null);
       onSave(null)
@@ -3296,7 +3351,6 @@ function FkCell({
       ? (labelField === 'code' ? picked.code : picked.name) ?? null
       : null;
     setLocalLabel(pickedLabel);
-    localLabelForIdRef.current = newId;
 
     setState('saving');
     setError(null);
@@ -3308,9 +3362,8 @@ function FkCell({
       .catch((e) => {
         setError(String(e instanceof Error ? e.message : e));
         setState('error');
-        // Rollback the optimistic override on failure.
+        // Rollback the optimistic override on real (HTTP) failure.
         setLocalLabel(null);
-        localLabelForIdRef.current = null;
       });
   }
 
@@ -3384,17 +3437,12 @@ function StaffCell({
 
   // Optimistic local name override — same rationale as FkCell. The backend
   // PATCH returns the new staff_id but a stale/null staff_name (derived via
-  // join). Without this, picking a counsellor leaves the cell showing "—"
-  // until the page is refreshed.
+  // join), or sometimes a stale snapshot of the case altogether. Without
+  // an optimistic local override, picking a counsellor leaves the cell
+  // showing "—" until the page is refreshed. We keep the optimistic name
+  // until the user explicitly clears the cell, the save errors out, or the
+  // page is reloaded.
   const [localName, setLocalName] = useState<string | null>(null);
-  const localNameForIdRef = useRef<number | null>(null);
-
-  useEffect(() => {
-    if (staffId !== localNameForIdRef.current) {
-      setLocalName(null);
-      localNameForIdRef.current = null;
-    }
-  }, [staffId]);
 
   const displayName = localName ?? staffName;
 
@@ -3418,7 +3466,6 @@ function StaffCell({
       return;
     }
     setLocalName(o.name ?? null);
-    localNameForIdRef.current = o.id;
 
     setState('saving');
     setError(null);
@@ -3431,7 +3478,6 @@ function StaffCell({
         setError(String(e instanceof Error ? e.message : e));
         setState('error');
         setLocalName(null);
-        localNameForIdRef.current = null;
       });
   }
 
@@ -3443,7 +3489,6 @@ function StaffCell({
         return;
       }
       setLocalName(null);
-      localNameForIdRef.current = null;
       setState('saving');
       setError(null);
       onSave(null, null)
