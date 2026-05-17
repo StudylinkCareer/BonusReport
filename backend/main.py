@@ -1492,8 +1492,8 @@ def per_staff_bao_cao(
           FROM case_staff_distinct csd
           JOIN tx_case c ON csd.case_id = c.id
           JOIN ref_staff s ON csd.slot_staff_id = s.id
-          LEFT JOIN dim_role        r          ON s.role_id              = r.id
-          LEFT JOIN dim_office      o          ON s.office_id            = o.id
+          LEFT JOIN dim_role        r          ON s.primary_role_id      = r.id
+          LEFT JOIN dim_office      o          ON s.home_office_id       = o.id
           LEFT JOIN ref_institution inst       ON c.institution_id       = inst.id
           LEFT JOIN dim_country     cn         ON c.country_id           = cn.id
           LEFT JOIN ref_staff       counsellor ON c.counsellor_staff_id  = counsellor.id
