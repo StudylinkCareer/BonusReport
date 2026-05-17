@@ -2927,6 +2927,118 @@ function SearchableDropdown({
   );
 }
 
+// ===========================================================================
+// FloatingPopover — generic portaled popover anchored to a trigger element
+// ===========================================================================
+//
+// Used by MultiSelectChipCell (Services) and ReferSourceCell, which both have
+// composite popovers (form fields, search lists, buttons) that aren't a
+// simple "type-to-search" pattern, so they don't fit SearchableDropdown.
+//
+// Same overflow-escape and dismiss semantics as SearchableDropdown: rendered
+// in a Portal, positioned with collision-aware fixed coords, dismissed on
+// outside click and Escape.
+//
+// Usage:
+//   const anchorRef = useRef<HTMLDivElement>(null);
+//   <div ref={anchorRef}>...trigger...</div>
+//   <FloatingPopover open={isOpen} onClose={...} anchorRef={anchorRef}>
+//     ...popover content...
+//   </FloatingPopover>
+
+type FloatingPopoverProps = {
+  open: boolean;
+  onClose: () => void;
+  anchorRef: { current: HTMLElement | null };
+  children: ReactNode;
+  className?: string;
+  placement?: 'bottom-start' | 'bottom' | 'bottom-end' | 'top-start' | 'top';
+  /** Default true. Set false if outside clicks should not close (e.g. when
+   *  the popover contains a confirm-required form and we don't want stray
+   *  taps to discard in-progress edits). */
+  dismissOnOutsidePress?: boolean;
+  /** Default 320 — the maximum height the popover may take. Floating UI's
+   *  `size` middleware will clamp this further if the viewport is smaller. */
+  maxHeight?: number;
+  /** Default false. When true, the popover at least matches the anchor's
+   *  width (useful for "type-to-search" style popovers; not needed for
+   *  form-style popovers where the content has its own width). */
+  matchAnchorWidth?: boolean;
+};
+
+function FloatingPopover({
+  open,
+  onClose,
+  anchorRef,
+  children,
+  className,
+  placement = 'bottom-start',
+  dismissOnOutsidePress = true,
+  maxHeight = 320,
+  matchAnchorWidth = false,
+}: FloatingPopoverProps) {
+  const { refs, floatingStyles, context } = useFloating({
+    open,
+    onOpenChange: (o) => {
+      if (!o) onClose();
+    },
+    placement,
+    whileElementsMounted: autoUpdate,
+    middleware: [
+      offset(4),
+      flip({ padding: 8 }),
+      shift({ padding: 8 }),
+      size({
+        apply({ rects, availableHeight, elements }) {
+          const styleUpdates: Record<string, string> = {
+            maxHeight: `${Math.min(availableHeight - 8, maxHeight)}px`,
+          };
+          if (matchAnchorWidth) {
+            styleUpdates.minWidth = `${rects.reference.width}px`;
+          }
+          Object.assign(elements.floating.style, styleUpdates);
+        },
+        padding: 8,
+      }),
+    ],
+  });
+
+  // Wire the externally-supplied anchor into Floating UI's reference slot.
+  useEffect(() => {
+    if (anchorRef.current) {
+      refs.setReference(anchorRef.current);
+    }
+    // refs is stable across renders; only re-run when the anchor identity
+    // changes (it shouldn't change at runtime — anchorRef stays the same
+    // ref across the component's lifetime).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [anchorRef.current]);
+
+  const dismiss = useDismiss(context, {
+    outsidePress: dismissOnOutsidePress,
+    escapeKey: true,
+  });
+  const { getFloatingProps } = useInteractions([dismiss]);
+
+  if (!open) return null;
+
+  return (
+    <FloatingPortal>
+      <div
+        ref={refs.setFloating}
+        style={{ ...floatingStyles, zIndex: 1000 }}
+        className={
+          className ??
+          'bg-white border border-gray-300 rounded-md shadow-lg overflow-y-auto'
+        }
+        {...getFloatingProps()}
+      >
+        {children}
+      </div>
+    </FloatingPortal>
+  );
+}
+
 // ---- SelectCell (string options, e.g. import_status, application_status) -
 function SelectCell({
   value,
@@ -3422,10 +3534,20 @@ function MultiSelectChipCell({
       return txt.includes(lcQ);
     });
 
+  // Ref to the chip-area container; FloatingPopover anchors its positioning
+  // to this so the popovers sit just below the chips and escape the table's
+  // overflow container via FloatingPortal.
+  const anchorRef = useRef<HTMLDivElement>(null);
+
   // ---- Render -----------------------------------------------------------
+  const editingChip =
+    mode.kind === 'editing'
+      ? services.find((s) => s.id === mode.chipId) ?? null
+      : null;
+
   return (
     <div className="relative">
-      <div className="flex flex-wrap gap-1 items-start">
+      <div ref={anchorRef} className="flex flex-wrap gap-1 items-start">
         {services.length === 0 && mode.kind === 'idle' && (
           <span className="text-gray-300 text-xs italic">—</span>
         )}
@@ -3471,129 +3593,140 @@ function MultiSelectChipCell({
         )}
       </div>
 
-      {/* Add-mode popover */}
-      {mode.kind === 'adding' && (
-        <div
-          className="absolute left-0 top-full mt-1 w-72 bg-white border border-gray-300 rounded shadow-xl z-30"
-          style={{ backgroundColor: '#ffffff' }}
-        >
-          <div className="p-2 border-b border-gray-100">
-            <input
-              autoFocus
-              value={addQuery}
-              onChange={(e) => setAddQuery(e.target.value)}
-              placeholder={`Search services… (${addOptions.length} available)`}
-              className="w-full px-2 py-1 text-sm border border-gray-300 rounded focus:outline-none focus:ring-1 focus:ring-blue-500"
-              onKeyDown={(e) => {
-                if (e.key === 'Escape') cancelMode();
-              }}
-            />
-          </div>
-          <div className="max-h-64 overflow-y-auto bg-white">
-            {addOptions.length === 0 ? (
-              <div className="px-3 py-2 text-xs text-gray-400 bg-white">No matches</div>
-            ) : (
-              addOptions.slice(0, 200).map((opt) => (
-                <div
-                  key={opt.id}
-                  onMouseDown={(e) => {
-                    e.preventDefault();
-                    addService(opt);
-                  }}
-                  className="px-3 py-1.5 text-sm cursor-pointer bg-white hover:bg-blue-50"
-                >
-                  <span className="font-medium">{opt.name}</span>
-                  {opt.category && (
-                    <span className="ml-2 text-xs text-gray-400">{opt.category}</span>
-                  )}
-                </div>
-              ))
-            )}
-          </div>
-          <div className="px-3 py-1 border-t border-gray-100 flex justify-end bg-white">
-            <button
-              type="button"
-              onClick={cancelMode}
-              className="text-xs text-gray-500 hover:text-gray-700"
-            >
-              Cancel
-            </button>
-          </div>
+      {/* Add-mode popover (portaled). Search services not yet on this case. */}
+      <FloatingPopover
+        open={mode.kind === 'adding'}
+        onClose={cancelMode}
+        anchorRef={anchorRef}
+        className="bg-white border border-gray-300 rounded-md shadow-lg w-72 overflow-hidden"
+        maxHeight={380}
+      >
+        <div className="p-2 border-b border-gray-100">
+          <input
+            autoFocus
+            value={addQuery}
+            onChange={(e) => setAddQuery(e.target.value)}
+            placeholder={`Search services… (${addOptions.length} available)`}
+            className="w-full px-2 py-1 text-sm border border-gray-300 rounded focus:outline-none focus:ring-1 focus:ring-blue-500"
+            onKeyDown={(e) => {
+              if (e.key === 'Escape') cancelMode();
+            }}
+          />
         </div>
-      )}
-
-      {/* Edit-mode popover */}
-      {mode.kind === 'editing' && (() => {
-        const chip = services.find((s) => s.id === mode.chipId);
-        if (!chip) return null;
-        return (
-          <div
-            className="absolute left-0 top-full mt-1 w-72 bg-white border border-gray-300 rounded shadow-xl z-30"
-            style={{ backgroundColor: '#ffffff' }}
+        <div className="max-h-64 overflow-y-auto">
+          {addOptions.length === 0 ? (
+            <div className="px-3 py-2 text-xs text-gray-400">No matches</div>
+          ) : (
+            addOptions.slice(0, 200).map((opt) => (
+              <div
+                key={opt.id}
+                onClick={() => addService(opt)}
+                className="px-3 py-1.5 text-sm cursor-pointer hover:bg-blue-50"
+              >
+                <span className="font-medium">{opt.name}</span>
+                {opt.category && (
+                  <span className="ml-2 text-xs text-gray-400">
+                    {opt.category}
+                  </span>
+                )}
+              </div>
+            ))
+          )}
+        </div>
+        <div className="px-3 py-1 border-t border-gray-100 flex justify-end">
+          <button
+            type="button"
+            onClick={cancelMode}
+            className="text-xs text-gray-500 hover:text-gray-700"
           >
-            <div className="p-3 space-y-2 bg-white">
-              <div className="text-sm font-medium text-gray-900 truncate" title={chip.service_label}>
-                {chip.service_label}
-              </div>
-              <div className="text-xs text-gray-500">
-                {chip.service_code} · {chip.category}
-              </div>
-              <div className="flex items-center gap-2 pt-1">
-                <label className="text-xs text-gray-700 w-16">Count:</label>
-                <input
-                  type="number"
-                  min={1}
-                  value={draftCount}
-                  onChange={(e) => setDraftCount(Math.max(1, Number(e.target.value) || 1))}
-                  className="w-20 px-2 py-0.5 text-sm border border-gray-300 rounded focus:outline-none focus:ring-1 focus:ring-blue-500"
-                />
-              </div>
-              <div className="flex items-center gap-2">
-                <label className="text-xs text-gray-700 w-16">Event:</label>
-                <select
-                  value={draftEvent}
-                  onChange={(e) => setDraftEvent(e.target.value)}
-                  className="flex-1 px-2 py-0.5 text-sm border border-gray-300 rounded focus:outline-none focus:ring-1 focus:ring-blue-500 bg-white"
-                  style={{ backgroundColor: '#ffffff' }}
-                >
-                  {bonusEvents.map((ev) => (
-                    <option key={ev} value={ev}>{ev}</option>
-                  ))}
-                </select>
-              </div>
-              {error && <div className="text-xs text-red-600">{error}</div>}
-              <div className="flex justify-between pt-2 border-t border-gray-100">
+            Cancel
+          </button>
+        </div>
+      </FloatingPopover>
+
+      {/* Edit-mode popover (portaled). Adjust count + bonus_event, or remove. */}
+      <FloatingPopover
+        open={mode.kind === 'editing' && editingChip != null}
+        onClose={cancelMode}
+        anchorRef={anchorRef}
+        className="bg-white border border-gray-300 rounded-md shadow-lg w-72"
+        // The edit form has unsaved input state — don't dismiss on accidental
+        // outside taps; require an explicit Cancel/Save/Remove/Escape.
+        dismissOnOutsidePress={false}
+      >
+        {editingChip && (
+          <div className="p-3 space-y-2">
+            <div
+              className="text-sm font-medium text-gray-900 truncate"
+              title={editingChip.service_label}
+            >
+              {editingChip.service_label}
+            </div>
+            <div className="text-xs text-gray-500">
+              {editingChip.service_code} · {editingChip.category}
+            </div>
+            <div className="flex items-center gap-2 pt-1">
+              <label className="text-xs text-gray-700 w-16">Count:</label>
+              <input
+                type="number"
+                min={1}
+                value={draftCount}
+                onChange={(e) =>
+                  setDraftCount(Math.max(1, Number(e.target.value) || 1))
+                }
+                onKeyDown={(e) => {
+                  if (e.key === 'Escape') cancelMode();
+                  if (e.key === 'Enter') updateChip(editingChip.id);
+                }}
+                className="w-20 px-2 py-0.5 text-sm border border-gray-300 rounded focus:outline-none focus:ring-1 focus:ring-blue-500"
+              />
+            </div>
+            <div className="flex items-center gap-2">
+              <label className="text-xs text-gray-700 w-16">Event:</label>
+              <select
+                value={draftEvent}
+                onChange={(e) => setDraftEvent(e.target.value)}
+                className="flex-1 px-2 py-0.5 text-sm border border-gray-300 rounded focus:outline-none focus:ring-1 focus:ring-blue-500 bg-white"
+              >
+                {bonusEvents.map((ev) => (
+                  <option key={ev} value={ev}>
+                    {ev}
+                  </option>
+                ))}
+              </select>
+            </div>
+            {error && <div className="text-xs text-red-600">{error}</div>}
+            <div className="flex justify-between pt-2 border-t border-gray-100">
+              <button
+                type="button"
+                onClick={() => removeChip(editingChip.id)}
+                disabled={saving}
+                className="text-xs text-red-600 hover:text-red-800 disabled:opacity-50"
+              >
+                Remove
+              </button>
+              <div className="flex gap-2">
                 <button
                   type="button"
-                  onClick={() => removeChip(chip.id)}
+                  onClick={cancelMode}
                   disabled={saving}
-                  className="text-xs text-red-600 hover:text-red-800 disabled:opacity-50"
+                  className="text-xs text-gray-500 hover:text-gray-700 disabled:opacity-50"
                 >
-                  Remove
+                  Cancel
                 </button>
-                <div className="flex gap-2">
-                  <button
-                    type="button"
-                    onClick={cancelMode}
-                    disabled={saving}
-                    className="text-xs text-gray-500 hover:text-gray-700 disabled:opacity-50"
-                  >
-                    Cancel
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => updateChip(chip.id)}
-                    disabled={saving}
-                    className="text-xs px-2 py-0.5 bg-blue-600 text-white rounded hover:bg-blue-700 disabled:opacity-50"
-                  >
-                    {saving ? 'Saving…' : 'Save'}
-                  </button>
-                </div>
+                <button
+                  type="button"
+                  onClick={() => updateChip(editingChip.id)}
+                  disabled={saving}
+                  className="text-xs px-2 py-0.5 bg-blue-600 text-white rounded hover:bg-blue-700 disabled:opacity-50"
+                >
+                  {saving ? 'Saving…' : 'Save'}
+                </button>
               </div>
             </div>
           </div>
-        );
-      })()}
+        )}
+      </FloatingPopover>
 
       {error && mode.kind === 'idle' && (
         <div className="absolute top-full mt-0.5 left-0 bg-red-100 text-red-800 text-xs px-2 py-1 rounded shadow z-20 max-w-[300px]">
@@ -3713,11 +3846,17 @@ function ReferSourceCell({
     }
   }
 
-  if (!editing) {
-    return (
+  // Anchor for the portaled form popover. We keep the display visible during
+  // editing so the user retains spatial context (which cell they're editing).
+  const anchorRef = useRef<HTMLDivElement>(null);
+
+  return (
+    <>
       <div
+        ref={anchorRef}
         className={EDITABLE_BASE + ' min-w-[150px]'}
         onClick={() => {
+          if (editing) return;
           setEditing(true);
           setError(null);
           setDraftType(initialType);
@@ -3730,81 +3869,98 @@ function ReferSourceCell({
         }}
       >
         <div className="text-xs">
-          <span className="text-gray-500">[{c.referring_source_type ?? 'DIRECT'}]</span>{' '}
+          <span className="text-gray-500">
+            [{c.referring_source_type ?? 'DIRECT'}]
+          </span>{' '}
           {displayName || DASH}
         </div>
       </div>
-    );
-  }
 
-  return (
-    <div className="relative bg-white p-2 border border-blue-500 rounded shadow-sm min-w-[260px] z-20">
-      <div className="space-y-1.5">
-        <label className="block text-xs font-medium text-gray-700">Type</label>
-        <select
-          value={draftType}
-          onChange={(e) => {
-            setDraftType(e.target.value as SourceType);
-            setDraftEntityId(null);
-          }}
-          className="w-full px-2 py-1 border border-gray-300 rounded text-xs"
-          disabled={state === 'saving'}
-        >
-          {refData.source_types.map((t) => (
-            <option key={t} value={t}>
-              {t}
-            </option>
-          ))}
-        </select>
-
-        {draftType !== 'DIRECT' && (
-          <>
-            <label className="block text-xs font-medium text-gray-700">Entity</label>
-            <select
-              value={draftEntityId ?? ''}
-              onChange={(e) =>
-                setDraftEntityId(e.target.value ? Number(e.target.value) : null)
-              }
-              className="w-full px-2 py-1 border border-gray-300 rounded text-xs"
-              disabled={state === 'saving'}
-            >
-              <option value="">— pick —</option>
-              {entityOptions.map((o) => (
-                <option key={o.id} value={o.id}>
-                  {o.name ?? o.code ?? `#${o.id}`}
-                </option>
-              ))}
-            </select>
-          </>
-        )}
-
-        <div className="flex gap-2 pt-1">
-          <button
-            type="button"
-            onClick={commit}
-            disabled={state === 'saving'}
-            className="px-2 py-1 bg-blue-600 text-white text-xs rounded hover:bg-blue-700 disabled:bg-gray-400"
-          >
-            {state === 'saving' ? 'Saving…' : 'Save'}
-          </button>
-          <button
-            type="button"
-            onClick={() => {
-              setEditing(false);
-              setError(null);
+      <FloatingPopover
+        open={editing}
+        onClose={() => {
+          setEditing(false);
+          setError(null);
+        }}
+        anchorRef={anchorRef}
+        className="bg-white border border-blue-500 rounded-md shadow-lg min-w-[260px]"
+        // The composite form has in-progress edits — require explicit
+        // Cancel/Save/Escape rather than dismissing on outside taps.
+        dismissOnOutsidePress={false}
+      >
+        <div className="p-2 space-y-1.5">
+          <label className="block text-xs font-medium text-gray-700">
+            Type
+          </label>
+          <select
+            value={draftType}
+            onChange={(e) => {
+              setDraftType(e.target.value as SourceType);
+              setDraftEntityId(null);
             }}
-            className="px-2 py-1 bg-gray-200 text-gray-700 text-xs rounded hover:bg-gray-300"
+            className="w-full px-2 py-1 border border-gray-300 rounded text-xs bg-white"
+            disabled={state === 'saving'}
           >
-            Cancel
-          </button>
-        </div>
-        {error && (
-          <div className="bg-red-100 text-red-800 text-xs px-2 py-1 rounded">
-            {error}
+            {refData.source_types.map((t) => (
+              <option key={t} value={t}>
+                {t}
+              </option>
+            ))}
+          </select>
+
+          {draftType !== 'DIRECT' && (
+            <>
+              <label className="block text-xs font-medium text-gray-700">
+                Entity
+              </label>
+              <select
+                value={draftEntityId ?? ''}
+                onChange={(e) =>
+                  setDraftEntityId(
+                    e.target.value ? Number(e.target.value) : null,
+                  )
+                }
+                className="w-full px-2 py-1 border border-gray-300 rounded text-xs bg-white"
+                disabled={state === 'saving'}
+              >
+                <option value="">— pick —</option>
+                {entityOptions.map((o) => (
+                  <option key={o.id} value={o.id}>
+                    {o.name ?? o.code ?? `#${o.id}`}
+                  </option>
+                ))}
+              </select>
+            </>
+          )}
+
+          <div className="flex gap-2 pt-1">
+            <button
+              type="button"
+              onClick={commit}
+              disabled={state === 'saving'}
+              className="px-2 py-1 bg-blue-600 text-white text-xs rounded hover:bg-blue-700 disabled:bg-gray-400"
+            >
+              {state === 'saving' ? 'Saving…' : 'Save'}
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setEditing(false);
+                setError(null);
+              }}
+              className="px-2 py-1 bg-gray-200 text-gray-700 text-xs rounded hover:bg-gray-300"
+            >
+              Cancel
+            </button>
           </div>
-        )}
-      </div>
-    </div>
+          {error && (
+            <div className="bg-red-100 text-red-800 text-xs px-2 py-1 rounded">
+              {error}
+            </div>
+          )}
+        </div>
+      </FloatingPopover>
+    </>
   );
 }
 
