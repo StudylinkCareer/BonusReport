@@ -26,6 +26,7 @@ import {
   CSSProperties,
   FormEvent,
   KeyboardEvent,
+  type MouseEvent as ReactMouseEvent,
   ReactNode,
   useCallback,
   useEffect,
@@ -37,7 +38,9 @@ import {
   ColumnDef,
   ColumnFiltersState,
   ColumnOrderState,
+  ColumnPinningState,
   ColumnSizingState,
+  Header,
   RowSelectionState,
   SortingState,
   flexRender,
@@ -46,6 +49,43 @@ import {
   getSortedRowModel,
   useReactTable,
 } from '@tanstack/react-table';
+import {
+  DndContext,
+  KeyboardSensor,
+  MouseSensor,
+  TouchSensor,
+  closestCenter,
+  useSensor,
+  useSensors,
+  type DragEndEvent,
+} from '@dnd-kit/core';
+import {
+  SortableContext,
+  arrayMove,
+  horizontalListSortingStrategy,
+  useSortable,
+} from '@dnd-kit/sortable';
+import { CSS } from '@dnd-kit/utilities';
+import {
+  FloatingPortal,
+  autoUpdate,
+  flip,
+  offset,
+  shift,
+  size,
+  useDismiss,
+  useFloating,
+  useInteractions,
+  useListNavigation,
+} from '@floating-ui/react';
+import {
+  ChevronDown,
+  ChevronUp,
+  ChevronsUpDown,
+  GripVertical,
+  Pin,
+  PinOff,
+} from 'lucide-react';
 import { useRole, roleLabel } from '@/lib/role';
 import {
   filtersFromQuery,
@@ -876,6 +916,268 @@ const STICKY_L = {
   student: STICKY_W.status + STICKY_W.contract,
 } as const;
 
+// ===========================================================================
+// Header cell components — used by <CasesTable />'s <thead>
+// ===========================================================================
+//
+// Two flavours:
+//   - SortableHeaderCell: a non-pinned column. Becomes a @dnd-kit sortable
+//     item with a GripVertical drag handle. The handle is the only thing
+//     that initiates a drag, so clicks elsewhere on the header (e.g. the
+//     sort button) still work normally.
+//   - PinnedHeaderCell: a pinned column. Renders sticky via
+//     `header.column.getStart('left')` — no drag handle, no sortable
+//     wrapping. Shows a small Pin icon to indicate pinned state.
+//
+// Both delegate the right-click menu to a callback supplied by CasesTable.
+
+type HeaderContextMenuState = {
+  x: number;
+  y: number;
+  columnId: string;
+} | null;
+
+function SortableHeaderCell({
+  header,
+  onContextMenu,
+}: {
+  header: Header<Case, unknown>;
+  onContextMenu: (e: ReactMouseEvent, columnId: string) => void;
+}) {
+  const { attributes, listeners, setNodeRef, transform, transition, isDragging } =
+    useSortable({ id: header.column.id });
+
+  const style: CSSProperties = {
+    transform: CSS.Translate.toString(transform),
+    transition,
+    opacity: isDragging ? 0.4 : 1,
+    position: isDragging ? 'relative' : undefined,
+    zIndex: isDragging ? 10 : undefined,
+    width: header.getSize(),
+  };
+
+  return (
+    <th
+      ref={setNodeRef}
+      style={style}
+      className="border-b border-r border-gray-200 px-3 py-2 text-left font-semibold text-gray-700 align-bottom relative group"
+      onContextMenu={(e) => onContextMenu(e, header.column.id)}
+    >
+      <div className="flex items-center gap-1">
+        {/* Drag handle — only thing that starts a drag */}
+        <span
+          {...attributes}
+          {...listeners}
+          className="opacity-0 group-hover:opacity-100 transition cursor-grab active:cursor-grabbing touch-none text-gray-400 hover:text-gray-900 -ml-1"
+          title="Drag to reorder column"
+          aria-label="Drag to reorder column"
+        >
+          <GripVertical className="h-3.5 w-3.5" strokeWidth={2} />
+        </span>
+        {/* Sort button */}
+        <button
+          type="button"
+          onClick={header.column.getToggleSortingHandler()}
+          className="flex-1 text-left truncate hover:text-gray-900"
+          title="Click to sort. Right-click for pin options."
+        >
+          {flexRender(header.column.columnDef.header, header.getContext())}
+          <SortIndicator dir={header.column.getIsSorted()} />
+        </button>
+      </div>
+      {/* Filter input */}
+      <input
+        type="text"
+        value={(header.column.getFilterValue() as string) ?? ''}
+        onChange={(e) => header.column.setFilterValue(e.target.value)}
+        placeholder="Filter…"
+        className="mt-1 w-full text-xs font-normal normal-case px-1.5 py-0.5 border border-gray-200 rounded focus:outline-none focus:border-blue-400"
+      />
+      {/* Resize handle */}
+      {header.column.getCanResize() && (
+        <div
+          onMouseDown={header.getResizeHandler()}
+          onTouchStart={header.getResizeHandler()}
+          className={`absolute top-0 right-0 h-full w-1 cursor-col-resize select-none touch-none ${
+            header.column.getIsResizing()
+              ? 'bg-blue-500'
+              : 'bg-transparent hover:bg-blue-300'
+          }`}
+        />
+      )}
+    </th>
+  );
+}
+
+function PinnedHeaderCell({
+  header,
+  onContextMenu,
+}: {
+  header: Header<Case, unknown>;
+  onContextMenu: (e: ReactMouseEvent, columnId: string) => void;
+}) {
+  const pinned = header.column.getIsPinned();
+  const leftOffset =
+    pinned === 'left' ? header.column.getStart('left') : undefined;
+  const rightOffset =
+    pinned === 'right' ? header.column.getAfter('right') : undefined;
+
+  const style: CSSProperties = {
+    position: 'sticky',
+    left: leftOffset,
+    right: rightOffset,
+    zIndex: 30,
+    background: '#F9FAFB', // gray-50
+    width: header.getSize(),
+  };
+
+  return (
+    <th
+      style={style}
+      className="border-b border-r border-gray-200 px-3 py-2 text-left font-semibold text-gray-700 align-bottom relative group"
+      onContextMenu={(e) => onContextMenu(e, header.column.id)}
+    >
+      <div className="flex items-center gap-1">
+        <Pin
+          className="h-3 w-3 text-blue-500 shrink-0"
+          strokeWidth={2.5}
+          aria-label="Pinned column"
+        />
+        <button
+          type="button"
+          onClick={header.column.getToggleSortingHandler()}
+          className="flex-1 text-left truncate hover:text-gray-900"
+          title="Click to sort. Right-click for pin options."
+        >
+          {flexRender(header.column.columnDef.header, header.getContext())}
+          <SortIndicator dir={header.column.getIsSorted()} />
+        </button>
+      </div>
+      {/* Filter input — pinned columns can still filter */}
+      {header.column.getCanFilter() && (
+        <input
+          type="text"
+          value={(header.column.getFilterValue() as string) ?? ''}
+          onChange={(e) => header.column.setFilterValue(e.target.value)}
+          placeholder="Filter…"
+          className="mt-1 w-full text-xs font-normal normal-case px-1.5 py-0.5 border border-gray-200 rounded focus:outline-none focus:border-blue-400"
+        />
+      )}
+    </th>
+  );
+}
+
+// ---- Right-click context menu for column pin operations ------------------
+function HeaderPinMenu({
+  menu,
+  pinnedState,
+  onClose,
+  onPinLeft,
+  onPinRight,
+  onUnpin,
+  onResetAll,
+}: {
+  menu: HeaderContextMenuState;
+  pinnedState: 'left' | 'right' | false;
+  onClose: () => void;
+  onPinLeft: () => void;
+  onPinRight: () => void;
+  onUnpin: () => void;
+  onResetAll: () => void;
+}) {
+  const { refs, floatingStyles, context } = useFloating({
+    open: !!menu,
+    onOpenChange: (o) => {
+      if (!o) onClose();
+    },
+    placement: 'right-start',
+    middleware: [offset(2), flip({ padding: 8 }), shift({ padding: 8 })],
+    whileElementsMounted: autoUpdate,
+  });
+
+  const dismiss = useDismiss(context, { outsidePress: true, escapeKey: true });
+  const { getFloatingProps } = useInteractions([dismiss]);
+
+  useEffect(() => {
+    if (menu) {
+      refs.setReference({
+        getBoundingClientRect: () => ({
+          width: 0,
+          height: 0,
+          x: menu.x,
+          y: menu.y,
+          left: menu.x,
+          top: menu.y,
+          right: menu.x,
+          bottom: menu.y,
+        }),
+      });
+    }
+    // refs is stable; only re-run when the menu coordinates change.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [menu?.x, menu?.y]);
+
+  if (!menu) return null;
+
+  return (
+    <FloatingPortal>
+      <div
+        ref={refs.setFloating}
+        style={{ ...floatingStyles, zIndex: 1100 }}
+        className="bg-white border border-gray-300 rounded-md shadow-lg py-1 text-sm min-w-[170px]"
+        {...getFloatingProps()}
+      >
+        <PinMenuItem
+          icon={<Pin className="h-3.5 w-3.5" />}
+          label="Pin to left"
+          disabled={pinnedState === 'left'}
+          onClick={onPinLeft}
+        />
+        <PinMenuItem
+          icon={<Pin className="h-3.5 w-3.5 rotate-180" />}
+          label="Pin to right"
+          disabled={pinnedState === 'right'}
+          onClick={onPinRight}
+        />
+        <PinMenuItem
+          icon={<PinOff className="h-3.5 w-3.5" />}
+          label="Unpin"
+          disabled={!pinnedState}
+          onClick={onUnpin}
+        />
+        <div className="border-t border-gray-100 my-1" />
+        <PinMenuItem icon={null} label="Reset all pins" onClick={onResetAll} />
+      </div>
+    </FloatingPortal>
+  );
+}
+
+function PinMenuItem({
+  icon,
+  label,
+  disabled,
+  onClick,
+}: {
+  icon: ReactNode;
+  label: string;
+  disabled?: boolean;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      disabled={disabled}
+      onClick={onClick}
+      className="w-full flex items-center gap-2 px-3 py-1.5 text-left hover:bg-gray-100 disabled:text-gray-400 disabled:cursor-not-allowed disabled:hover:bg-transparent"
+    >
+      <span className="w-4 flex items-center justify-center text-gray-500">
+        {icon}
+      </span>
+      <span>{label}</span>
+    </button>
+  );
+}
+
 function CasesTable({
   cases,
   refData,
@@ -898,7 +1200,12 @@ function CasesTable({
     workflowState === 'uploaded' ||
     workflowState === 'in_review' ||
     workflowState === 'submitted';
-  const PINNED = showSelect
+
+  // Default left-pinned columns. The user can change this at runtime via
+  // the header right-click menu (Pin to left / Unpin). Stored in TanStack's
+  // `ColumnPinningState`, so pin offsets are computed natively via
+  // `header.column.getStart('left')` rather than a hardcoded lookup table.
+  const DEFAULT_PINNED_LEFT = showSelect
     ? ['select', 'import_status', 'contract_id', 'student_name']
     : ['import_status', 'contract_id', 'student_name'];
   const DEFAULT_ORDER = showSelect
@@ -961,6 +1268,10 @@ function CasesTable({
   const [columnFilters, setColumnFilters] = useState<ColumnFiltersState>([]);
   const [columnOrder, setColumnOrder] = useState<ColumnOrderState>(DEFAULT_ORDER);
   const [columnSizing, setColumnSizing] = useState<ColumnSizingState>({});
+  const [columnPinning, setColumnPinning] = useState<ColumnPinningState>({
+    left: DEFAULT_PINNED_LEFT,
+    right: [],
+  });
 
   // Row selection (only used in workflow_state / pillar mode).
   const [rowSelection, setRowSelection] = useState<RowSelectionState>({});
@@ -1471,11 +1782,12 @@ function CasesTable({
   const table = useReactTable({
     data: cases,
     columns,
-    state: { sorting, columnFilters, columnOrder, columnSizing, rowSelection },
+    state: { sorting, columnFilters, columnOrder, columnSizing, columnPinning, rowSelection },
     onSortingChange: setSorting,
     onColumnFiltersChange: setColumnFilters,
     onColumnOrderChange: setColumnOrder,
     onColumnSizingChange: setColumnSizing,
+    onColumnPinningChange: setColumnPinning,
     onRowSelectionChange: setRowSelection,
     getCoreRowModel: getCoreRowModel(),
     getSortedRowModel: getSortedRowModel(),
@@ -1650,45 +1962,90 @@ function CasesTable({
     }
   }
 
-  // Move-column helpers (used by the small "←  →" buttons in each non-pinned header).
-  const moveCol = (id: string, direction: -1 | 1) => {
+  // dnd-kit sensors. Mouse needs an 8px activation distance so that clicking
+  // a header (e.g. to sort) doesn't accidentally start a drag.
+  const dndSensors = useSensors(
+    useSensor(MouseSensor, { activationConstraint: { distance: 8 } }),
+    useSensor(TouchSensor, { activationConstraint: { delay: 200, tolerance: 5 } }),
+    useSensor(KeyboardSensor),
+  );
+
+  function handleColumnDragEnd(e: DragEndEvent) {
+    const { active, over } = e;
+    if (!over || active.id === over.id) return;
     setColumnOrder((order) => {
-      const i = order.indexOf(id);
-      if (i === -1) return order;
-      const j = i + direction;
-      // Don't move into pinned zone
-      if (j < PINNED.length || j >= order.length) return order;
-      const next = order.slice();
-      [next[i], next[j]] = [next[j], next[i]];
-      return next;
+      const oldIdx = order.indexOf(String(active.id));
+      const newIdx = order.indexOf(String(over.id));
+      if (oldIdx === -1 || newIdx === -1) return order;
+      return arrayMove(order, oldIdx, newIdx);
     });
-  };
+  }
 
   const resetView = () => {
     setSorting([]);
     setColumnFilters([]);
     setColumnOrder(DEFAULT_ORDER);
     setColumnSizing({});
+    setColumnPinning({ left: DEFAULT_PINNED_LEFT, right: [] });
   };
 
-  // Pinned (sticky) left offset calculations. Includes the select column
-  // when shown (workflow_state pillar mode).
-  const SELECT_W = 44;
-  const pinnedLeft: Record<string, number> = showSelect
-    ? {
-        select: 0,
-        import_status: SELECT_W,
-        contract_id: SELECT_W + STICKY_W.status,
-        student_name: SELECT_W + STICKY_W.status + STICKY_W.contract,
-      }
-    : {
-        import_status: 0,
-        contract_id: STICKY_W.status,
-        student_name: STICKY_W.status + STICKY_W.contract,
-      };
+  // Right-click context menu state for column pin operations.
+  const [headerMenu, setHeaderMenu] = useState<HeaderContextMenuState>(null);
+
+  function openHeaderMenu(e: ReactMouseEvent, columnId: string) {
+    e.preventDefault();
+    setHeaderMenu({ x: e.clientX, y: e.clientY, columnId });
+  }
+
+  function closeHeaderMenu() {
+    setHeaderMenu(null);
+  }
+
+  function pinColumnLeft(columnId: string) {
+    setColumnPinning((p) => {
+      const left = (p.left ?? []).filter((id) => id !== columnId);
+      const right = (p.right ?? []).filter((id) => id !== columnId);
+      return { left: [...left, columnId], right };
+    });
+    closeHeaderMenu();
+  }
+
+  function pinColumnRight(columnId: string) {
+    setColumnPinning((p) => {
+      const left = (p.left ?? []).filter((id) => id !== columnId);
+      const right = (p.right ?? []).filter((id) => id !== columnId);
+      return { left, right: [columnId, ...right] };
+    });
+    closeHeaderMenu();
+  }
+
+  function unpinColumn(columnId: string) {
+    setColumnPinning((p) => ({
+      left: (p.left ?? []).filter((id) => id !== columnId),
+      right: (p.right ?? []).filter((id) => id !== columnId),
+    }));
+    closeHeaderMenu();
+  }
+
+  function resetPinning() {
+    setColumnPinning({ left: DEFAULT_PINNED_LEFT, right: [] });
+    closeHeaderMenu();
+  }
 
   const visibleHeaders = table.getHeaderGroups()[0]?.headers ?? [];
   const anyFilterActive = columnFilters.length > 0 || sorting.length > 0;
+
+  // Pinned-state lookup for the open context menu, so the menu can grey out
+  // the item matching the column's current pin status.
+  const menuColumnPinnedState: 'left' | 'right' | false = headerMenu
+    ? table.getColumn(headerMenu.columnId)?.getIsPinned() ?? false
+    : false;
+
+  // Items eligible for drag-and-drop reordering: every non-pinned column.
+  // Pinned columns stay in their pinned section and aren't draggable.
+  const sortableItemIds = visibleHeaders
+    .filter((h) => !h.column.getIsPinned())
+    .map((h) => h.column.id);
 
   return (
     <div className="border border-gray-200 rounded">
@@ -1787,159 +2144,157 @@ function CasesTable({
       )}
 
       <div className="overflow-auto max-h-[calc(100vh-320px)] relative">
-        <table
-          className="text-sm border-collapse"
-          style={{ width: table.getTotalSize() }}
+        <DndContext
+          sensors={dndSensors}
+          collisionDetection={closestCenter}
+          onDragEnd={handleColumnDragEnd}
         >
-          <thead className="bg-gray-50 text-xs uppercase tracking-wide sticky top-0 z-20">
-            <tr>
-              {visibleHeaders.map((header) => {
-                const id = header.column.id;
-                const isPinned = PINNED.includes(id);
-                const pinnedStyle: CSSProperties = isPinned
-                  ? {
-                      position: 'sticky',
-                      left: pinnedLeft[id] ?? 0,
-                      zIndex: 30,
-                      background: '#F9FAFB', // gray-50
-                    }
-                  : {};
-                return (
-                  <th
-                    key={header.id}
-                    style={{
-                      width: header.getSize(),
-                      ...pinnedStyle,
-                    }}
-                    className="border-b border-r border-gray-200 px-3 py-2 text-left font-semibold text-gray-700 align-bottom relative group"
-                  >
-                    <div className="flex items-center justify-between gap-1">
-                      <button
-                        type="button"
-                        onClick={header.column.getToggleSortingHandler()}
-                        className="flex-1 text-left truncate hover:text-gray-900"
-                        title="Click to sort"
-                      >
-                        {flexRender(header.column.columnDef.header, header.getContext())}
-                        <SortIndicator dir={header.column.getIsSorted()} />
-                      </button>
-                      {!isPinned && (
-                        <span className="opacity-0 group-hover:opacity-100 transition flex items-center gap-0.5">
-                          <button
-                            type="button"
-                            onClick={() => moveCol(id, -1)}
-                            className="text-gray-400 hover:text-gray-900 px-1"
-                            title="Move left"
-                          >
-                            ←
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => moveCol(id, 1)}
-                            className="text-gray-400 hover:text-gray-900 px-1"
-                            title="Move right"
-                          >
-                            →
-                          </button>
-                        </span>
-                      )}
-                    </div>
-                    {/* Filter input */}
-                    <input
-                      type="text"
-                      value={(header.column.getFilterValue() as string) ?? ''}
-                      onChange={(e) => header.column.setFilterValue(e.target.value)}
-                      placeholder="Filter…"
-                      className="mt-1 w-full text-xs font-normal normal-case px-1.5 py-0.5 border border-gray-200 rounded focus:outline-none focus:border-blue-400"
-                    />
-                    {/* Resize handle (not on pinned cols) */}
-                    {header.column.getCanResize() && (
-                      <div
-                        onMouseDown={header.getResizeHandler()}
-                        onTouchStart={header.getResizeHandler()}
-                        className={`absolute top-0 right-0 h-full w-1 cursor-col-resize select-none touch-none ${
-                          header.column.getIsResizing()
-                            ? 'bg-blue-500'
-                            : 'bg-transparent hover:bg-blue-300'
-                        }`}
-                      />
-                    )}
-                  </th>
-                );
-              })}
-            </tr>
-          </thead>
-          <tbody>
-            {table.getRowModel().rows.map((row, idx) => {
-              const c = row.original;
-              const altBg = idx % 2 === 0 ? 'bg-white' : 'bg-slate-50';
-              const rowBg =
-                c.import_status === 'OK' ? altBg : ROW_BG[c.import_status] ?? altBg;
-              const stickyBg =
-                c.import_status === 'OK'
-                  ? idx % 2 === 0
-                    ? '#FFFFFF'
-                    : '#F8FAFC' /* slate-50 */
-                  : STICKY_BG_HEX[c.import_status] ?? '#FFFFFF';
-
-              return (
-                <tr
-                  key={row.id}
-                  className={`${rowBg} border-b border-gray-100 align-top`}
+          <table
+            className="text-sm border-collapse"
+            style={{ width: table.getTotalSize() }}
+          >
+            <thead className="bg-gray-50 text-xs uppercase tracking-wide sticky top-0 z-20">
+              <tr>
+                <SortableContext
+                  items={sortableItemIds}
+                  strategy={horizontalListSortingStrategy}
                 >
-                  {row.getVisibleCells().map((cell) => {
-                    const id = cell.column.id;
-                    const isPinned = PINNED.includes(id);
-                    const pinnedStyle: CSSProperties = isPinned
-                      ? {
-                          position: 'sticky',
-                          left: pinnedLeft[id] ?? 0,
-                          zIndex: 10,
-                          background: stickyBg,
-                        }
-                      : {};
+                  {visibleHeaders.map((header) => {
+                    if (header.column.getIsPinned()) {
+                      return (
+                        <PinnedHeaderCell
+                          key={header.id}
+                          header={header}
+                          onContextMenu={openHeaderMenu}
+                        />
+                      );
+                    }
                     return (
-                      <td
-                        key={cell.id}
-                        style={{
-                          width: cell.column.getSize(),
-                          ...pinnedStyle,
-                        }}
-                        className="border-r border-gray-100 px-3 py-2"
-                      >
-                        {flexRender(cell.column.columnDef.cell, cell.getContext())}
-                      </td>
+                      <SortableHeaderCell
+                        key={header.id}
+                        header={header}
+                        onContextMenu={openHeaderMenu}
+                      />
                     );
                   })}
-                </tr>
-              );
-            })}
-            {table.getRowModel().rows.length === 0 && cases.length > 0 && (
-              <tr>
-                <td
-                  colSpan={visibleHeaders.length}
-                  className="px-3 py-8 text-center text-gray-500"
-                >
-                  No cases match the current filters.{' '}
-                  <button
-                    onClick={resetView}
-                    className="text-blue-600 underline hover:text-blue-800"
-                  >
-                    Reset
-                  </button>
-                </td>
+                </SortableContext>
               </tr>
-            )}
-          </tbody>
-        </table>
+            </thead>
+            <tbody>
+              {table.getRowModel().rows.map((row, idx) => {
+                const c = row.original;
+                const altBg = idx % 2 === 0 ? 'bg-white' : 'bg-slate-50';
+                const rowBg =
+                  c.import_status === 'OK'
+                    ? altBg
+                    : ROW_BG[c.import_status] ?? altBg;
+                const stickyBg =
+                  c.import_status === 'OK'
+                    ? idx % 2 === 0
+                      ? '#FFFFFF'
+                      : '#F8FAFC' /* slate-50 */
+                    : STICKY_BG_HEX[c.import_status] ?? '#FFFFFF';
+
+                return (
+                  <tr
+                    key={row.id}
+                    className={`${rowBg} border-b border-gray-100 align-top`}
+                  >
+                    {row.getVisibleCells().map((cell) => {
+                      const pinned = cell.column.getIsPinned();
+                      const pinnedStyle: CSSProperties = pinned
+                        ? {
+                            position: 'sticky',
+                            left:
+                              pinned === 'left'
+                                ? cell.column.getStart('left')
+                                : undefined,
+                            right:
+                              pinned === 'right'
+                                ? cell.column.getAfter('right')
+                                : undefined,
+                            zIndex: 10,
+                            background: stickyBg,
+                          }
+                        : {};
+                      return (
+                        <td
+                          key={cell.id}
+                          style={{
+                            width: cell.column.getSize(),
+                            ...pinnedStyle,
+                          }}
+                          className="border-r border-gray-100 px-3 py-2"
+                        >
+                          {flexRender(
+                            cell.column.columnDef.cell,
+                            cell.getContext(),
+                          )}
+                        </td>
+                      );
+                    })}
+                  </tr>
+                );
+              })}
+              {table.getRowModel().rows.length === 0 && cases.length > 0 && (
+                <tr>
+                  <td
+                    colSpan={visibleHeaders.length}
+                    className="px-3 py-8 text-center text-gray-500"
+                  >
+                    No cases match the current filters.{' '}
+                    <button
+                      onClick={resetView}
+                      className="text-blue-600 underline hover:text-blue-800"
+                    >
+                      Reset
+                    </button>
+                  </td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </DndContext>
+        {/* Right-click pin menu (portaled to body) */}
+        <HeaderPinMenu
+          menu={headerMenu}
+          pinnedState={menuColumnPinnedState}
+          onClose={closeHeaderMenu}
+          onPinLeft={() =>
+            headerMenu && pinColumnLeft(headerMenu.columnId)
+          }
+          onPinRight={() =>
+            headerMenu && pinColumnRight(headerMenu.columnId)
+          }
+          onUnpin={() => headerMenu && unpinColumn(headerMenu.columnId)}
+          onResetAll={resetPinning}
+        />
       </div>
     </div>
   );
 }
 
 function SortIndicator({ dir }: { dir: false | 'asc' | 'desc' }) {
-  if (!dir) return <span className="text-gray-300 ml-1">↕</span>;
-  return <span className="text-gray-700 ml-1">{dir === 'asc' ? '↑' : '↓'}</span>;
+  // Bolder, higher-contrast sort affordance.
+  // Unsorted: muted double-chevron at 60% opacity.
+  // Sorted: solid chevron in brand blue, slightly larger.
+  if (!dir) {
+    return (
+      <ChevronsUpDown
+        aria-hidden
+        className="ml-1 inline-block h-3.5 w-3.5 text-gray-400 align-[-2px]"
+        strokeWidth={2.5}
+      />
+    );
+  }
+  const Icon = dir === 'asc' ? ChevronUp : ChevronDown;
+  return (
+    <Icon
+      aria-hidden
+      className="ml-1 inline-block h-4 w-4 text-blue-600 align-[-3px]"
+      strokeWidth={3}
+    />
+  );
 }
 
 // STICKY_BG was a Tailwind class map; for inline-style use in sticky cells
@@ -2405,6 +2760,173 @@ function DateCell({
   );
 }
 
+// ===========================================================================
+// SearchableDropdown — portal-based, collision-aware, accessible
+// ===========================================================================
+//
+// Replaces the previous inline `position: absolute` dropdown pattern that
+// suffered from two bugs:
+//   (1) Options below the viewport edge were clipped by ancestor overflow.
+//   (2) onMouseDown vs onBlur races caused clicks to fail to commit.
+//
+// This implementation uses @floating-ui/react. The dropdown is rendered into
+// a Portal (`<FloatingPortal>`) so it escapes the table's overflow container,
+// is positioned with `position: fixed` based on the input's bounding rect,
+// and `flip` middleware automatically opens upward when there's no room
+// below. `useDismiss` handles outside-clicks; `useListNavigation` provides
+// arrow-key support. Click-to-select goes through the standard `onClick`
+// handler — no more racing setTimeouts.
+//
+// Used by SelectCell, FkCell, and StaffCell.
+
+type SearchableDropdownProps = {
+  open: boolean;
+  setOpen: (open: boolean) => void;
+  options: { key: string; label: string; isCurrent?: boolean }[];
+  draft: string;
+  setDraft: (s: string) => void;
+  onPick: (key: string) => void;
+  onCancel: () => void;
+  onCommitDraft: () => void; // Called when user presses Enter w/o picking
+  placeholder?: string;
+  saving?: boolean;
+  inputClassName?: string;
+  maxShown?: number;
+};
+
+function SearchableDropdown({
+  open,
+  setOpen,
+  options,
+  draft,
+  setDraft,
+  onPick,
+  onCancel,
+  onCommitDraft,
+  placeholder,
+  saving = false,
+  inputClassName,
+  maxShown = 200,
+}: SearchableDropdownProps) {
+  const [activeIndex, setActiveIndex] = useState<number | null>(null);
+  const listRef = useRef<Array<HTMLDivElement | null>>([]);
+
+  const { refs, floatingStyles, context } = useFloating({
+    open,
+    onOpenChange: setOpen,
+    placement: 'bottom-start',
+    whileElementsMounted: autoUpdate,
+    middleware: [
+      offset(4),
+      flip({ padding: 8 }),
+      shift({ padding: 8 }),
+      size({
+        apply({ rects, availableHeight, elements }) {
+          Object.assign(elements.floating.style, {
+            minWidth: `${rects.reference.width}px`,
+            maxHeight: `${Math.min(availableHeight - 8, 320)}px`,
+          });
+        },
+        padding: 8,
+      }),
+    ],
+  });
+
+  const dismiss = useDismiss(context, { outsidePress: true });
+  const listNav = useListNavigation(context, {
+    listRef,
+    activeIndex,
+    onNavigate: setActiveIndex,
+    virtual: true,
+    loop: true,
+  });
+  const { getReferenceProps, getFloatingProps, getItemProps } = useInteractions([
+    dismiss,
+    listNav,
+  ]);
+
+  const shown = options.slice(0, maxShown);
+
+  return (
+    <>
+      <input
+        ref={refs.setReference}
+        autoFocus
+        value={draft}
+        onChange={(e) => {
+          setDraft(e.target.value);
+          setOpen(true);
+          setActiveIndex(0);
+        }}
+        onFocus={(e) => {
+          e.target.select();
+          setOpen(true);
+        }}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter') {
+            e.preventDefault();
+            if (activeIndex != null && shown[activeIndex]) {
+              onPick(shown[activeIndex].key);
+            } else {
+              onCommitDraft();
+            }
+          } else if (e.key === 'Escape') {
+            e.preventDefault();
+            onCancel();
+          }
+        }}
+        disabled={saving}
+        placeholder={placeholder}
+        className={inputClassName ?? INPUT_BASE}
+        {...getReferenceProps()}
+      />
+      {open && (
+        <FloatingPortal>
+          <div
+            ref={refs.setFloating}
+            style={{
+              ...floatingStyles,
+              zIndex: 1000,
+            }}
+            className="bg-white border border-gray-300 rounded-md shadow-lg overflow-y-auto"
+            {...getFloatingProps()}
+          >
+            {shown.length === 0 ? (
+              <div className="px-3 py-2 text-xs text-gray-400">No matches</div>
+            ) : (
+              shown.map((opt, i) => {
+                const isActive = i === activeIndex;
+                return (
+                  <div
+                    key={opt.key}
+                    ref={(node) => {
+                      listRef.current[i] = node;
+                    }}
+                    role="option"
+                    aria-selected={opt.isCurrent}
+                    className={`px-3 py-1.5 text-sm cursor-pointer ${
+                      isActive ? 'bg-blue-50' : 'bg-white'
+                    } ${opt.isCurrent ? 'font-medium' : ''}`}
+                    onClick={() => onPick(opt.key)}
+                    {...getItemProps()}
+                  >
+                    {opt.label}
+                  </div>
+                );
+              })
+            )}
+            {options.length > maxShown && (
+              <div className="px-3 py-1.5 text-xs text-gray-400 border-t border-gray-100">
+                … and {options.length - maxShown} more. Refine the search.
+              </div>
+            )}
+          </div>
+        </FloatingPortal>
+      )}
+    </>
+  );
+}
+
 // ---- SelectCell (string options, e.g. import_status, application_status) -
 function SelectCell({
   value,
@@ -2441,6 +2963,12 @@ function SelectCell({
     }
   }
 
+  function cancel() {
+    setEditing(false);
+    setError(null);
+    setDraft(value ?? '');
+  }
+
   if (!editing) {
     return (
       <div
@@ -2458,76 +2986,44 @@ function SelectCell({
 
   const lcDraft = draft.trim().toLowerCase();
   const isUnchanged = lcDraft === (value ?? '').trim().toLowerCase();
-  const filtered = lcDraft && !isUnchanged
-    ? options.filter((o) => o.toLowerCase().includes(lcDraft))
-    : options;
+  const filtered =
+    lcDraft && !isUnchanged
+      ? options.filter((o) => o.toLowerCase().includes(lcDraft))
+      : options;
+
+  const dropdownOptions = filtered.map((opt) => ({
+    key: opt,
+    label: opt,
+    isCurrent: opt === value,
+  }));
 
   return (
     <div className="relative">
-      <input
-        autoFocus
-        value={draft}
-        onChange={(e) => setDraft(e.target.value)}
-        onFocus={(e) => e.target.select()}
-        onBlur={() => {
-          setTimeout(() => {
-            setEditing(false);
-            setError(null);
-            setDraft(value ?? '');
-          }, 150);
+      <SearchableDropdown
+        open={editing}
+        setOpen={(o) => {
+          if (!o) cancel();
         }}
-        onKeyDown={(e) => {
-          if (e.key === 'Enter') {
-            // Enter commits whatever is in the draft (must match an option)
-            const trimmed = draft.trim();
-            const match = options.find((o) => o.toLowerCase() === trimmed.toLowerCase());
-            if (match) commit(match);
-            else if (trimmed === '') commit(null);
-            else {
-              setError(`No matching option for "${trimmed}"`);
-              setState('error');
-            }
-          } else if (e.key === 'Escape') {
-            setEditing(false);
-            setError(null);
-            setDraft(value ?? '');
+        options={dropdownOptions}
+        draft={draft}
+        setDraft={setDraft}
+        onPick={(key) => commit(key)}
+        onCancel={cancel}
+        onCommitDraft={() => {
+          const trimmed = draft.trim();
+          const match = options.find(
+            (o) => o.toLowerCase() === trimmed.toLowerCase(),
+          );
+          if (match) commit(match);
+          else if (trimmed === '') commit(null);
+          else {
+            setError(`No matching option for "${trimmed}"`);
+            setState('error');
           }
         }}
-        disabled={state === 'saving'}
-        className={INPUT_BASE}
         placeholder={`type to search… (${options.length} options)`}
+        saving={state === 'saving'}
       />
-      <div
-        className="absolute left-0 right-0 top-full mt-1 max-h-64 overflow-y-auto bg-white border border-gray-300 rounded shadow-xl z-30"
-        style={{ backgroundColor: '#ffffff' }}
-      >
-        {filtered.length === 0 ? (
-          <div className="px-3 py-2 text-xs text-gray-400 bg-white">No matches</div>
-        ) : (
-          filtered.slice(0, 200).map((opt) => {
-            const isCurrent = opt === value;
-            return (
-              <div
-                key={opt}
-                onMouseDown={(e) => {
-                  e.preventDefault();
-                  commit(opt);
-                }}
-                className={`px-3 py-1.5 text-sm cursor-pointer bg-white hover:bg-blue-50 ${
-                  isCurrent ? 'bg-blue-100 font-medium' : ''
-                }`}
-              >
-                {opt}
-              </div>
-            );
-          })
-        )}
-        {filtered.length > 200 && (
-          <div className="px-3 py-1.5 text-xs text-gray-400 border-t border-gray-100 bg-white">
-            … and {filtered.length - 200} more. Refine the search.
-          </div>
-        )}
-      </div>
       <ErrorTooltip error={error} />
     </div>
   );
@@ -2554,7 +3050,13 @@ function FkCell({
     setDraft(label ?? '');
   }, [label]);
 
-  async function commit() {
+  function cancel() {
+    setEditing(false);
+    setError(null);
+    setDraft(label ?? '');
+  }
+
+  function commitDraft() {
     const trimmed = draft.trim();
     if (trimmed === '') {
       if (value === null) {
@@ -2563,14 +3065,15 @@ function FkCell({
       }
       setState('saving');
       setError(null);
-      try {
-        await onSave(null);
-        setEditing(false);
-        setState('idle');
-      } catch (e) {
-        setError(String(e instanceof Error ? e.message : e));
-        setState('error');
-      }
+      onSave(null)
+        .then(() => {
+          setEditing(false);
+          setState('idle');
+        })
+        .catch((e) => {
+          setError(String(e instanceof Error ? e.message : e));
+          setState('error');
+        });
       return;
     }
     const match = options.find(
@@ -2581,20 +3084,25 @@ function FkCell({
       setState('error');
       return;
     }
-    if (match.id === value) {
+    pickById(match.id);
+  }
+
+  function pickById(newId: number) {
+    if (newId === value) {
       setEditing(false);
       return;
     }
     setState('saving');
     setError(null);
-    try {
-      await onSave(match.id);
-      setEditing(false);
-      setState('idle');
-    } catch (e) {
-      setError(String(e instanceof Error ? e.message : e));
-      setState('error');
-    }
+    onSave(newId)
+      .then(() => {
+        setEditing(false);
+        setState('idle');
+      })
+      .catch((e) => {
+        setError(String(e instanceof Error ? e.message : e));
+        setState('error');
+      });
   }
 
   if (!editing) {
@@ -2615,92 +3123,37 @@ function FkCell({
   const lcDraft = draft.trim().toLowerCase();
   // When the draft still matches the current label exactly, show ALL options
   // (so the user sees the full picker without having to clear the input first).
-  // Otherwise filter by what they've typed.
   const isUnchangedLabel = lcDraft === (label ?? '').trim().toLowerCase();
-  const filtered = lcDraft && !isUnchangedLabel
-    ? options.filter((o) => {
-        const txt = (labelField === 'code' ? o.code : o.name) ?? '';
-        return txt.toLowerCase().includes(lcDraft);
-      })
-    : options;
+  const filtered =
+    lcDraft && !isUnchangedLabel
+      ? options.filter((o) => {
+          const txt = (labelField === 'code' ? o.code : o.name) ?? '';
+          return txt.toLowerCase().includes(lcDraft);
+        })
+      : options;
 
-  function pick(o: RefItem) {
-    if (o.id === value) {
-      setEditing(false);
-      return;
-    }
-    setState('saving');
-    setError(null);
-    onSave(o.id)
-      .then(() => {
-        setEditing(false);
-        setState('idle');
-      })
-      .catch((e) => {
-        setError(String(e instanceof Error ? e.message : e));
-        setState('error');
-      });
-  }
+  const dropdownOptions = filtered.map((o) => ({
+    key: String(o.id),
+    label: (labelField === 'code' ? o.code : o.name) ?? '',
+    isCurrent: o.id === value,
+  }));
 
   return (
     <div className="relative">
-      <input
-        autoFocus
-        value={draft}
-        onChange={(e) => setDraft(e.target.value)}
-        onFocus={(e) => e.target.select()}
-        onBlur={() => {
-          // Defer slightly so option clicks (onMouseDown) win the race.
-          // If user clicks an option, pick() runs first and setEditing(false)
-          // gets called there. Otherwise this onBlur closes the dropdown
-          // without saving, preserving the existing value.
-          setTimeout(() => {
-            setEditing(false);
-            setError(null);
-            setDraft(label ?? '');
-          }, 150);
+      <SearchableDropdown
+        open={editing}
+        setOpen={(o) => {
+          if (!o) cancel();
         }}
-        onKeyDown={(e) => {
-          if (e.key === 'Enter') commit();
-          else if (e.key === 'Escape') {
-            setEditing(false);
-            setError(null);
-            setDraft(label ?? '');
-          }
-        }}
-        disabled={state === 'saving'}
-        className={INPUT_BASE}
+        options={dropdownOptions}
+        draft={draft}
+        setDraft={setDraft}
+        onPick={(key) => pickById(Number(key))}
+        onCancel={cancel}
+        onCommitDraft={commitDraft}
         placeholder={`type to search… (${options.length} options)`}
+        saving={state === 'saving'}
       />
-      <div className="absolute left-0 right-0 top-full mt-1 max-h-64 overflow-y-auto bg-white border border-gray-300 rounded shadow-xl z-30" style={{ backgroundColor: '#ffffff' }}>
-        {filtered.length === 0 ? (
-          <div className="px-3 py-2 text-xs text-gray-400 bg-white">No matches</div>
-        ) : (
-          filtered.slice(0, 200).map((o) => {
-            const txt = (labelField === 'code' ? o.code : o.name) ?? '';
-            const isCurrent = o.id === value;
-            return (
-              <div
-                key={o.id}
-                onMouseDown={(e) => {
-                  e.preventDefault(); // prevent input blur before click registers
-                  pick(o);
-                }}
-                className={`px-3 py-1.5 text-sm cursor-pointer bg-white hover:bg-blue-50 ${
-                  isCurrent ? 'bg-blue-100 font-medium' : ''
-                }`}
-              >
-                {txt}
-              </div>
-            );
-          })
-        )}
-        {filtered.length > 200 && (
-          <div className="px-3 py-1.5 text-xs text-gray-400 border-t border-gray-100 bg-white">
-            … and {filtered.length - 200} more. Refine the search.
-          </div>
-        )}
-      </div>
       <ErrorTooltip error={error} />
     </div>
   );
@@ -2725,7 +3178,33 @@ function StaffCell({
     setDraft(staffName ?? '');
   }, [staffName]);
 
-  async function commit() {
+  function cancel() {
+    setEditing(false);
+    setError(null);
+    setDraft(staffName ?? '');
+  }
+
+  function pickById(newStaffId: number) {
+    const o = options.find((opt) => opt.id === newStaffId);
+    if (!o) return;
+    if (o.id === staffId) {
+      setEditing(false);
+      return;
+    }
+    setState('saving');
+    setError(null);
+    onSave(o.id, o.primary_role_id ?? null)
+      .then(() => {
+        setEditing(false);
+        setState('idle');
+      })
+      .catch((e) => {
+        setError(String(e instanceof Error ? e.message : e));
+        setState('error');
+      });
+  }
+
+  function commitDraft() {
     const trimmed = draft.trim();
     if (trimmed === '') {
       if (staffId === null) {
@@ -2734,14 +3213,15 @@ function StaffCell({
       }
       setState('saving');
       setError(null);
-      try {
-        await onSave(null, null);
-        setEditing(false);
-        setState('idle');
-      } catch (e) {
-        setError(String(e instanceof Error ? e.message : e));
-        setState('error');
-      }
+      onSave(null, null)
+        .then(() => {
+          setEditing(false);
+          setState('idle');
+        })
+        .catch((e) => {
+          setError(String(e instanceof Error ? e.message : e));
+          setState('error');
+        });
       return;
     }
     const match = options.find((o) => o.name === trimmed);
@@ -2750,20 +3230,7 @@ function StaffCell({
       setState('error');
       return;
     }
-    if (match.id === staffId) {
-      setEditing(false);
-      return;
-    }
-    setState('saving');
-    setError(null);
-    try {
-      await onSave(match.id, match.primary_role_id ?? null);
-      setEditing(false);
-      setState('idle');
-    } catch (e) {
-      setError(String(e instanceof Error ? e.message : e));
-      setState('error');
-    }
+    pickById(match.id);
   }
 
   if (!editing) {
@@ -2783,85 +3250,33 @@ function StaffCell({
 
   const lcDraft = draft.trim().toLowerCase();
   const isUnchangedLabel = lcDraft === (staffName ?? '').trim().toLowerCase();
-  const filtered = lcDraft && !isUnchangedLabel
-    ? options.filter((o) => (o.name ?? '').toLowerCase().includes(lcDraft))
-    : options;
+  const filtered =
+    lcDraft && !isUnchangedLabel
+      ? options.filter((o) => (o.name ?? '').toLowerCase().includes(lcDraft))
+      : options;
 
-  function pick(o: typeof options[number]) {
-    if (o.id === staffId) {
-      setEditing(false);
-      return;
-    }
-    setState('saving');
-    setError(null);
-    onSave(o.id, o.primary_role_id ?? null)
-      .then(() => {
-        setEditing(false);
-        setState('idle');
-      })
-      .catch((e) => {
-        setError(String(e instanceof Error ? e.message : e));
-        setState('error');
-      });
-  }
+  const dropdownOptions = filtered.map((o) => ({
+    key: String(o.id),
+    label: o.name ?? '',
+    isCurrent: o.id === staffId,
+  }));
 
   return (
     <div className="relative">
-      <input
-        autoFocus
-        value={draft}
-        onChange={(e) => setDraft(e.target.value)}
-        onFocus={(e) => e.target.select()}
-        onBlur={() => {
-          setTimeout(() => {
-            setEditing(false);
-            setError(null);
-            setDraft(staffName ?? '');
-          }, 150);
+      <SearchableDropdown
+        open={editing}
+        setOpen={(o) => {
+          if (!o) cancel();
         }}
-        onKeyDown={(e) => {
-          if (e.key === 'Enter') commit();
-          else if (e.key === 'Escape') {
-            setEditing(false);
-            setError(null);
-            setDraft(staffName ?? '');
-          }
-        }}
-        disabled={state === 'saving'}
-        className={INPUT_BASE}
+        options={dropdownOptions}
+        draft={draft}
+        setDraft={setDraft}
+        onPick={(key) => pickById(Number(key))}
+        onCancel={cancel}
+        onCommitDraft={commitDraft}
         placeholder={`type to search… (${options.length} staff)`}
+        saving={state === 'saving'}
       />
-      <div
-        className="absolute left-0 right-0 top-full mt-1 max-h-64 overflow-y-auto bg-white border border-gray-300 rounded shadow-xl z-30"
-        style={{ backgroundColor: '#ffffff' }}
-      >
-        {filtered.length === 0 ? (
-          <div className="px-3 py-2 text-xs text-gray-400 bg-white">No matches</div>
-        ) : (
-          filtered.slice(0, 200).map((o) => {
-            const isCurrent = o.id === staffId;
-            return (
-              <div
-                key={o.id}
-                onMouseDown={(e) => {
-                  e.preventDefault();
-                  pick(o);
-                }}
-                className={`px-3 py-1.5 text-sm cursor-pointer bg-white hover:bg-blue-50 ${
-                  isCurrent ? 'bg-blue-100 font-medium' : ''
-                }`}
-              >
-                {o.name}
-              </div>
-            );
-          })
-        )}
-        {filtered.length > 200 && (
-          <div className="px-3 py-1.5 text-xs text-gray-400 border-t border-gray-100 bg-white">
-            … and {filtered.length - 200} more. Refine the search.
-          </div>
-        )}
-      </div>
       <ErrorTooltip error={error} />
     </div>
   );
