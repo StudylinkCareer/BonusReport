@@ -468,6 +468,13 @@ export default function ReviewPage() {
 
   // --- Cell save handler --------------------------------------------------
   // PATCHes one or more fields on one case and updates the row in state.
+  //
+  // Defensive: after a 200 response, verify that every requested field is
+  // actually reflected in the returned Case. If not, the backend has
+  // silently dropped the update (a known failure mode — certain rows
+  // refuse edits without flagging an error). We throw so the cell rolls
+  // back its optimistic state and surfaces an error tooltip, rather than
+  // letting the cell quietly revert to "—" with no explanation.
   const saveCase = useCallback(
     async (caseId: number, updates: Record<string, unknown>) => {
       const r = await fetch(`/api/cases/${caseId}`, {
@@ -486,6 +493,33 @@ export default function ReviewPage() {
         throw new Error(detail);
       }
       const updated = (await r.json()) as Case;
+
+      // Detect silent rejections — request says X, response says not-X.
+      // Only validate scalar fields (string | number | null | boolean). Skip
+      // arrays/objects (those are handled by dedicated endpoints anyway).
+      const mismatches: string[] = [];
+      for (const [key, expected] of Object.entries(updates)) {
+        if (
+          expected !== null &&
+          typeof expected !== 'string' &&
+          typeof expected !== 'number' &&
+          typeof expected !== 'boolean'
+        ) {
+          continue;
+        }
+        const actual = (updated as unknown as Record<string, unknown>)[key];
+        if (actual !== expected) {
+          mismatches.push(
+            `${key}: sent ${JSON.stringify(expected)}, server returned ${JSON.stringify(actual)}`,
+          );
+        }
+      }
+      if (mismatches.length > 0) {
+        throw new Error(
+          `Server accepted the request but did not apply the change. ${mismatches.join('; ')}.`,
+        );
+      }
+
       setCases((prev) => prev.map((c) => (c.id === caseId ? updated : c)));
     },
     [],
