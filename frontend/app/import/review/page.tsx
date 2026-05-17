@@ -1748,12 +1748,23 @@ function CasesTable({
         id: 'targets_name',
         header: 'Targets Name',
         accessorFn: (row) => row.targets_name ?? '',
-        size: 160,
+        size: 180,
         cell: ({ row }) => {
           const c = row.original;
+          // Pick from the staff list. Stored as the name string (not a FK),
+          // mirroring how the source CRM record carries it. Filter out blank
+          // names and dedupe to keep the dropdown clean.
+          const staffNames = Array.from(
+            new Set(
+              refData.staff_all
+                .map((s) => s.name ?? '')
+                .filter((n) => n.trim().length > 0),
+            ),
+          ).sort();
           return (
-            <TextCell
+            <SelectCell
               value={c.targets_name}
+              options={staffNames}
               onSave={(v) => onSave(c.id, { targets_name: v })}
             />
           );
@@ -2491,8 +2502,15 @@ function CaseCard({
           />
         </Field>
         <Field label="Targets Name">
-          <TextCell
+          <SelectCell
             value={c.targets_name}
+            options={Array.from(
+              new Set(
+                refData.staff_all
+                  .map((s) => s.name ?? '')
+                  .filter((n) => n.trim().length > 0),
+              ),
+            ).sort()}
             onSave={(v) => save({ targets_name: v })}
           />
         </Field>
@@ -2902,13 +2920,19 @@ function SearchableDropdown({
                     ref={(node) => {
                       listRef.current[i] = node;
                     }}
-                    role="option"
                     aria-selected={opt.isCurrent}
                     className={`px-3 py-1.5 text-sm cursor-pointer ${
                       isActive ? 'bg-blue-50' : 'bg-white'
                     } ${opt.isCurrent ? 'font-medium' : ''}`}
-                    onClick={() => onPick(opt.key)}
-                    {...getItemProps()}
+                    {...getItemProps({
+                      // IMPORTANT: pass onClick THROUGH getItemProps so it
+                      // composes with Floating UI's internal handlers.
+                      // Putting onClick directly on the div AFTER the spread
+                      // works; putting it BEFORE the spread (or relying on
+                      // spread order) is the canonical gotcha — getItemProps
+                      // can return its own onClick and overwrite yours.
+                      onClick: () => onPick(opt.key),
+                    })}
                   >
                     {opt.label}
                   </div>
