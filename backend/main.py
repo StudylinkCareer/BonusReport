@@ -30,6 +30,7 @@ from backend.data.connection import get_connection
 from backend.engine_runner.api_runner import (
     AmendmentWindowExpiredError,
     NoLivePaymentsToReverseError,
+    reverse_only_api,
     run_engine_api,
     run_engine_cascade_api,
 )
@@ -2072,6 +2073,127 @@ def list_reversal_reasons() -> dict:
             cur.execute(sql)
             rows = [dict(r) for r in cur.fetchall()]
     return {"reasons": rows}
+
+
+@app.post("/api/bonus/reverse-only")
+def reverse_only(body: dict = Body(default_factory=dict)) -> dict:
+    """
+    Phase 13e — Reverse a staff's bonus payments for one period AND move
+    the affected cases back to workflow_state 'submitted' so they can be
+    edited and re-closed. Does NOT re-run the engine.
+
+    This is the standard reversal flow: Finance flags a disagreement →
+    cases go back to QM/Case Officer for review → after corrections, cases
+    re-close → bonus engine runs again (via /api/engine/run).
+
+    Request body (JSON):
+        {
+          "year": 2024,
+          "month": 1,
+          "trigger_staff_id": 9,
+          "reversed_by_acting_as": "persona:finance_officer",
+          "reason_code": "DISAGREEMENT",
+          "notes": "Spot-check on partner X bonus tier"  // optional
+        }
+
+    Response:
+        {
+          "year": int, "month": int,
+          "trigger_staff_id": int,
+          "reversal_id": int,
+          "payment_count": int,
+          "total_reversed_amount": int,
+          "cases_unlocked": int,
+        }
+
+    Errors:
+        400 — bad year/month/staff_id/acting_as_key/reason_code/notes
+        403 — acting_as_key not in ref_amendment_authorised_persona
+        409 — amendment window expired OR no live payments to reverse
+        500 — engine raised mid-operation (DB rolled back)
+    """
+    year = body.get("year")
+    month = body.get("month")
+    trigger_staff_id = body.get("trigger_staff_id")
+    reversed_by_acting_as = body.get("reversed_by_acting_as")
+    reason_code = body.get("reason_code")
+    notes = body.get("notes")
+
+    # Basic type/range validation — matches /api/engine/run style
+    if not isinstance(year, int) or not isinstance(month, int):
+        raise HTTPException(400, "year and month must be integers")
+    if not (2020 <= year <= 2099):
+        raise HTTPException(400, "year out of range (2020–2099)")
+    if not (1 <= month <= 12):
+        raise HTTPException(400, "month must be 1–12")
+    if not isinstance(trigger_staff_id, int) or trigger_staff_id < 1:
+        raise HTTPException(400, "trigger_staff_id must be a positive integer")
+    if not isinstance(reversed_by_acting_as, str) or not reversed_by_acting_as.strip():
+        raise HTTPException(400, "reversed_by_acting_as must be a non-empty string")
+    if not isinstance(reason_code, str) or not reason_code.strip():
+        raise HTTPException(400, "reason_code must be a non-empty string")
+    if notes is not None and not isinstance(notes, str):
+        raise HTTPException(400, "notes must be a string or null")
+
+    # Authorisation gate — guard BEFORE DB writes
+    auth_sql = """
+        SELECT 1
+          FROM ref_amendment_authorised_persona
+         WHERE acting_as_key = %s
+           AND active = true
+    """
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(auth_sql, (reversed_by_acting_as,))
+            if cur.fetchone() is None:
+                raise HTTPException(
+                    403,
+                    f"acting-as key '{reversed_by_acting_as}' is not authorised "
+                    f"to reverse bonus runs",
+                )
+
+    # Reason code validation
+    if reason_code == "CASCADE_FROM_PRIORITY_IMPACT":
+        raise HTTPException(
+            400,
+            "reason_code 'CASCADE_FROM_PRIORITY_IMPACT' is reserved for the "
+            "cascade orchestrator and cannot be used as a user-selected reason",
+        )
+    reason_check_sql = """
+        SELECT 1
+          FROM ref_reversal_reason
+         WHERE code = %s
+           AND active = true
+    """
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(reason_check_sql, (reason_code,))
+            if cur.fetchone() is None:
+                raise HTTPException(
+                    400,
+                    f"unknown reason_code '{reason_code}' "
+                    f"(see GET /api/bonus/reverse/reasons for valid codes)",
+                )
+
+    try:
+        return reverse_only_api(
+            year=year,
+            month=month,
+            trigger_staff_id=trigger_staff_id,
+            reversed_by_acting_as=reversed_by_acting_as,
+            reason_code=reason_code,
+            notes=notes,
+        )
+    except AmendmentWindowExpiredError as exc:
+        raise HTTPException(409, str(exc))
+    except NoLivePaymentsToReverseError as exc:
+        raise HTTPException(409, str(exc))
+    except Exception as exc:
+        traceback.print_exc()
+        raise HTTPException(
+            500,
+            f"Reverse-only failed: {type(exc).__name__}: {exc}",
+        )
 
 
 @app.post("/api/bonus/reverse-and-rerun-cascade")

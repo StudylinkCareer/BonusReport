@@ -144,6 +144,7 @@ def _reverse_staff_payments(
     reason_code: str,
     notes: str | None,
     amendment_window_days: int,
+    unlock_cases: bool = False,
 ) -> dict[str, Any]:
     """Reverse all live tx_bonus_payment rows for (staff, run_year, run_month).
 
@@ -157,11 +158,24 @@ def _reverse_staff_payments(
          AmendmentWindowExpiredError.
       4. INSERT tx_bonus_reversal row.
       5. UPDATE tx_bonus_payment rows to flag with reversal_id + reversed_at.
+      6. (Optional) If unlock_cases=True: UPDATE tx_case for cases touched by
+         the reversed payments, setting workflow_state from 'closed' back to
+         'submitted' so QM/Case Officer can edit and re-close.
 
     Carry-over balance state from the reversed run is NOT undone here —
-    the next persist_payments call (in the re-run) will wipe and recreate
-    its carry-over state via the existing DELETE/UPDATE logic, since those
-    scope by withheld_run_year/month and released_run_year/month.
+    if the caller subsequently re-runs the engine (cascade mode), the
+    persist_payments call will wipe and recreate carry-over state via the
+    existing DELETE/UPDATE logic scoped by withheld_run_year/month and
+    released_run_year/month. For reverse-only mode (unlock_cases=True, no
+    re-run), the carry-over state stays as-is — re-running later will
+    re-sync it.
+
+    Args:
+        unlock_cases: when True, also moves tx_case rows whose case_id is
+            referenced by the reversed payment rows back to workflow_state
+            'submitted' (only if they are currently 'closed' — defensive
+            filter against partial states). Used by the reverse-only flow.
+            Defaults to False so the cascade flow leaves cases alone.
 
     Returns:
         {
@@ -169,6 +183,7 @@ def _reverse_staff_payments(
           "payment_count": int,
           "total_reversed_amount": int,
           "first_run_at": ISO timestamp,
+          "cases_unlocked": int,   # 0 when unlock_cases=False
         }
     """
     # Step 1: Aggregate live rows
@@ -242,11 +257,37 @@ def _reverse_staff_payments(
         (reversal_id, run_year, run_month, staff_id),
     )
 
+    # Step 5 (optional): Unlock cases back to 'submitted'.
+    # We look up all distinct case_ids touched by the rows we just reversed
+    # (i.e. those that now have our new reversal_id), and only flip cases
+    # that are currently 'closed' — defensive filter against any case that
+    # may have already moved to another state (e.g. another concurrent
+    # reversal). Bypasses /api/cases/transition validation deliberately —
+    # this is an admin-triggered audit action.
+    cases_unlocked = 0
+    if unlock_cases:
+        cursor.execute(
+            """
+            UPDATE tx_case
+               SET workflow_state = 'submitted',
+                   updated_at     = NOW()
+             WHERE id IN (
+                 SELECT DISTINCT case_id
+                   FROM tx_bonus_payment
+                  WHERE reversal_id = %s
+             )
+               AND workflow_state = 'closed'
+            """,
+            (reversal_id,),
+        )
+        cases_unlocked = cursor.rowcount
+
     return {
         "reversal_id": reversal_id,
         "payment_count": row_count,
         "total_reversed_amount": total_gross,
         "first_run_at": first_run_at.isoformat(),
+        "cases_unlocked": cases_unlocked,
     }
 
 
@@ -528,6 +569,95 @@ def run_engine_api(
             conn.commit()
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# Public: reverse_only_api (Phase 13e)
+# ---------------------------------------------------------------------------
+
+def reverse_only_api(
+    *,
+    year: int,
+    month: int,
+    trigger_staff_id: int,
+    reversed_by_acting_as: str,
+    reason_code: str,
+    notes: str | None = None,
+) -> dict[str, Any]:
+    """
+    Phase 13e — Reverse a staff's bonus payments for one period AND move the
+    affected cases back to workflow_state 'submitted' so QM / Case Officer
+    can edit them and re-close. Does NOT re-run the engine.
+
+    This is the standard reversal flow when Finance disagrees with a bonus
+    calculation. After this call:
+      - Old payment rows are flagged with reversal_id (kept for audit).
+      - Cases that were referenced by those payments move from 'closed' to
+        'submitted' — they appear in the Submitted pillar and are editable.
+      - No new payment rows are produced.
+      - The priority quota tracker is NOT touched; re-running the engine
+        later will re-sync it from the resubmitted case data.
+
+    Atomic: the reversal + unlock happens in a single transaction. If
+    anything fails, both roll back.
+
+    Args:
+        year, month:           run period (month 1-12).
+        trigger_staff_id:      the staff whose payments + cases get reversed.
+        reversed_by_acting_as: actingAsKey from frontend role.ts (e.g.
+                               'persona:finance_officer'). The caller (the
+                               FastAPI endpoint) is responsible for verifying
+                               this key is in ref_amendment_authorised_persona
+                               before invoking this function.
+        reason_code:           reversal reason code (must exist in
+                               ref_reversal_reason; caller validates).
+        notes:                 optional free-text notes for the audit log.
+
+    Returns:
+        {
+          "year": int, "month": int,
+          "trigger_staff_id": int,
+          "reversal_id": int,
+          "payment_count": int,           # rows flagged reversed
+          "total_reversed_amount": int,   # đ sum of reversed gross_bonus
+          "cases_unlocked": int,          # cases moved closed -> submitted
+        }
+
+    Raises:
+        ValueError if month is out of range.
+        AmendmentWindowExpiredError if first persist for this staff/period
+            is older than ref_setting.amendment_window_days.
+        NoLivePaymentsToReverseError if no live (un-reversed) payments
+            exist for this staff/period.
+    """
+    if not (1 <= month <= 12):
+        raise ValueError("month must be between 1 and 12")
+
+    with get_connection() as conn:
+        amendment_window_days = _get_amendment_window_days(conn)
+        with conn.cursor(row_factory=dict_row) as cursor:
+            reversal = _reverse_staff_payments(
+                cursor,
+                staff_id=trigger_staff_id,
+                run_year=year,
+                run_month=month,
+                reversed_by_acting_as=reversed_by_acting_as,
+                reason_code=reason_code,
+                notes=notes,
+                amendment_window_days=amendment_window_days,
+                unlock_cases=True,
+            )
+        conn.commit()
+
+    return {
+        "year": year,
+        "month": month,
+        "trigger_staff_id": trigger_staff_id,
+        "reversal_id": reversal["reversal_id"],
+        "payment_count": reversal["payment_count"],
+        "total_reversed_amount": reversal["total_reversed_amount"],
+        "cases_unlocked": reversal["cases_unlocked"],
+    }
 
 
 # ---------------------------------------------------------------------------

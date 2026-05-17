@@ -7,26 +7,28 @@
  * Per-staff bao cao view for one (year, month). One report per staff member
  * with cases in the period, switchable via a dropdown at the top.
  *
- * Phase 13d additions (this revision):
+ * Phase 13e additions (this revision):
  *   - "Reverse this run" button in each staff's sub-header.
- *   - ReverseModal — opens at the page level so a successful cascade can
- *     refresh the entire report (the cascade may touch other staff via the
- *     priority-quota impact propagation).
+ *   - ReverseModal — opens at the page level so the report can be refreshed
+ *     after the action completes (reversed cases leave the closed list).
  *   - Modal phases: loading dropdowns → form → submitting → result → error.
  *   - Auth gate: the modal reads useRole() / actingAsKey() and checks the
  *     current key against /api/bonus/reverse/authorised-keys before
  *     enabling the Confirm button. Unauthorised personas see a clear
- *     "switch your Acting As role to ..." message and the Confirm is
- *     disabled.
+ *     "switch your Acting As role to ..." message and Confirm is disabled.
  *   - Reason dropdown sourced from /api/bonus/reverse/reasons (excludes
  *     the system-only CASCADE_FROM_PRIORITY_IMPACT code).
- *   - Result panel shows: cascade_complete badge, iterations used,
- *     per-iteration reversals, per-iteration re-runs, any remaining
- *     priority impact warnings, any pending_unprocessed staff IDs when the
- *     iteration cap was hit.
+ *   - Behaviour (Phase 13e — reverse-only): clicking Reverse flags the
+ *     existing tx_bonus_payment rows as reversed (audit) AND moves the
+ *     affected tx_case rows back from 'closed' to 'submitted' so QM /
+ *     Case Officer can edit them. The engine does NOT re-run — after the
+ *     cases are corrected and re-closed, the bonus engine must be run
+ *     again manually to produce fresh payments.
+ *   - Result panel shows: payments_reversed, total_reversed_amount,
+ *     cases_unlocked, next-steps guidance, reversal_id for audit trail.
  *
  * Data: GET /api/bonus/reports/{year}/{month}
- * Action: POST /api/bonus/reverse-and-rerun-cascade
+ * Action: POST /api/bonus/reverse-only
  */
 
 import { use, useCallback, useEffect, useMemo, useState } from 'react';
@@ -102,56 +104,14 @@ type ReversalReason = {
   notes: string | null;
 };
 
-type CascadeReversal = {
-  iteration: number;
-  staff_id: number;
-  staff_name: string;
-  reversal_id: number;
-  reason_code: string;
-  payment_count: number;
-  total_reversed_amount: number;
-};
-
-type CascadeRerun = {
-  iteration: number;
-  staff_id: number;
-  staff_name: string;
-  total_cases: number;
-  adapted: number;
-  skipped: Array<{ contract_id: string; reason: string }>;
-  errored: Array<{ contract_id: string; error: string; phase: string }>;
-  payment_count: number;
-  gross_total: number;
-  net_total: number;
-};
-
-type AffectedPayment = {
-  staff_id: number;
-  staff_name: string;
-  case_count: number;
-  total_priority_bonus: number;
-};
-
-type PriorityWarning = {
-  partner_name: string;
-  priority_list_institution_id: number;
-  institution_id: number;
-  count_delta_direct: number;
-  count_delta_sub: number;
-  potentially_affected_payments: AffectedPayment[];
-};
-
-type CascadeResponse = {
+type ReverseOnlyResponse = {
   year: number;
   month: number;
   trigger_staff_id: number;
-  max_iterations: number;
-  iterations_used: number;
-  cascade_complete: boolean;
-  reversals: CascadeReversal[];
-  reruns: CascadeRerun[];
-  final_warnings: PriorityWarning[];
-  pending_unprocessed: number[];
+  reversal_id: number;
+  payment_count: number;
+  total_reversed_amount: number;
+  cases_unlocked: number;
 };
 
 // ---------------------------------------------------------------------------
@@ -604,7 +564,7 @@ function ReverseModal({
   const [reasons, setReasons] = useState<ReversalReason[]>([]);
   const [selectedReason, setSelectedReason] = useState<string>('');
   const [notes, setNotes] = useState<string>('');
-  const [result, setResult] = useState<CascadeResponse | null>(null);
+  const [result, setResult] = useState<ReverseOnlyResponse | null>(null);
   const [errorMsg, setErrorMsg] = useState<string>('');
 
   // Lazy-fetch the two dropdowns when the modal opens
@@ -644,7 +604,7 @@ function ReverseModal({
     if (!selectedReason || !isAuthorised) return;
     setPhase('submitting');
     try {
-      const res = await fetch('/api/bonus/reverse-and-rerun-cascade', {
+      const res = await fetch('/api/bonus/reverse-only', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -652,7 +612,7 @@ function ReverseModal({
           month,
           trigger_staff_id: staff.staff_id,
           reversed_by_acting_as: currentKey,
-          initial_reason_code: selectedReason,
+          reason_code: selectedReason,
           notes: notes.trim() || null,
         }),
       });
@@ -669,7 +629,7 @@ function ReverseModal({
         }
         throw new Error(`HTTP ${res.status} — ${detail}`);
       }
-      const data: CascadeResponse = await res.json();
+      const data: ReverseOnlyResponse = await res.json();
       setResult(data);
       setPhase('result');
     } catch (e) {
@@ -726,18 +686,21 @@ function ReverseModal({
           {phase === 'submitting' && (
             <div className="py-8 text-center">
               <div className="text-sm text-gray-700 mb-1">
-                Running cascade…
+                Reversing…
               </div>
               <div className="text-xs text-gray-500">
-                Reverses {staff.staff_name}'s payments, re-runs the engine,
-                and propagates to any other staff with affected priority
-                bonuses. This may take 10–30 seconds.
+                Flagging {staff.staff_name}'s payments as reversed and
+                moving their cases back to the Submitted pillar for editing.
               </div>
             </div>
           )}
 
           {phase === 'result' && result && (
-            <ResultView result={result} onDone={onComplete} />
+            <ResultView
+              result={result}
+              staffName={staff.staff_name ?? `#${staff.staff_id}`}
+              onDone={onComplete}
+            />
           )}
 
           {phase === 'error' && (
@@ -855,12 +818,12 @@ function ReverseForm({
 
       <div className="rounded border border-blue-200 bg-blue-50 px-3 py-2 text-xs text-blue-900">
         <strong>What happens:</strong> The current bonus payments for this
-        staff/period are flagged reversed in the audit log, then the engine
-        re-runs for this staff. If the re-run changes the priority quota
-        tracker in ways that affect other staff's live priority bonuses,
-        those staff get auto-reversed and re-run too, with reason{' '}
-        <code className="bg-white px-1 rounded">CASCADE_FROM_PRIORITY_IMPACT</code>.
-        All within one transaction.
+        staff/period are flagged reversed in the audit log, and their cases
+        move from <code className="bg-white px-1 rounded">closed</code> back
+        to <code className="bg-white px-1 rounded">submitted</code> so QM /
+        Case Officer can edit them. The engine does <em>not</em> re-run —
+        after the cases are corrected and re-closed, run the engine again
+        manually to produce fresh payments.
       </div>
 
       <div className="flex items-center justify-end gap-2 pt-2 border-t">
@@ -877,7 +840,7 @@ function ReverseForm({
           disabled={!isAuthorised || !selectedReason}
           className="rounded bg-amber-600 px-4 py-1.5 text-sm font-medium text-white hover:bg-amber-700 disabled:bg-gray-300 disabled:cursor-not-allowed"
         >
-          Reverse &amp; Re-run
+          Reverse run
         </button>
       </div>
     </div>
@@ -886,158 +849,77 @@ function ReverseForm({
 
 function ResultView({
   result,
+  staffName,
   onDone,
 }: {
-  result: CascadeResponse;
+  result: ReverseOnlyResponse;
+  staffName: string;
   onDone: () => void;
 }) {
   return (
     <div className="space-y-4 text-sm">
-      {/* Top status banner */}
-      {result.cascade_complete ? (
-        <div className="rounded border border-emerald-200 bg-emerald-50 px-4 py-3">
-          <div className="font-semibold text-emerald-800">
-            ✓ Cascade complete
-          </div>
-          <div className="text-xs text-emerald-900 mt-0.5">
-            {result.iterations_used} iteration
-            {result.iterations_used === 1 ? '' : 's'}.{' '}
-            {result.reversals.length} staff reversed and re-run.
-          </div>
+      <div className="rounded border border-emerald-200 bg-emerald-50 px-4 py-3">
+        <div className="font-semibold text-emerald-800">
+          ✓ Reversal complete
         </div>
-      ) : (
-        <div className="rounded border border-amber-300 bg-amber-50 px-4 py-3">
-          <div className="font-semibold text-amber-900">
-            ⚠ Cascade incomplete — iteration limit reached
-          </div>
-          <div className="text-xs text-amber-900 mt-0.5">
-            Used {result.iterations_used} of {result.max_iterations}{' '}
-            iterations. {result.pending_unprocessed.length} staff still
-            pending: {result.pending_unprocessed.join(', ')}
-          </div>
+        <div className="text-xs text-emerald-900 mt-0.5">
+          {staffName}'s bonus run has been reversed. Affected cases are now
+          back in the Submitted pillar and editable by QM / Case Officer.
         </div>
-      )}
+      </div>
 
-      {/* Reversals */}
-      {result.reversals.length > 0 && (
-        <div>
-          <h4 className="text-xs font-medium text-gray-600 uppercase tracking-wide mb-1.5">
-            Reversals ({result.reversals.length})
-          </h4>
-          <div className="rounded border divide-y">
-            {result.reversals.map((rv) => (
-              <div
-                key={rv.reversal_id}
-                className="px-3 py-2 text-xs flex items-center justify-between"
-              >
-                <div>
-                  <span className="font-medium">{rv.staff_name}</span>
-                  <span className="text-gray-500">
-                    {' '}— iter {rv.iteration} ·{' '}
-                  </span>
-                  <code className="bg-gray-100 px-1 rounded text-[10px]">
-                    {rv.reason_code}
-                  </code>
-                </div>
-                <div className="text-right">
-                  <div>
-                    {rv.payment_count} payment
-                    {rv.payment_count === 1 ? '' : 's'}
-                  </div>
-                  <div className="text-gray-500">
-                    {fmtVnd(rv.total_reversed_amount)} đ reversed
-                  </div>
-                </div>
-              </div>
-            ))}
+      <div className="grid grid-cols-3 gap-3">
+        <div className="rounded border px-3 py-2">
+          <div className="text-[11px] uppercase tracking-wide text-gray-500">
+            Payments reversed
+          </div>
+          <div className="text-lg font-semibold mt-0.5">
+            {result.payment_count}
           </div>
         </div>
-      )}
+        <div className="rounded border px-3 py-2">
+          <div className="text-[11px] uppercase tracking-wide text-gray-500">
+            Total reversed
+          </div>
+          <div className="text-lg font-semibold mt-0.5">
+            {fmtVnd(result.total_reversed_amount)} đ
+          </div>
+        </div>
+        <div className="rounded border px-3 py-2">
+          <div className="text-[11px] uppercase tracking-wide text-gray-500">
+            Cases unlocked
+          </div>
+          <div className="text-lg font-semibold mt-0.5">
+            {result.cases_unlocked}
+          </div>
+        </div>
+      </div>
 
-      {/* Re-runs */}
-      {result.reruns.length > 0 && (
-        <div>
-          <h4 className="text-xs font-medium text-gray-600 uppercase tracking-wide mb-1.5">
-            Re-runs ({result.reruns.length})
-          </h4>
-          <div className="rounded border divide-y">
-            {result.reruns.map((rr) => (
-              <div
-                key={`${rr.staff_id}-${rr.iteration}`}
-                className="px-3 py-2 text-xs"
-              >
-                <div className="flex items-center justify-between">
-                  <div>
-                    <span className="font-medium">{rr.staff_name}</span>
-                    <span className="text-gray-500">
-                      {' '}— iter {rr.iteration} · {rr.total_cases} case
-                      {rr.total_cases === 1 ? '' : 's'} · {rr.adapted} adapted
-                    </span>
-                  </div>
-                  <div className="text-right">
-                    <div>
-                      {rr.payment_count} payment
-                      {rr.payment_count === 1 ? '' : 's'}
-                    </div>
-                    <div className="text-gray-500">
-                      gross {fmtVnd(rr.gross_total)} · net{' '}
-                      {fmtVnd(rr.net_total)} đ
-                    </div>
-                  </div>
-                </div>
-                {(rr.skipped.length > 0 || rr.errored.length > 0) && (
-                  <div className="mt-1 text-[11px] text-gray-500">
-                    {rr.skipped.length > 0 &&
-                      `${rr.skipped.length} skipped`}
-                    {rr.skipped.length > 0 && rr.errored.length > 0 && ' · '}
-                    {rr.errored.length > 0 &&
-                      `${rr.errored.length} errored`}
-                  </div>
-                )}
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
+      <div className="rounded border border-blue-200 bg-blue-50 px-3 py-2 text-xs text-blue-900">
+        <strong>Next steps:</strong>
+        <ol className="mt-1 ml-4 list-decimal space-y-0.5">
+          <li>
+            Go to the{' '}
+            <Link
+              href="/pillars/submitted"
+              className="underline font-medium hover:text-blue-700"
+            >
+              Submitted pillar
+            </Link>{' '}
+            to find {staffName}'s unlocked cases.
+          </li>
+          <li>Edit the case data as needed; QM re-closes when satisfied.</li>
+          <li>
+            Once cases are re-closed, run the bonus engine again for this
+            period to produce fresh payments.
+          </li>
+        </ol>
+      </div>
 
-      {/* Remaining warnings */}
-      {result.final_warnings.length > 0 && (
-        <div>
-          <h4 className="text-xs font-medium text-gray-600 uppercase tracking-wide mb-1.5">
-            Remaining priority impact warnings ({result.final_warnings.length})
-          </h4>
-          <div className="rounded border border-amber-200 bg-amber-50 divide-y divide-amber-200">
-            {result.final_warnings.map((w) => (
-              <div
-                key={w.priority_list_institution_id}
-                className="px-3 py-2 text-xs"
-              >
-                <div className="font-medium text-amber-900">
-                  {w.partner_name}
-                </div>
-                <div className="text-amber-800 text-[11px]">
-                  Δ direct: {w.count_delta_direct >= 0 ? '+' : ''}
-                  {w.count_delta_direct} · Δ sub:{' '}
-                  {w.count_delta_sub >= 0 ? '+' : ''}
-                  {w.count_delta_sub}
-                  {w.potentially_affected_payments.length > 0 && (
-                    <>
-                      {' '}· still touching:{' '}
-                      {w.potentially_affected_payments
-                        .map((p) => `${p.staff_name} (${p.case_count})`)
-                        .join(', ')}
-                    </>
-                  )}
-                </div>
-              </div>
-            ))}
-          </div>
-          <p className="mt-1 text-[11px] text-gray-500 italic">
-            These warnings persisted after the cascade exhausted its
-            iterations. Manual review may be needed.
-          </p>
-        </div>
-      )}
+      <div className="text-[11px] text-gray-500">
+        Reversal ID: <span className="font-mono">{result.reversal_id}</span> ·
+        kept in <code>tx_bonus_reversal</code> for audit.
+      </div>
 
       <div className="flex items-center justify-end pt-2 border-t">
         <button
