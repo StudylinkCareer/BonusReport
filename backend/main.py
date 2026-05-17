@@ -1246,6 +1246,394 @@ def list_bonus_payments(
 
 
 # ===========================================================================
+# Per-staff bao cao reports (Phase 16)
+# ===========================================================================
+
+@app.get("/api/bonus/periods")
+def list_bonus_periods() -> list[dict]:
+    """All (run_year, run_month) periods present in tx_case, ordered most-
+    recent-first. Each row carries:
+      - case_count: distinct non-SCRAP cases
+      - staff_count: distinct staff appearing in any role (counsellor, CO,
+        pre-sales)
+      - total_net_payable: SUM of net_payable from tx_bonus_payment (0 if
+        engine has not yet run for the period)
+      - has_engine_output: TRUE iff at least one tx_bonus_payment row
+        exists for the period
+
+    Drives the /bonus index page. Periods with no engine output still
+    appear so users can see uploaded-but-uncalculated months.
+    """
+    sql = """
+        WITH period_summary AS (
+            SELECT
+                c.run_year,
+                c.run_month,
+                COUNT(DISTINCT c.id)::int AS case_count
+              FROM tx_case c
+             WHERE c.import_status IS DISTINCT FROM 'SCRAP'
+               AND c.run_year IS NOT NULL
+               AND c.run_month IS NOT NULL
+             GROUP BY c.run_year, c.run_month
+        ),
+        period_staff AS (
+            SELECT run_year, run_month, counsellor_staff_id AS staff_id
+              FROM tx_case
+             WHERE counsellor_staff_id IS NOT NULL
+               AND import_status IS DISTINCT FROM 'SCRAP'
+               AND run_year IS NOT NULL AND run_month IS NOT NULL
+            UNION
+            SELECT run_year, run_month, case_officer_staff_id AS staff_id
+              FROM tx_case
+             WHERE case_officer_staff_id IS NOT NULL
+               AND import_status IS DISTINCT FROM 'SCRAP'
+               AND run_year IS NOT NULL AND run_month IS NOT NULL
+            UNION
+            SELECT run_year, run_month, pre_sales_staff_id AS staff_id
+              FROM tx_case
+             WHERE pre_sales_staff_id IS NOT NULL
+               AND import_status IS DISTINCT FROM 'SCRAP'
+               AND run_year IS NOT NULL AND run_month IS NOT NULL
+        ),
+        period_staff_count AS (
+            SELECT run_year, run_month, COUNT(DISTINCT staff_id)::int AS staff_count
+              FROM period_staff
+             GROUP BY run_year, run_month
+        ),
+        period_bonus AS (
+            SELECT
+                run_year,
+                run_month,
+                COALESCE(SUM(net_payable), 0)::bigint AS total_net_payable,
+                COUNT(*)::int                         AS payment_count
+              FROM tx_bonus_payment
+             GROUP BY run_year, run_month
+        )
+        SELECT
+            ps.run_year,
+            ps.run_month,
+            ps.case_count,
+            COALESCE(psc.staff_count, 0)              AS staff_count,
+            COALESCE(pb.total_net_payable, 0)         AS total_net_payable,
+            COALESCE(pb.payment_count, 0) > 0         AS has_engine_output
+          FROM period_summary       ps
+          LEFT JOIN period_staff_count psc
+                 ON ps.run_year = psc.run_year AND ps.run_month = psc.run_month
+          LEFT JOIN period_bonus pb
+                 ON ps.run_year = pb.run_year  AND ps.run_month = pb.run_month
+         ORDER BY ps.run_year DESC, ps.run_month DESC
+    """
+    with get_connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(sql)
+            return list(cur.fetchall())
+
+
+# ---- Per-staff bao cao helpers (Phase 16) --------------------------------
+# These are templated/approximate Vietnamese phrases used for the
+# Note BONUS Enrolled and Note BONUS Priority columns. The intent is to
+# look like the bao cao output, not to be policy-correct. A future phase
+# will replace these by strings emitted directly by the engine into
+# tx_bonus_payment.calc_notes.
+
+_ENROLLED_NOTE_BY_STATUS = {
+    "Closed - Cancelled":                    "Hồ sơ hủy. Bonus mức = 0.",
+    "Closed - Visa refused":                 "Visa từ chối. Bonus mức = 0.",
+    "Closed - Visa granted":                 "Đã có visa, chưa nhập học.",
+    "Closed - Enrolled":                     "Đã nhập học. Nhận bonus mức 'Enrolled'.",
+    "Closed - Enrolled, then Visa granted":  "Nhập học rồi có visa. Nhận bonus mức 'Enrolled, then Visa granted'.",
+    "Closed - Visa granted, then enrolled":  "Có visa rồi nhập học. Nhận bonus mức 'Visa granted, then enrolled'.",
+    "Current - Enrolled":                    "Đã nhập học, đang chờ visa. Nhận 50% bonus mức 'Current - Enrolled'.",
+}
+
+# Bao cao display order. Statuses not in this list are appended at the end.
+_SECTION_ORDER = [
+    "Closed - Visa granted, then enrolled",
+    "Closed - Enrolled, then Visa granted",
+    "Closed - Enrolled",
+    "Current - Enrolled",
+    "Closed - Visa granted",
+    "Closed - Visa refused",
+    "Closed - Cancelled",
+]
+
+_TIER_LABEL = {
+    "UNDER":  "Under target",
+    "TARGET": "Hit target",
+    "OVER":   "Over target (all cases)",
+}
+
+
+def _enrolled_note(status, bonus_enrolled, tier, target, actual, run_year, run_month):
+    base = _ENROLLED_NOTE_BY_STATUS.get(status or "", f"Status: {status or '?'}")
+    if bonus_enrolled > 0 and tier and target is not None and actual is not None:
+        tier_lbl = _TIER_LABEL.get(tier, tier)
+        base += (f" Tháng {run_month:02d}/{run_year}, chỉ tiêu {target}. "
+                 f"Đạt {actual}. Tier: {tier_lbl}.")
+    return base
+
+
+def _priority_note(institution_name, bonus_priority):
+    if bonus_priority == 0:
+        return ""
+    if not institution_name:
+        return "Priority bonus áp dụng."
+    return f"Thêm bonus Priority cho Trường {institution_name}."
+
+
+def _section_sort_key(section_name: str):
+    try:
+        return (_SECTION_ORDER.index(section_name), section_name)
+    except ValueError:
+        return (999, section_name)
+
+
+@app.get("/api/bonus/reports/{year}/{month}")
+def per_staff_bao_cao(
+    year: int = PathParam(..., ge=2020, le=2099),
+    month: int = PathParam(..., ge=1, le=12),
+) -> dict:
+    """Per-staff bao cao-format report data for one (year, month).
+
+    Returns one report per staff member who has any role on any case in
+    the period. Each staff's report is sectioned by application_status
+    (bao cao style) and includes templated Vietnamese justification notes
+    for the BONUS Enrolled and BONUS Priority columns.
+
+    Data sourcing:
+      - Cases come from tx_case (so zero-bonus cases appear even if the
+        engine has not yet written a tx_bonus_payment row for them).
+      - Bonus amounts come from tx_bonus_payment when present, 0 otherwise.
+      - SCRAP cases are excluded.
+
+    Response shape:
+        {
+          "year": 2023,
+          "month": 10,
+          "staff_reports": [
+            {
+              "staff_id": 9,
+              "staff_name": "Phạm Thị Lợi",
+              "role_code": "CO_SUB",
+              "office_code": "DN",
+              "sections": [
+                {
+                  "section_name": "Closed - Visa granted, then enrolled",
+                  "cases": [ { no, contract_id, student_name, ..., bonus_enrolled,
+                               note_bonus_enrolled, bonus_priority,
+                               note_bonus_priority } ],
+                  "subtotal_enrolled": 11000000,
+                  "subtotal_priority":  1485000
+                }, ...
+              ],
+              "total_enrolled": 17300000,
+              "total_priority":  1485000,
+              "grand_total":    18785000
+            }, ...
+          ]
+        }
+    """
+    # --- 1. Pull every distinct (case, staff) pair for the period --------
+    # GROUP BY (case_id, staff_id) collapses the multi-role case (e.g.
+    # Lợi as both Counsellor AND CO on the same file) to a single row.
+    # slot_roles records WHICH roles she filled, joined with '/'.
+    sql = """
+        WITH case_staff_distinct AS (
+            SELECT
+                c.id                                AS case_id,
+                slot.staff_id                       AS slot_staff_id,
+                STRING_AGG(slot.role_code, '/' ORDER BY slot.role_code)
+                                                    AS slot_role
+              FROM tx_case c
+              CROSS JOIN LATERAL (
+                  VALUES
+                      (c.counsellor_staff_id,   'COUNSELLOR'),
+                      (c.case_officer_staff_id, 'CO'),
+                      (c.pre_sales_staff_id,    'PRESALES')
+              ) AS slot(staff_id, role_code)
+             WHERE c.run_year  = %s
+               AND c.run_month = %s
+               AND c.import_status IS DISTINCT FROM 'SCRAP'
+               AND slot.staff_id IS NOT NULL
+             GROUP BY c.id, slot.staff_id
+        )
+        SELECT
+            csd.case_id,
+            csd.slot_staff_id,
+            csd.slot_role,
+            c.contract_id,
+            c.student_name,
+            c.student_id,
+            c.contract_signed_date,
+            c.client_type_code,
+            c.application_status,
+            c.course_status,
+            c.visa_received_date,
+            c.course_start_date,
+            c.notes,
+            c.run_year,
+            c.run_month,
+            c.referring_agent_text_raw,
+            c.referring_source_type,
+            inst.canonical_name        AS institution_name,
+            cn.name                    AS country_name,
+            counsellor.canonical_name  AS counsellor_name,
+            co.canonical_name          AS case_officer_name,
+            partner.name               AS referring_partner_name,
+            sub_agent.canonical_name   AS referring_sub_agent_name,
+            s.canonical_name           AS staff_name,
+            r.code                     AS staff_role_code,
+            o.code                     AS staff_office_code,
+            bp.bonus_enrolled,
+            bp.bonus_priority,
+            bp.tier_for_period,
+            bp.target_for_period,
+            bp.actual_for_period
+          FROM case_staff_distinct csd
+          JOIN tx_case c ON csd.case_id = c.id
+          JOIN ref_staff s ON csd.slot_staff_id = s.id
+          LEFT JOIN dim_role        r          ON s.role_id              = r.id
+          LEFT JOIN dim_office      o          ON s.office_id            = o.id
+          LEFT JOIN ref_institution inst       ON c.institution_id       = inst.id
+          LEFT JOIN dim_country     cn         ON c.country_id           = cn.id
+          LEFT JOIN ref_staff       counsellor ON c.counsellor_staff_id  = counsellor.id
+          LEFT JOIN ref_staff       co         ON c.case_officer_staff_id = co.id
+          LEFT JOIN ref_partner     partner    ON c.referring_partner_id = partner.id
+          LEFT JOIN ref_sub_agent   sub_agent  ON c.referring_sub_agent_id = sub_agent.id
+          LEFT JOIN LATERAL (
+              SELECT
+                  COALESCE(SUM(bp.tier_bonus + bp.package_bonus
+                             + bp.addon_bonus + bp.flat_local_enrolment_bonus), 0)::bigint
+                                              AS bonus_enrolled,
+                  COALESCE(SUM(bp.priority_bonus), 0)::bigint
+                                              AS bonus_priority,
+                  MAX(bp.tier)                AS tier_for_period,
+                  MAX(bp.target)              AS target_for_period,
+                  MAX(bp.actual_enrolled)     AS actual_for_period
+                FROM tx_bonus_payment bp
+               WHERE bp.case_id   = csd.case_id
+                 AND bp.staff_id  = csd.slot_staff_id
+                 AND bp.run_year  = c.run_year
+                 AND bp.run_month = c.run_month
+          ) bp ON TRUE
+         ORDER BY s.canonical_name NULLS LAST,
+                  c.application_status NULLS LAST,
+                  c.contract_id
+    """
+
+    with get_connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(sql, [year, month])
+            rows = list(cur.fetchall())
+
+    # --- 2. Group: staff -> section -> case ------------------------------
+    by_staff: dict[int, dict] = {}
+    for row in rows:
+        sid = row["slot_staff_id"]
+        if sid not in by_staff:
+            by_staff[sid] = {
+                "staff_id":         sid,
+                "staff_name":       row["staff_name"],
+                "role_code":        row["staff_role_code"],
+                "office_code":      row["staff_office_code"],
+                "sections_by_name": {},
+                "total_enrolled":   0,
+                "total_priority":   0,
+            }
+        staff = by_staff[sid]
+
+        section_name = row["application_status"] or "(unknown status)"
+        if section_name not in staff["sections_by_name"]:
+            staff["sections_by_name"][section_name] = {
+                "section_name":      section_name,
+                "cases":             [],
+                "subtotal_enrolled": 0,
+                "subtotal_priority": 0,
+            }
+        section = staff["sections_by_name"][section_name]
+
+        bonus_e = int(row["bonus_enrolled"] or 0)
+        bonus_p = int(row["bonus_priority"] or 0)
+
+        # Refer-source: pick the first populated field in the bao cao's
+        # natural preference order (sub-agent → partner → free-text).
+        refer_source = (
+            row.get("referring_sub_agent_name")
+            or row.get("referring_partner_name")
+            or row.get("referring_agent_text_raw")
+            or ""
+        )
+
+        # In-system vs out-system display
+        rst = row.get("referring_source_type") or ""
+        system_type = "Ngoài hệ thống" if rst == "OUT_SYSTEM" else "Trong hệ thống"
+
+        case_payload = {
+            "case_id":             row["case_id"],
+            "contract_id":         row["contract_id"],
+            "student_name":        row["student_name"],
+            "student_id":          row["student_id"],
+            "signed_date":         row["contract_signed_date"].isoformat() if row["contract_signed_date"] else None,
+            "client_type":         row["client_type_code"],
+            "country":             row["country_name"],
+            "refer_source":        refer_source,
+            "system_type":         system_type,
+            "application_status":  row["application_status"],
+            "visa_date":           row["visa_received_date"].isoformat() if row["visa_received_date"] else None,
+            "institution":         row["institution_name"],
+            "course_start":        row["course_start_date"].isoformat() if row["course_start_date"] else None,
+            "course_status":       row["course_status"],
+            "counsellor":          row["counsellor_name"],
+            "co":                  row["case_officer_name"],
+            "notes":               row["notes"],
+            "slot_role":           row["slot_role"],
+            "bonus_enrolled":      bonus_e,
+            "note_bonus_enrolled": _enrolled_note(
+                row["application_status"], bonus_e,
+                row["tier_for_period"], row["target_for_period"],
+                row["actual_for_period"], year, month,
+            ),
+            "bonus_priority":      bonus_p,
+            "note_bonus_priority": _priority_note(row["institution_name"], bonus_p),
+        }
+
+        section["cases"].append(case_payload)
+        section["subtotal_enrolled"] += bonus_e
+        section["subtotal_priority"] += bonus_p
+        staff["total_enrolled"]      += bonus_e
+        staff["total_priority"]      += bonus_p
+
+    # --- 3. Materialise final structure ----------------------------------
+    staff_reports = []
+    for staff in by_staff.values():
+        sections = sorted(
+            staff["sections_by_name"].values(),
+            key=lambda s: _section_sort_key(s["section_name"]),
+        )
+        for section in sections:
+            for idx, case in enumerate(section["cases"], start=1):
+                case["no"] = idx
+        staff_reports.append({
+            "staff_id":       staff["staff_id"],
+            "staff_name":     staff["staff_name"],
+            "role_code":      staff["role_code"],
+            "office_code":    staff["office_code"],
+            "sections":       sections,
+            "total_enrolled": staff["total_enrolled"],
+            "total_priority": staff["total_priority"],
+            "grand_total":    staff["total_enrolled"] + staff["total_priority"],
+        })
+
+    staff_reports.sort(key=lambda r: ((r["staff_name"] or "").lower(), r["staff_id"]))
+
+    return {
+        "year":          year,
+        "month":         month,
+        "staff_reports": staff_reports,
+    }
+
+
+# ===========================================================================
 # Pillar counts — drives the 4-pillar home page tiles (Phase 15)
 # ===========================================================================
 

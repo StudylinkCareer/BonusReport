@@ -1,66 +1,86 @@
 'use client';
 
 /**
- * frontend/app/bonus/[year]/[month]/page.tsx
+ * SAVE TO: frontend/app/bonus/[year]/[month]/page.tsx
+ * (Full path: C:\Users\rhod_\Documents\BonusReport\Application\frontend\app\bonus\[year]\[month]\page.tsx)
  *
- * Bonus Report view — reads tx_bonus_payment rows for a (year, month)
- * via /api/bonus and renders a sortable/filterable table with summary
- * tiles. Single-page client component for now (no server-side fetch).
+ * REPLACES the prior flat-table viewer. This is the per-staff bao cao
+ * view — one report per staff member with cases in the period, switchable
+ * via a dropdown at the top.
  *
- * URL: /bonus/2024/11
+ * Each staff's report:
+ *   - Sub-header: "Báo cáo {name} — tháng {MM}/{YYYY}"
+ *   - Sections grouped by application_status (bao cao layout order)
+ *   - 21-column table per section, including BONUS Enrolled, Note BONUS
+ *     Enrolled, BONUS Priority, Note BONUS Priority
+ *   - Subtotal row at the bottom of each section
+ *   - TỔNG block at the bottom: Enrolled + Priority + Grand total
+ *
+ * Data: GET /api/bonus/reports/{year}/{month}
+ *
+ * NOTE: Vietnamese justification notes are templated/approximate. To be
+ * replaced by engine-emitted phrasing in a future phase.
  */
 
 import { use, useEffect, useMemo, useState } from 'react';
 import Link from 'next/link';
 
-type Payment = {
-  id: number;
+type Case = {
+  no: number;
   case_id: number;
-  slot: string;
-  staff_id: number | null;
-  staff_name: string | null;
-  role_id: number | null;
-  role_code: string | null;
-  role_name: string | null;
-  office_id: number | null;
-  office_code: string | null;
-  office_name: string | null;
   contract_id: string;
   student_name: string | null;
+  student_id: string | null;
+  signed_date: string | null;
+  client_type: string | null;
+  country: string | null;
+  refer_source: string;
+  system_type: string;
   application_status: string | null;
+  visa_date: string | null;
+  institution: string | null;
+  course_start: string | null;
   course_status: string | null;
-  institution_name: string | null;
-  country_name: string | null;
-  tier: string | null;
-  target: number | null;
-  actual_enrolled: number | null;
-  base_rate: number;
-  split_pct: string | null;
-  tier_bonus: number;
-  package_bonus: number;
-  addon_bonus: number;
-  priority_bonus: number;
-  presales_share_taken: number;
-  flat_local_enrolment_bonus: number;
-  advance_offset: number;
-  gross_bonus: number;
-  net_payable: number;
-  priority_withheld_amount: number;
-  priority_unlocked_amount: number;
-  priority_schedule_type: string;
-  calc_notes: string | null;
+  counsellor: string | null;
+  co: string | null;
+  notes: string | null;
+  slot_role: string | null;
+  bonus_enrolled: number;
+  note_bonus_enrolled: string;
+  bonus_priority: number;
+  note_bonus_priority: string;
 };
 
-const fmtVnd = (n: number | null | undefined) => {
-  if (n == null) return '–';
-  return n.toLocaleString('vi-VN') + ' đ';
+type Section = {
+  section_name: string;
+  cases: Case[];
+  subtotal_enrolled: number;
+  subtotal_priority: number;
 };
 
+type StaffReport = {
+  staff_id: number;
+  staff_name: string | null;
+  role_code: string | null;
+  office_code: string | null;
+  sections: Section[];
+  total_enrolled: number;
+  total_priority: number;
+  grand_total: number;
+};
+
+type ReportData = {
+  year: number;
+  month: number;
+  staff_reports: StaffReport[];
+};
+
+const fmtVnd = (n: number) => (n ? n.toLocaleString('vi-VN') : '0');
 const monthName = (m: number) =>
   ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
    'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'][m - 1] ?? `M${m}`;
 
-export default function BonusReportPage({
+export default function BaoCaoPage({
   params,
 }: {
   params: Promise<{ year: string; month: string }>;
@@ -69,258 +89,307 @@ export default function BonusReportPage({
   const year = parseInt(yearStr, 10);
   const month = parseInt(monthStr, 10);
 
-  const [payments, setPayments] = useState<Payment[] | null>(null);
-  const [loadError, setLoadError] = useState<string | null>(null);
-  const [filter, setFilter] = useState('');
-  const [staffFilter, setStaffFilter] = useState<string>('all');
+  const [data, setData] = useState<ReportData | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [selectedStaffId, setSelectedStaffId] = useState<number | null>(null);
 
   useEffect(() => {
     let cancelled = false;
-    setPayments(null);
-    setLoadError(null);
-    fetch(`/api/bonus?year=${year}&month=${month}`)
+    setData(null);
+    setError(null);
+    setSelectedStaffId(null);
+    fetch(`/api/bonus/reports/${year}/${month}`)
       .then((r) => {
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
         return r.json();
       })
-      .then((data: Payment[]) => {
-        if (!cancelled) setPayments(data);
+      .then((d: ReportData) => {
+        if (cancelled) return;
+        setData(d);
+        if (d.staff_reports.length > 0) {
+          setSelectedStaffId(d.staff_reports[0].staff_id);
+        }
       })
-      .catch((err) => {
-        if (!cancelled) setLoadError(String(err));
+      .catch((e) => {
+        if (!cancelled) setError(String(e));
       });
     return () => {
       cancelled = true;
     };
   }, [year, month]);
 
-  // Distinct staff for filter (memoised so selecting doesn't re-sort)
-  const staffOptions = useMemo(() => {
-    if (!payments) return [];
-    const map = new Map<number, string>();
-    for (const p of payments) {
-      if (p.staff_id != null) {
-        map.set(p.staff_id, p.staff_name ?? `Staff ${p.staff_id}`);
-      }
-    }
-    return Array.from(map.entries()).sort((a, b) => a[1].localeCompare(b[1]));
-  }, [payments]);
-
-  if (loadError) {
-    return (
-      <main className="p-6 max-w-3xl">
-        <Link href="/imports" className="text-sm text-blue-600 hover:underline">
-          ← All imports
-        </Link>
-        <h1 className="text-xl font-semibold mt-2">Bonus Report — error</h1>
-        <p className="text-red-600 mt-2">{loadError}</p>
-        <p className="text-sm text-gray-600 mt-2">
-          Make sure the engine has been run for this period (Submit to Engine
-          on the import review page).
-        </p>
-      </main>
-    );
-  }
-
-  if (!payments) {
-    return (
-      <main className="p-6">
-        <p className="text-gray-600">Loading bonus report…</p>
-      </main>
-    );
-  }
-
-  // Apply filters
-  const lowerFilter = filter.toLowerCase().trim();
-  const filtered = payments.filter((p) => {
-    if (staffFilter !== 'all' && String(p.staff_id) !== staffFilter) return false;
-    if (lowerFilter) {
-      const hay = [
-        p.staff_name,
-        p.contract_id,
-        p.student_name,
-        p.institution_name,
-        p.role_code,
-        p.slot,
-      ]
-        .filter(Boolean)
-        .join(' ')
-        .toLowerCase();
-      if (!hay.includes(lowerFilter)) return false;
-    }
-    return true;
-  });
-
-  const totalGross = filtered.reduce((a, p) => a + (p.gross_bonus ?? 0), 0);
-  const totalNet = filtered.reduce((a, p) => a + (p.net_payable ?? 0), 0);
-  const totalPriorityWithheld = filtered.reduce(
-    (a, p) => a + (p.priority_withheld_amount ?? 0),
-    0,
-  );
-  const distinctStaff = new Set(filtered.map((p) => p.staff_id)).size;
-  const distinctContracts = new Set(filtered.map((p) => p.contract_id)).size;
+  const selectedStaff = useMemo(() => {
+    if (!data || selectedStaffId == null) return null;
+    return data.staff_reports.find((s) => s.staff_id === selectedStaffId) ?? null;
+  }, [data, selectedStaffId]);
 
   return (
-    <main className="p-6 max-w-[1600px] mx-auto">
-      <header className="flex items-center justify-between mb-4">
-        <div>
-          <Link href="/imports" className="text-sm text-blue-600 hover:underline">
-            ← All imports
+    <main className="mx-auto max-w-[1800px] p-6">
+      <nav className="mb-4 flex items-center justify-between text-sm">
+        <div className="flex items-center gap-3 text-gray-500">
+          <Link href="/" className="hover:text-gray-900 hover:underline">
+            ← Case workflow
           </Link>
-          <h1 className="text-2xl font-semibold mt-1">
-            Bonus Report — {monthName(month)} {year}
-          </h1>
-        </div>
-        <div className="flex items-center gap-2">
-          <Link
-            href={`/import/review?year=${year}&month=${month}`}
-            className="text-sm text-blue-600 hover:underline"
-          >
-            ← Review imports
+          <span>·</span>
+          <Link href="/bonus" className="hover:text-gray-900 hover:underline">
+            All bonus reports
           </Link>
-          <span className="text-sm text-gray-500">
-            · {payments.length} row(s) total
-          </span>
         </div>
+        <Link
+          href={`/import/review?year=${year}&month=${month}`}
+          className="text-blue-600 hover:underline"
+        >
+          Review imports for this period →
+        </Link>
+      </nav>
+
+      <header className="mb-4">
+        <h1 className="text-2xl font-bold">
+          Bonus Report — {monthName(month)} {year}
+        </h1>
+        {data && (
+          <p className="mt-1 text-sm text-gray-600">
+            {data.staff_reports.length} staff member
+            {data.staff_reports.length === 1 ? '' : 's'} with cases in this period.
+          </p>
+        )}
       </header>
 
-      {/* Summary tiles */}
-      <section className="grid grid-cols-2 md:grid-cols-5 gap-3 mb-4">
-        <Stat label="Payments" value={filtered.length} />
-        <Stat label="Staff" value={distinctStaff} />
-        <Stat label="Contracts" value={distinctContracts} />
-        <Stat label="Gross" value={fmtVnd(totalGross)} />
-        <Stat label="Net payable" value={fmtVnd(totalNet)} highlight />
-      </section>
+      {error && (
+        <div className="rounded border border-red-200 bg-red-50 px-4 py-3 text-red-800">
+          <strong>Error:</strong> {error}
+        </div>
+      )}
 
-      {/* Filters */}
-      <section className="flex flex-wrap gap-3 mb-3 items-center">
-        <input
-          type="text"
-          placeholder="Filter (staff, contract, student, institution…)"
-          value={filter}
-          onChange={(e) => setFilter(e.target.value)}
-          className="border rounded px-3 py-1.5 text-sm flex-1 min-w-[280px]"
-        />
-        <select
-          value={staffFilter}
-          onChange={(e) => setStaffFilter(e.target.value)}
-          className="border rounded px-3 py-1.5 text-sm"
-        >
-          <option value="all">All staff ({staffOptions.length})</option>
-          {staffOptions.map(([id, name]) => (
-            <option key={id} value={String(id)}>
-              {name}
-            </option>
-          ))}
-        </select>
-        {totalPriorityWithheld > 0 && (
-          <span className="text-xs text-amber-700">
-            Priority withheld in view: {fmtVnd(totalPriorityWithheld)}
-          </span>
-        )}
-      </section>
+      {!data && !error && (
+        <div className="py-12 text-center text-gray-500">Loading…</div>
+      )}
 
-      {/* Table */}
-      <div className="overflow-x-auto border rounded">
-        <table className="min-w-full text-xs">
-          <thead className="bg-gray-50">
-            <tr>
-              <Th>Staff</Th>
-              <Th>Contract</Th>
-              <Th>Student</Th>
-              <Th>Slot</Th>
-              <Th>Role</Th>
-              <Th>Institution</Th>
-              <Th>Tier</Th>
-              <Th right>Tgt / Act</Th>
-              <Th right>Base</Th>
-              <Th right>Split</Th>
-              <Th right>Tier bonus</Th>
-              <Th right>Priority</Th>
-              <Th right>Package</Th>
-              <Th right>Addon</Th>
-              <Th right>Withheld</Th>
-              <Th>Schedule</Th>
-              <Th right>Gross</Th>
-              <Th right>Net</Th>
-            </tr>
-          </thead>
-          <tbody>
-            {filtered.map((p) => (
-              <tr key={p.id} className="border-t hover:bg-yellow-50/40">
-                <Td>{p.staff_name ?? `#${p.staff_id}`}</Td>
-                <Td className="font-mono">{p.contract_id}</Td>
-                <Td>{p.student_name ?? '–'}</Td>
-                <Td className="text-gray-600 lowercase">{p.slot}</Td>
-                <Td>{p.role_code ?? '–'}</Td>
-                <Td>{p.institution_name ?? '–'}</Td>
-                <Td>{p.tier && <TierBadge tier={p.tier} />}</Td>
-                <Td right className="text-gray-600">
-                  {p.target ?? '–'} / {p.actual_enrolled ?? '–'}
-                </Td>
-                <Td right className="text-gray-600">{fmtVnd(p.base_rate)}</Td>
-                <Td right className="text-gray-600">{p.split_pct ?? '–'}</Td>
-                <Td right>{fmtVnd(p.tier_bonus)}</Td>
-                <Td right>{p.priority_bonus ? fmtVnd(p.priority_bonus) : '–'}</Td>
-                <Td right>{p.package_bonus ? fmtVnd(p.package_bonus) : '–'}</Td>
-                <Td right>{p.addon_bonus ? fmtVnd(p.addon_bonus) : '–'}</Td>
-                <Td right>
-                  {p.priority_withheld_amount ? (
-                    <span className="text-amber-700">
-                      {fmtVnd(p.priority_withheld_amount)}
-                    </span>
-                  ) : (
-                    '–'
-                  )}
-                </Td>
-                <Td>
-                  {p.priority_schedule_type !== 'STANDARD' && (
-                    <span className="text-amber-700 text-[10px] font-medium">
-                      {p.priority_schedule_type}
-                    </span>
-                  )}
-                </Td>
-                <Td right className="font-medium">{fmtVnd(p.gross_bonus)}</Td>
-                <Td right className="font-semibold">{fmtVnd(p.net_payable)}</Td>
-              </tr>
-            ))}
-            {filtered.length === 0 && (
-              <tr>
-                <td colSpan={18} className="p-6 text-center text-gray-500">
-                  No payment rows match the filter.
-                </td>
-              </tr>
-            )}
-          </tbody>
-        </table>
-      </div>
+      {data && data.staff_reports.length === 0 && (
+        <div className="py-12 text-center text-gray-500">
+          No cases for this period.
+        </div>
+      )}
+
+      {data && data.staff_reports.length > 0 && (
+        <>
+          <section className="mb-6 flex flex-wrap items-center gap-3">
+            <label className="text-sm font-medium text-gray-700">
+              Staff:
+            </label>
+            <select
+              value={selectedStaffId ?? ''}
+              onChange={(e) =>
+                setSelectedStaffId(parseInt(e.target.value, 10))
+              }
+              className="rounded border px-3 py-1.5 text-sm bg-white min-w-[400px]"
+            >
+              {data.staff_reports.map((s) => {
+                const caseCount = s.sections.reduce(
+                  (a, x) => a + x.cases.length,
+                  0,
+                );
+                return (
+                  <option key={s.staff_id} value={s.staff_id}>
+                    {s.staff_name ?? `#${s.staff_id}`}
+                    {s.role_code ? ` (${s.role_code})` : ''}
+                    {s.office_code ? ` · ${s.office_code}` : ''}
+                    {' — '}
+                    {caseCount} case{caseCount === 1 ? '' : 's'}
+                    {' · '}
+                    {fmtVnd(s.grand_total)} đ
+                  </option>
+                );
+              })}
+            </select>
+            <span className="text-xs text-gray-500">
+              {data.staff_reports.length} staff in this period
+            </span>
+          </section>
+
+          {selectedStaff && (
+            <StaffBaoCao staff={selectedStaff} year={year} month={month} />
+          )}
+        </>
+      )}
     </main>
   );
 }
 
-// ---------- helpers ---------------------------------------------------------
-
-function Stat({
-  label,
-  value,
-  highlight,
+function StaffBaoCao({
+  staff,
+  year,
+  month,
 }: {
-  label: string;
-  value: string | number;
-  highlight?: boolean;
+  staff: StaffReport;
+  year: number;
+  month: number;
 }) {
   return (
-    <div
-      className={`border rounded px-3 py-2 ${
-        highlight ? 'bg-emerald-50 border-emerald-200' : 'bg-white'
-      }`}
-    >
-      <div className="text-[11px] uppercase tracking-wide text-gray-500">
-        {label}
+    <section className="space-y-5">
+      {/* Staff sub-header */}
+      <div className="rounded border border-gray-200 bg-gray-50 px-4 py-3">
+        <h2 className="text-lg font-semibold">
+          Báo cáo {staff.staff_name} — tháng{' '}
+          {String(month).padStart(2, '0')}/{year}
+        </h2>
+        <p className="text-xs text-gray-600">
+          {staff.role_code ?? '—'}
+          {staff.office_code ? ` · ${staff.office_code}` : ''}
+        </p>
       </div>
-      <div className={`text-lg font-semibold ${highlight ? 'text-emerald-700' : ''}`}>
-        {value}
+
+      {staff.sections.map((section) => (
+        <BaoCaoSection key={section.section_name} section={section} />
+      ))}
+
+      {/* Grand totals */}
+      <div className="rounded border border-emerald-200 bg-emerald-50 px-4 py-3">
+        <h3 className="text-sm font-semibold mb-2">TỔNG</h3>
+        <div className="grid grid-cols-3 gap-4 text-sm">
+          <div>
+            <div className="text-[11px] uppercase tracking-wide text-gray-500">
+              Bonus Enrolled
+            </div>
+            <div className="text-lg font-semibold">
+              {fmtVnd(staff.total_enrolled)} đ
+            </div>
+          </div>
+          <div>
+            <div className="text-[11px] uppercase tracking-wide text-gray-500">
+              Bonus Priority
+            </div>
+            <div className="text-lg font-semibold">
+              {fmtVnd(staff.total_priority)} đ
+            </div>
+          </div>
+          <div>
+            <div className="text-[11px] uppercase tracking-wide text-gray-500">
+              Grand total
+            </div>
+            <div className="text-lg font-bold text-emerald-700">
+              {fmtVnd(staff.grand_total)} đ
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+  );
+}
+
+function BaoCaoSection({ section }: { section: Section }) {
+  return (
+    <div>
+      <h3 className="text-sm font-semibold bg-blue-50 border border-blue-200 px-3 py-1.5 rounded-t">
+        {section.section_name}{' '}
+        <span className="text-gray-500 font-normal">
+          ({section.cases.length})
+        </span>
+      </h3>
+      <div className="overflow-x-auto border border-blue-200 border-t-0 rounded-b">
+        <table className="min-w-full text-[11px]">
+          <thead className="bg-gray-50">
+            <tr>
+              <Th>No.</Th>
+              <Th>Student Name</Th>
+              <Th>Student ID</Th>
+              <Th>Contract ID</Th>
+              <Th>Signed</Th>
+              <Th>Client Type</Th>
+              <Th>Country</Th>
+              <Th>Refer Source</Th>
+              <Th>System</Th>
+              <Th>App Status</Th>
+              <Th>Visa Date</Th>
+              <Th>Institution</Th>
+              <Th>Course Start</Th>
+              <Th>Course Status</Th>
+              <Th>Counsellor</Th>
+              <Th>CO</Th>
+              <Th>Notes</Th>
+              <Th right>BONUS Enrolled</Th>
+              <Th>Note Enrolled</Th>
+              <Th right>BONUS Priority</Th>
+              <Th>Note Priority</Th>
+            </tr>
+          </thead>
+          <tbody>
+            {section.cases.map((c) => (
+              <tr
+                key={`${c.case_id}-${c.slot_role}`}
+                className="border-t border-gray-100 hover:bg-yellow-50/40"
+              >
+                <Td>{c.no}</Td>
+                <Td>{c.student_name ?? '—'}</Td>
+                <Td className="font-mono">{c.student_id ?? '—'}</Td>
+                <Td className="font-mono">{c.contract_id}</Td>
+                <Td>{c.signed_date ?? '—'}</Td>
+                <Td>{c.client_type ?? '—'}</Td>
+                <Td>{c.country ?? '—'}</Td>
+                <Td className="max-w-[200px] truncate" title={c.refer_source}>
+                  {c.refer_source || '—'}
+                </Td>
+                <Td>{c.system_type}</Td>
+                <Td>{c.application_status ?? '—'}</Td>
+                <Td>{c.visa_date ?? '—'}</Td>
+                <Td className="max-w-[200px] truncate" title={c.institution ?? ''}>
+                  {c.institution ?? '—'}
+                </Td>
+                <Td>{c.course_start ?? '—'}</Td>
+                <Td>{c.course_status ?? '—'}</Td>
+                <Td>{c.counsellor ?? '—'}</Td>
+                <Td>{c.co ?? '—'}</Td>
+                <Td
+                  className="max-w-[200px] truncate text-gray-600"
+                  title={c.notes ?? ''}
+                >
+                  {c.notes ?? '—'}
+                </Td>
+                <Td
+                  right
+                  className={
+                    c.bonus_enrolled > 0 ? 'font-medium' : 'text-gray-400'
+                  }
+                >
+                  {c.bonus_enrolled.toLocaleString('vi-VN')}
+                </Td>
+                <Td
+                  className="max-w-[280px] text-[10px] italic text-gray-600 whitespace-normal"
+                  title={c.note_bonus_enrolled}
+                >
+                  {c.note_bonus_enrolled || '—'}
+                </Td>
+                <Td
+                  right
+                  className={
+                    c.bonus_priority > 0 ? 'font-medium' : 'text-gray-400'
+                  }
+                >
+                  {c.bonus_priority.toLocaleString('vi-VN')}
+                </Td>
+                <Td
+                  className="max-w-[280px] text-[10px] italic text-gray-600 whitespace-normal"
+                  title={c.note_bonus_priority}
+                >
+                  {c.note_bonus_priority || '—'}
+                </Td>
+              </tr>
+            ))}
+            <tr className="border-t-2 border-gray-300 bg-gray-50 font-semibold">
+              <Td colSpan={17} className="text-right">
+                Subtotal
+              </Td>
+              <Td right>
+                {section.subtotal_enrolled.toLocaleString('vi-VN')}
+              </Td>
+              <Td></Td>
+              <Td right>
+                {section.subtotal_priority.toLocaleString('vi-VN')}
+              </Td>
+              <Td></Td>
+            </tr>
+          </tbody>
+        </table>
       </div>
     </div>
   );
@@ -335,7 +404,7 @@ function Th({
 }) {
   return (
     <th
-      className={`px-2 py-1.5 text-xs font-medium text-gray-700 whitespace-nowrap ${
+      className={`px-2 py-1.5 text-[11px] font-medium text-gray-700 whitespace-nowrap ${
         right ? 'text-right' : 'text-left'
       }`}
     >
@@ -348,32 +417,24 @@ function Td({
   children,
   right,
   className,
+  colSpan,
+  title,
 }: {
-  children: React.ReactNode;
+  children?: React.ReactNode;
   right?: boolean;
   className?: string;
+  colSpan?: number;
+  title?: string;
 }) {
   return (
     <td
-      className={`px-2 py-1 whitespace-nowrap ${right ? 'text-right' : ''} ${
-        className ?? ''
-      }`}
+      colSpan={colSpan}
+      title={title}
+      className={`px-2 py-1 whitespace-nowrap align-top ${
+        right ? 'text-right' : ''
+      } ${className ?? ''}`}
     >
       {children}
     </td>
-  );
-}
-
-function TierBadge({ tier }: { tier: string }) {
-  const styles: Record<string, string> = {
-    UNDER: 'bg-gray-100 text-gray-700',
-    TARGET: 'bg-blue-100 text-blue-700',
-    OVER: 'bg-emerald-100 text-emerald-700',
-  };
-  const cls = styles[tier] ?? 'bg-gray-100 text-gray-700';
-  return (
-    <span className={`px-1.5 py-0.5 text-[10px] font-medium rounded ${cls}`}>
-      {tier}
-    </span>
   );
 }
