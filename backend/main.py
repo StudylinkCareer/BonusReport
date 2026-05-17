@@ -26,7 +26,12 @@ from fastapi import Body, FastAPI, HTTPException, Path as PathParam, Query
 from psycopg.rows import dict_row
 
 from backend.data.connection import get_connection
-from backend.engine_runner.api_runner import run_engine_api
+from backend.engine_runner.api_runner import (
+    AmendmentWindowExpiredError,
+    NoLivePaymentsToReverseError,
+    run_engine_api,
+    run_engine_cascade_api,
+)
 
 
 app = FastAPI(title="BonusReport API")
@@ -2000,6 +2005,189 @@ def list_cases_by_pillar(state: str = PathParam(..., min_length=1)) -> dict:
             cases = [dict(row) for row in cur.fetchall()]
 
     return {"state": state, "count": len(cases), "cases": cases}
+
+
+# ===========================================================================
+# Bonus reversal — Phase 13b/c
+# ===========================================================================
+
+@app.get("/api/bonus/reverse/authorised-keys")
+def list_reversal_authorised_keys() -> dict:
+    """
+    Acting-as keys allowed to reverse bonus runs.
+
+    Returns the active rows from ref_amendment_authorised_persona, used by
+    the frontend to enable/disable the Reverse button based on the current
+    "Acting as" persona selection in role.ts.
+
+    Response:
+        {
+          "authorised_keys": [
+            {"acting_as_key": "admin", "display_name": "..."},
+            {"acting_as_key": "persona:director", "display_name": "..."},
+            ...
+          ]
+        }
+    """
+    sql = """
+        SELECT acting_as_key, display_name
+          FROM ref_amendment_authorised_persona
+         WHERE active = true
+         ORDER BY display_name
+    """
+    with get_connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(sql)
+            rows = [dict(r) for r in cur.fetchall()]
+    return {"authorised_keys": rows}
+
+
+@app.get("/api/bonus/reverse/reasons")
+def list_reversal_reasons() -> dict:
+    """
+    User-selectable reversal reason codes for the Reverse modal dropdown.
+
+    Excludes the system-only CASCADE_FROM_PRIORITY_IMPACT code, which the
+    cascade orchestrator applies automatically to downstream-affected staff
+    and is never user-selected.
+
+    Response:
+        {
+          "reasons": [
+            {"code": "DATA_ERROR", "label": "...", "description": "..."},
+            ...
+          ]
+        }
+    """
+    sql = """
+        SELECT code, label, description
+          FROM ref_reversal_reason
+         WHERE code <> 'CASCADE_FROM_PRIORITY_IMPACT'
+         ORDER BY label
+    """
+    with get_connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(sql)
+            rows = [dict(r) for r in cur.fetchall()]
+    return {"reasons": rows}
+
+
+@app.post("/api/bonus/reverse-and-rerun-cascade")
+def reverse_and_rerun_cascade(body: dict = Body(default_factory=dict)) -> dict:
+    """
+    Reverse a staff's bonus payments for one period, re-run the engine for
+    them, then cascade-reverse-and-rerun any OTHER staff whose live priority
+    bonus payments are stale because the trigger staff's re-run changed the
+    priority quota tracker state.
+
+    Each cascade iteration handles one staff (reverse → re-run → check
+    warnings → enqueue newly-affected). The whole cascade runs in a single
+    DB transaction — if anything fails, all reversals and re-runs roll back.
+
+    Request body (JSON):
+        {
+          "year": 2024,
+          "month": 11,
+          "trigger_staff_id": 9,
+          "reversed_by_acting_as": "persona:finance_officer",
+          "initial_reason_code": "DISAGREEMENT",
+          "notes": "Finance challenged the partner X bonus",  // optional
+          "max_iterations": 10                                 // optional
+        }
+
+    Response: full result dict from run_engine_cascade_api with reversals[],
+    reruns[], final_warnings[], pending_unprocessed[], and cascade_complete.
+
+    Errors:
+        400 — bad year/month/staff_id/acting_as_key/reason_code/notes
+        403 — acting_as_key not in ref_amendment_authorised_persona
+        409 — amendment window expired OR no live payments to reverse
+        500 — engine raised mid-cascade (DB rolled back)
+    """
+    year = body.get("year")
+    month = body.get("month")
+    trigger_staff_id = body.get("trigger_staff_id")
+    reversed_by_acting_as = body.get("reversed_by_acting_as")
+    initial_reason_code = body.get("initial_reason_code")
+    notes = body.get("notes")
+    max_iterations = body.get("max_iterations", 10)
+
+    # Basic type/range validation — match style of /api/engine/run
+    if not isinstance(year, int) or not isinstance(month, int):
+        raise HTTPException(400, "year and month must be integers")
+    if not (2020 <= year <= 2099):
+        raise HTTPException(400, "year out of range (2020–2099)")
+    if not (1 <= month <= 12):
+        raise HTTPException(400, "month must be 1–12")
+    if not isinstance(trigger_staff_id, int) or trigger_staff_id < 1:
+        raise HTTPException(400, "trigger_staff_id must be a positive integer")
+    if not isinstance(reversed_by_acting_as, str) or not reversed_by_acting_as.strip():
+        raise HTTPException(400, "reversed_by_acting_as must be a non-empty string")
+    if not isinstance(initial_reason_code, str) or not initial_reason_code.strip():
+        raise HTTPException(400, "initial_reason_code must be a non-empty string")
+    if notes is not None and not isinstance(notes, str):
+        raise HTTPException(400, "notes must be a string or null")
+    if not isinstance(max_iterations, int) or max_iterations < 1 or max_iterations > 50:
+        raise HTTPException(400, "max_iterations must be an integer between 1 and 50")
+
+    # Authorisation gate — guard BEFORE doing any DB writes.
+    # 403 (not 400) because the request is well-formed but the actor is
+    # not permitted. 401 would imply auth was missing entirely.
+    auth_sql = """
+        SELECT 1
+          FROM ref_amendment_authorised_persona
+         WHERE acting_as_key = %s
+    """
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(auth_sql, (reversed_by_acting_as,))
+            if cur.fetchone() is None:
+                raise HTTPException(
+                    403,
+                    f"acting-as key '{reversed_by_acting_as}' is not authorised "
+                    f"to reverse bonus runs",
+                )
+
+    # Reason-code sanity check — verify against ref_reversal_reason. This
+    # catches typos/stale frontend dropdowns BEFORE the cascade starts.
+    # CASCADE_FROM_PRIORITY_IMPACT is rejected here because it's
+    # system-only — users shouldn't be able to spoof it as an initial reason.
+    if initial_reason_code == "CASCADE_FROM_PRIORITY_IMPACT":
+        raise HTTPException(
+            400,
+            "initial_reason_code 'CASCADE_FROM_PRIORITY_IMPACT' is reserved "
+            "for the cascade orchestrator and cannot be used as an initial reason",
+        )
+    reason_check_sql = "SELECT 1 FROM ref_reversal_reason WHERE code = %s"
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(reason_check_sql, (initial_reason_code,))
+            if cur.fetchone() is None:
+                raise HTTPException(
+                    400,
+                    f"unknown initial_reason_code '{initial_reason_code}' "
+                    f"(see GET /api/bonus/reverse/reasons for valid codes)",
+                )
+
+    try:
+        return run_engine_cascade_api(
+            year=year,
+            month=month,
+            trigger_staff_id=trigger_staff_id,
+            reversed_by_acting_as=reversed_by_acting_as,
+            initial_reason_code=initial_reason_code,
+            notes=notes,
+            max_iterations=max_iterations,
+        )
+    except AmendmentWindowExpiredError as exc:
+        raise HTTPException(409, str(exc))
+    except NoLivePaymentsToReverseError as exc:
+        raise HTTPException(409, str(exc))
+    except Exception as exc:
+        raise HTTPException(
+            500,
+            f"Cascade reverse-and-rerun failed: {type(exc).__name__}: {exc}",
+        )
 
 
 # Note: The duplicate inline @app.post("/api/imports") that previously lived

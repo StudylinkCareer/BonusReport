@@ -6,10 +6,17 @@ Command-line entrypoint for running the engine on a single (year, month).
 Usage:
     python -m backend.engine_runner.cli --year 2025 --month 4
     python -m backend.engine_runner.cli --year 2025 --month 4 --persist
+    python -m backend.engine_runner.cli --year 2025 --month 4 --persist --staff-id 9
 
 Default mode is --dry-run (prints BonusPayment objects to stdout, no DB
 writes). Use --persist when you've eyeballed the output and want to
 write to tx_bonus_payment AND manage tx_carry_over_balance state.
+
+Use --staff-id N for staff-scoped re-runs after a reversal: only cases
+involving that staff in any of the four payment slots (counsellor,
+case_officer, presales, vp) are loaded, and only that staff's
+tx_bonus_payment rows are wiped/rewritten. Other staff's live payments
+are preserved.
 
 Flow:
     1. Load ReferenceData via the data layer (one snapshot of all ref/dim tables)
@@ -18,17 +25,23 @@ Flow:
     3a. (Phase 12b) Load tx_priority_quota_tracker → priority_quota_state
     3b. (Phase 12b) Load prior priority withholdings → prior_priority_withholdings_by_contract_staff
     4. Build RunContext for the period
-    5. Query tx_case rows for (year, month)
+    5. Query tx_case rows for (year, month, optional staff_id)
     6. For each row:
          - Try to adapt to CaseInput (skip if not adaptable)
          - Try to run engine.calculate_case (collect errors, don't abort)
     7. Print summary (cases processed, skipped, errored, payments emitted)
     8. If --persist:
-         - DELETE existing tx_bonus_payment rows for (run_year, run_month)
+         - (Phase 13b) Pre-check: refuse if live (non-reversed)
+           tx_bonus_payment rows exist for the target staff/period.
+         - (Phase 13b) Snapshot tx_priority_quota_tracker (pre-state)
+         - DELETE existing tx_bonus_payment rows for (run_year, run_month,
+           optional staff_id), preserving rows with reversal_id NOT NULL
          - INSERT each new payment (incl. priority_withheld_amount,
            priority_unlocked_amount, priority_schedule_type)
-         - Manage tx_carry_over_balance lifecycle
+         - Manage tx_carry_over_balance lifecycle (scoped by staff_id when given)
          - (Phase 12b) UPSERT tx_priority_quota_tracker from ctx.priority_quota_state
+         - (Phase 13b) Snapshot tx_priority_quota_tracker (post-state)
+         - (Phase 13b) Compute priority impact warnings if staff_id given
          - Run priority_finalizer to write retroactive priority payments
            for any (case, slot) whose threshold was met by end of this month
          - Re-runs of the same month are idempotent
@@ -51,6 +64,19 @@ Phase 12b SPLIT_25_25_50 layer:
     final 50% is gated on year-end quota completion (year-end finalizer,
     not yet built). All 2024 priority groups remain on STANDARD_50_50,
     so this layer is a no-op for 2024 reruns.
+
+Phase 13b reversal infrastructure:
+    Before persisting, check_no_live_payments refuses if any non-reversed
+    tx_bonus_payment rows exist for the target staff/period. To re-run a
+    period, the caller must first reverse the existing rows via
+    POST /api/bonus/reverse. The DELETE-then-INSERT cycle inside
+    persist_payments now preserves reversed rows (adds reversal_id IS NULL
+    to the DELETE WHERE), keeping the audit trail intact.
+
+    When --staff-id is given, the precheck and all DELETE/UPDATE operations
+    on tx_bonus_payment and tx_carry_over_balance are scoped to that staff.
+    A priority impact assessment runs after persist to identify other staff
+    whose live priority payments may now be stale.
 
 Phase 7 carry-over key fix: tx_case has a different case_id for every
 (contract, run_year, run_month) tuple. Carry-over lookup, opening, and
@@ -78,6 +104,12 @@ from backend.data.ref_loaders import load_priority_quota_tracker
 from backend.data.reference_data import load_reference_data
 from backend.engine.calc import calculate_case
 from backend.engine.models import RunContext
+from backend.engine.reversal_check import (
+    LivePaymentRowsExistError,
+    check_no_live_payments,
+    compute_priority_impact_warnings,
+    snapshot_priority_quota_tracker,
+)
 from backend.engine_runner import priority_finalizer
 from backend.engine_runner.adapter import (
     CaseNotAdaptableError,
@@ -118,6 +150,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Process only the case with this contract_id (debug a single case).",
     )
+    parser.add_argument(
+        "--staff-id",
+        type=int,
+        default=None,
+        help="Phase 13b: staff-scoped re-run. Process only cases where this "
+             "staff occupies any of the four payment slots. Other staff's "
+             "live payments are preserved; priority impact warnings flag "
+             "any whose calculations may now be stale.",
+    )
     args = parser.parse_args(argv)
     if not (1 <= args.month <= 12):
         parser.error("--month must be between 1 and 12")
@@ -134,9 +175,17 @@ def load_cases(
     year: int,
     month: int,
     contract_id: str | None = None,
+    staff_id: int | None = None,
     limit: int | None = None,
 ) -> list[dict]:
-    """Load tx_case rows for the run period as a list of dicts."""
+    """Load tx_case rows for the run period as a list of dicts.
+
+    Phase 13b: when staff_id is given, only loads cases where the staff
+    occupies one of the four payment slots: counsellor, case_officer,
+    presales, vp. Note: target_owner_staff_id and pre_sales_staff_id are
+    NOT part of the filter — those are separate concepts (KPI ownership
+    and a legacy column, respectively).
+    """
     sql = """
         SELECT *
           FROM tx_case
@@ -148,6 +197,16 @@ def load_cases(
     if contract_id is not None:
         sql += " AND contract_id = %s"
         params.append(contract_id)
+
+    if staff_id is not None:
+        sql += """
+           AND (   counsellor_staff_id    = %s
+                OR case_officer_staff_id  = %s
+                OR presales_staff_id      = %s
+                OR vp_staff_id            = %s
+               )
+        """
+        params.extend([staff_id, staff_id, staff_id, staff_id])
 
     sql += " ORDER BY id"
 
@@ -195,8 +254,8 @@ def load_prior_priority_withholdings(cursor: Any) -> dict[tuple[str, int], int]:
 
     For SPLIT_25_25_50 cases, the at-enrolment 25% is paid immediately, the
     next 25% is withheld at the same row (priority_withheld_amount > 0) until
-    visa receipt + file closure (carry-over branch), and the final 50% is
-    released by the year-end finalizer when the partner quota is met.
+    visa receipt releases it (priority_unlocked_amount > 0 on the carry-over
+    row).
 
     This loader returns the NET remaining withhold for each (contract, staff)
     pair: SUM(priority_withheld_amount) − SUM(priority_unlocked_amount). The
@@ -428,6 +487,49 @@ def print_summary(
     print("=" * 80)
 
 
+def print_priority_impact_warnings(warnings: list[Any], ref: Any) -> None:
+    """Phase 13b: human-readable summary of priority impact warnings.
+
+    Looks up staff names and institution names from ReferenceData since
+    the warnings themselves carry only IDs.
+    """
+    if not warnings:
+        print("Priority impact warnings: none.")
+        return
+
+    print()
+    print("=" * 80)
+    print(f"  PRIORITY IMPACT WARNINGS ({len(warnings)})")
+    print("=" * 80)
+    print("  Other staff with live priority rows touching partners whose")
+    print("  quota state shifted during this re-run. Their priority bonus")
+    print("  may now be stale; consider reversing + re-running them.")
+    print()
+    for w in warnings:
+        inst = ref.institutions.get(w.institution_id, {})
+        partner_name = (
+            inst.get("canonical_name")
+            or inst.get("name")
+            or f"<institution_id={w.institution_id}>"
+        )
+        print(f"  Partner: {partner_name}")
+        print(f"    PLI id: {w.priority_list_institution_id}  "
+              f"Δdirect: {w.count_delta_direct:+d}  "
+              f"Δsub: {w.count_delta_sub:+d}")
+        for e in w.potentially_affected_payments:
+            staff = ref.staff.get(e.staff_id, {})
+            staff_name = (
+                staff.get("canonical_name")
+                or staff.get("name")
+                or f"<staff_id={e.staff_id}>"
+            )
+            print(f"      • {staff_name:<30}  "
+                  f"{e.case_count:>2} case(s)  "
+                  f"{e.total_priority_bonus:>11,} đ priority")
+        print()
+    print("=" * 80)
+
+
 # ---------------------------------------------------------------------------
 # Persistence
 # ---------------------------------------------------------------------------
@@ -465,12 +567,26 @@ def persist_payments(
     payments: list[Any],
     case_office_id_map: dict[int, int],
     case_contract_id_map: dict[int, str],
+    staff_id: int | None = None,
 ) -> None:
     """
     Write payments to tx_bonus_payment AND manage tx_carry_over_balance.
 
+    Phase 13b changes:
+      * Pre-flight: calls check_no_live_payments. If staff_id is given,
+        checks only that staff; otherwise checks the entire period for
+        any live (non-reversed) rows. Raises LivePaymentRowsExistError
+        if found — caller must reverse first via POST /api/bonus/reverse.
+      * DELETE on tx_bonus_payment now preserves reversed rows (adds
+        AND reversal_id IS NULL). Reversed rows stay in the DB for audit.
+      * When staff_id is given, all DELETE/UPDATE operations on both
+        tx_bonus_payment AND tx_carry_over_balance are scoped to that
+        staff. Other staff's payments and carry-over balances are
+        untouched.
+
     Idempotent for full-period re-runs:
-      * tx_bonus_payment rows for (year, month) are wiped + reinserted.
+      * tx_bonus_payment LIVE rows for (year, month, optional staff_id)
+        are wiped + reinserted. Reversed rows remain.
         This INCLUDES any retroactive priority rows priority_finalizer
         wrote in a prior run for this period — they get rewritten too.
       * tx_carry_over_balance rows whose withheld_run was this period
@@ -505,35 +621,76 @@ def persist_payments(
     Args:
         case_office_id_map:   {tx_case.id → office_id} for the period.
         case_contract_id_map: {tx_case.id → contract_id} for the period.
+        staff_id:             Phase 13b — optional staff-scoped re-run filter.
     """
-    # ----- Idempotency cleanup -------------------------------------------
-    cursor.execute(
-        "DELETE FROM tx_bonus_payment "
-        "WHERE run_year = %s AND run_month = %s",
-        (year, month),
-    )
+    # ----- Phase 13b: Pre-flight check ----------------------------------
+    conn = cursor.connection
+    if staff_id is not None:
+        check_no_live_payments(conn, year, month, [staff_id])
+    else:
+        check_no_live_payments(conn, year, month, None)  # period-wide
 
-    cursor.execute(
-        "DELETE FROM tx_carry_over_balance "
-        "WHERE withheld_run_year = %s AND withheld_run_month = %s",
-        (year, month),
-    )
+    # ----- Idempotency cleanup ------------------------------------------
+    # Phase 13b: preserve reversed rows (audit trail). When staff_id is
+    # given, scope to that staff; otherwise the precheck above already
+    # guaranteed no live rows exist anywhere in the period.
+    if staff_id is not None:
+        cursor.execute(
+            """DELETE FROM tx_bonus_payment
+                WHERE run_year = %s
+                  AND run_month = %s
+                  AND staff_id = %s
+                  AND reversal_id IS NULL""",
+            (year, month, staff_id),
+        )
+        cursor.execute(
+            """DELETE FROM tx_carry_over_balance
+                WHERE withheld_run_year = %s
+                  AND withheld_run_month = %s
+                  AND staff_id = %s""",
+            (year, month, staff_id),
+        )
+        cursor.execute(
+            """UPDATE tx_carry_over_balance
+                  SET is_open              = TRUE,
+                      released_amount      = NULL,
+                      released_run_year    = NULL,
+                      released_run_month   = NULL,
+                      released_status_code = NULL,
+                      updated_at           = NOW()
+                WHERE released_run_year  = %s
+                  AND released_run_month = %s
+                  AND staff_id           = %s""",
+            (year, month, staff_id),
+        )
+    else:
+        cursor.execute(
+            """DELETE FROM tx_bonus_payment
+                WHERE run_year = %s
+                  AND run_month = %s
+                  AND reversal_id IS NULL""",
+            (year, month),
+        )
+        cursor.execute(
+            """DELETE FROM tx_carry_over_balance
+                WHERE withheld_run_year = %s
+                  AND withheld_run_month = %s""",
+            (year, month),
+        )
+        cursor.execute(
+            """UPDATE tx_carry_over_balance
+                  SET is_open              = TRUE,
+                      released_amount      = NULL,
+                      released_run_year    = NULL,
+                      released_run_month   = NULL,
+                      released_status_code = NULL,
+                      updated_at           = NOW()
+                WHERE released_run_year  = %s
+                  AND released_run_month = %s""",
+            (year, month),
+        )
 
-    # Revert any closures done in this run back to open
-    cursor.execute(
-        """UPDATE tx_carry_over_balance
-              SET is_open              = TRUE,
-                  released_amount      = NULL,
-                  released_run_year    = NULL,
-                  released_run_month   = NULL,
-                  released_status_code = NULL,
-                  updated_at           = NOW()
-            WHERE released_run_year  = %s
-              AND released_run_month = %s""",
-        (year, month),
-    )
-
-    # ----- Write each payment + manage carry-over ------------------------
+    # ----- Write each payment + manage carry-over -----------------------
     inserted_count = 0
     co_opened_count = 0
     co_closed_count = 0
@@ -762,7 +919,8 @@ def main(argv: list[str] | None = None) -> int:
 
     print(f"Engine run: year={args.year} month={args.month} "
           f"persist={args.persist} limit={args.limit} "
-          f"contract_id={args.contract_id!r}")
+          f"contract_id={args.contract_id!r} "
+          f"staff_id={args.staff_id!r}")
 
     with get_connection() as conn:
         # Reference data uses the existing data layer (uses a default cursor)
@@ -781,6 +939,11 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Priority quota tracker loaded: "
               f"{len(priority_quota_tracker)} priority-list-institution(s) "
               f"with prior-period enrolment counts.")
+
+        # Phase 13b: snapshot tracker state BEFORE the run mutates it.
+        # Used after persist to compute priority impact warnings when
+        # this is a staff-scoped re-run.
+        old_tracker_snapshot = snapshot_priority_quota_tracker(conn)
 
         with conn.cursor(row_factory=dict_row) as cursor:
             # YTD aggregator (Phase 8: returns PriorityYtdSnapshot with
@@ -824,11 +987,12 @@ def main(argv: list[str] | None = None) -> int:
                 prior_priority_withholdings=prior_priority_withholdings,
             )
 
-            # Load cases
+            # Load cases (Phase 13b: staff_id filter applied if --staff-id given)
             case_rows = load_cases(
                 cursor,
                 year=args.year, month=args.month,
                 contract_id=args.contract_id,
+                staff_id=args.staff_id,
                 limit=args.limit,
             )
             print(f"Loaded {len(case_rows)} tx_case row(s) for period.")
@@ -888,13 +1052,19 @@ def main(argv: list[str] | None = None) -> int:
             )
 
             if args.persist:
-                persist_payments(
-                    cursor,
-                    year=args.year, month=args.month,
-                    payments=payments,
-                    case_office_id_map=case_office_id_map,
-                    case_contract_id_map=case_contract_id_map,
-                )
+                try:
+                    persist_payments(
+                        cursor,
+                        year=args.year, month=args.month,
+                        payments=payments,
+                        case_office_id_map=case_office_id_map,
+                        case_contract_id_map=case_contract_id_map,
+                        staff_id=args.staff_id,
+                    )
+                except LivePaymentRowsExistError as e:
+                    print(f"\n[PERSIST REFUSED] {e}")
+                    print("Reverse the existing run first via POST /api/bonus/reverse.")
+                    return 2
 
                 # Phase 12b: write back ctx.priority_quota_state. Runs
                 # AFTER persist_payments so that if persist throws, the
@@ -906,6 +1076,23 @@ def main(argv: list[str] | None = None) -> int:
                     year=args.year, month=args.month,
                     priority_quota_state=ctx.priority_quota_state,
                 )
+
+                # Phase 13b: take new snapshot and compute priority impact
+                # warnings for staff-scoped re-runs. For whole-period re-runs
+                # the warning list is computed but typically empty (since
+                # the precheck forced full reversal first, and the new run
+                # writes consistent state).
+                if args.staff_id is not None:
+                    new_tracker_state = snapshot_priority_quota_tracker(conn)
+                    warnings = compute_priority_impact_warnings(
+                        conn,
+                        run_year=args.year,
+                        run_month=args.month,
+                        staff_id_rerun=args.staff_id,
+                        old_tracker_snapshot=old_tracker_snapshot,
+                        new_tracker_state=new_tracker_state,
+                    )
+                    print_priority_impact_warnings(warnings, ref)
 
                 # Phase 8: retroactive priority catch-up.
                 # Runs after persist so it sees this month's just-written
