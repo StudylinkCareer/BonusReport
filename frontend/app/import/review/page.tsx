@@ -3178,7 +3178,7 @@ function DateCell({
   }
 
   return (
-    <div className="relative">
+    <div className="relative flex items-center gap-1">
       <input
         autoFocus
         type="date"
@@ -3196,6 +3196,35 @@ function DateCell({
         disabled={state === 'saving'}
         className={INPUT_BASE + ' text-xs font-mono'}
       />
+      {value && (
+        <button
+          type="button"
+          // onMouseDown so the click registers BEFORE the input's onBlur
+          // fires — otherwise the blur commit would close the cell before
+          // this handler runs.
+          onMouseDown={(e) => {
+            e.preventDefault();
+            setDraft('');
+            // Save null immediately so the user gets a single-click clear.
+            setState('saving');
+            setError(null);
+            onSave(null)
+              .then(() => {
+                setEditing(false);
+                setState('idle');
+              })
+              .catch((err) => {
+                setError(String(err instanceof Error ? err.message : err));
+                setState('error');
+              });
+          }}
+          disabled={state === 'saving'}
+          className="rounded border border-gray-300 bg-white px-1.5 py-0.5 text-xs text-gray-600 hover:bg-red-50 hover:text-red-700"
+          title="Clear date"
+        >
+          ×
+        </button>
+      )}
       <ErrorTooltip error={error} />
     </div>
   );
@@ -3306,7 +3335,13 @@ function SearchableDropdown({
         onKeyDown={(e) => {
           if (e.key === 'Enter') {
             e.preventDefault();
-            if (activeIndex != null && shown[activeIndex]) {
+            // Empty input → always route to onCommitDraft so the parent cell's
+            // clear-to-null path runs. Otherwise (with options shown when the
+            // input is blank) Enter would pick the highlighted first option
+            // and the user could never clear the value.
+            if (draft.trim() === '') {
+              onCommitDraft();
+            } else if (activeIndex != null && shown[activeIndex]) {
               onPick(shown[activeIndex].key);
             } else {
               onCommitDraft();
