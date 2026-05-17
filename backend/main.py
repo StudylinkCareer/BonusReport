@@ -10,6 +10,7 @@ Endpoints live under /api/* to match the Netlify proxy redirect.
 import sys
 import types
 import json
+import traceback
 from calendar import monthrange
 from datetime import date
 from pathlib import Path
@@ -2192,6 +2193,10 @@ def reverse_and_rerun_cascade(body: dict = Body(default_factory=dict)) -> dict:
     except NoLivePaymentsToReverseError as exc:
         raise HTTPException(409, str(exc))
     except Exception as exc:
+        # Print full traceback to stderr so Railway Deploy Logs capture it.
+        # Without this, FastAPI's HTTPException swallows the original
+        # exception and we lose the file/line info.
+        traceback.print_exc()
         raise HTTPException(
             500,
             f"Cascade reverse-and-rerun failed: {type(exc).__name__}: {exc}",
