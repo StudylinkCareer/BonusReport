@@ -3180,16 +3180,40 @@ function FkCell({
   onSave: (newId: number | null) => Promise<void>;
 }) {
   const { state, setState, error, setError, editing, setEditing } = useCellState();
-  const [draft, setDraft] = useState(label ?? '');
+
+  // Optimistic local label override. The backend PATCH endpoint returns the
+  // updated Case row with the new FK id but a STALE/NULL label (because the
+  // label is a denormalised column populated by a JOIN that the UPDATE path
+  // doesn't re-resolve). Without an override, picking a value would leave
+  // the cell showing "—" until a full refresh re-joined the lookup. We hold
+  // the freshly picked label locally and use it in place of the prop label
+  // until the prop catches up.
+  //
+  // The ref records WHICH id the override belongs to. If the prop value
+  // drifts to a different id externally (someone else's edit, undo, manual
+  // refetch), we discard the override and trust the prop.
+  const [localLabel, setLocalLabel] = useState<string | null>(null);
+  const localLabelForIdRef = useRef<number | null>(null);
 
   useEffect(() => {
-    setDraft(label ?? '');
-  }, [label]);
+    if (value !== localLabelForIdRef.current) {
+      setLocalLabel(null);
+      localLabelForIdRef.current = null;
+    }
+  }, [value]);
+
+  const displayLabel = localLabel ?? label;
+
+  const [draft, setDraft] = useState(displayLabel ?? '');
+
+  useEffect(() => {
+    setDraft(displayLabel ?? '');
+  }, [displayLabel]);
 
   function cancel() {
     setEditing(false);
     setError(null);
-    setDraft(label ?? '');
+    setDraft(displayLabel ?? '');
   }
 
   function commitDraft() {
@@ -3199,6 +3223,9 @@ function FkCell({
         setEditing(false);
         return;
       }
+      // Clearing — drop the local override so the prop (null) wins.
+      setLocalLabel(null);
+      localLabelForIdRef.current = null;
       setState('saving');
       setError(null);
       onSave(null)
@@ -3228,6 +3255,15 @@ function FkCell({
       setEditing(false);
       return;
     }
+    // Stash the picked option's label so the cell can display it immediately,
+    // regardless of what the backend returns for the label field.
+    const picked = options.find((o) => o.id === newId);
+    const pickedLabel = picked
+      ? (labelField === 'code' ? picked.code : picked.name) ?? null
+      : null;
+    setLocalLabel(pickedLabel);
+    localLabelForIdRef.current = newId;
+
     setState('saving');
     setError(null);
     onSave(newId)
@@ -3238,6 +3274,9 @@ function FkCell({
       .catch((e) => {
         setError(String(e instanceof Error ? e.message : e));
         setState('error');
+        // Rollback the optimistic override on failure.
+        setLocalLabel(null);
+        localLabelForIdRef.current = null;
       });
   }
 
@@ -3248,10 +3287,10 @@ function FkCell({
         onClick={() => {
           setEditing(true);
           setError(null);
-          setDraft(label ?? ''); // Keep existing value visible until user types
+          setDraft(displayLabel ?? ''); // Keep existing value visible until user types
         }}
       >
-        {label || DASH}
+        {displayLabel || DASH}
       </div>
     );
   }
@@ -3259,7 +3298,7 @@ function FkCell({
   const lcDraft = draft.trim().toLowerCase();
   // When the draft still matches the current label exactly, show ALL options
   // (so the user sees the full picker without having to clear the input first).
-  const isUnchangedLabel = lcDraft === (label ?? '').trim().toLowerCase();
+  const isUnchangedLabel = lcDraft === (displayLabel ?? '').trim().toLowerCase();
   const filtered =
     lcDraft && !isUnchangedLabel
       ? options.filter((o) => {
@@ -3308,16 +3347,33 @@ function StaffCell({
   onSave: (newStaffId: number | null, newRoleId: number | null) => Promise<void>;
 }) {
   const { state, setState, error, setError, editing, setEditing } = useCellState();
-  const [draft, setDraft] = useState(staffName ?? '');
+
+  // Optimistic local name override — same rationale as FkCell. The backend
+  // PATCH returns the new staff_id but a stale/null staff_name (derived via
+  // join). Without this, picking a counsellor leaves the cell showing "—"
+  // until the page is refreshed.
+  const [localName, setLocalName] = useState<string | null>(null);
+  const localNameForIdRef = useRef<number | null>(null);
 
   useEffect(() => {
-    setDraft(staffName ?? '');
-  }, [staffName]);
+    if (staffId !== localNameForIdRef.current) {
+      setLocalName(null);
+      localNameForIdRef.current = null;
+    }
+  }, [staffId]);
+
+  const displayName = localName ?? staffName;
+
+  const [draft, setDraft] = useState(displayName ?? '');
+
+  useEffect(() => {
+    setDraft(displayName ?? '');
+  }, [displayName]);
 
   function cancel() {
     setEditing(false);
     setError(null);
-    setDraft(staffName ?? '');
+    setDraft(displayName ?? '');
   }
 
   function pickById(newStaffId: number) {
@@ -3327,6 +3383,9 @@ function StaffCell({
       setEditing(false);
       return;
     }
+    setLocalName(o.name ?? null);
+    localNameForIdRef.current = o.id;
+
     setState('saving');
     setError(null);
     onSave(o.id, o.primary_role_id ?? null)
@@ -3337,6 +3396,8 @@ function StaffCell({
       .catch((e) => {
         setError(String(e instanceof Error ? e.message : e));
         setState('error');
+        setLocalName(null);
+        localNameForIdRef.current = null;
       });
   }
 
@@ -3347,6 +3408,8 @@ function StaffCell({
         setEditing(false);
         return;
       }
+      setLocalName(null);
+      localNameForIdRef.current = null;
       setState('saving');
       setError(null);
       onSave(null, null)
@@ -3376,16 +3439,16 @@ function StaffCell({
         onClick={() => {
           setEditing(true);
           setError(null);
-          setDraft(staffName ?? ''); // Keep existing value visible until user types
+          setDraft(displayName ?? ''); // Keep existing value visible until user types
         }}
       >
-        {staffName || DASH}
+        {displayName || DASH}
       </div>
     );
   }
 
   const lcDraft = draft.trim().toLowerCase();
-  const isUnchangedLabel = lcDraft === (staffName ?? '').trim().toLowerCase();
+  const isUnchangedLabel = lcDraft === (displayName ?? '').trim().toLowerCase();
   const filtered =
     lcDraft && !isUnchangedLabel
       ? options.filter((o) => (o.name ?? '').toLowerCase().includes(lcDraft))
