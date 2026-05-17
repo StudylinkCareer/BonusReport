@@ -9,6 +9,7 @@ Endpoints live under /api/* to match the Netlify proxy redirect.
 # --- Make 'backend' importable as a package alias for the current dir ----
 import sys
 import types
+import json
 from calendar import monthrange
 from datetime import date
 from pathlib import Path
@@ -1631,6 +1632,236 @@ def per_staff_bao_cao(
         "month":         month,
         "staff_reports": staff_reports,
     }
+
+
+
+# ===========================================================================
+# User layout variants — per-(acting_as, page_key) saved column layouts
+# (Phase 17a)
+# ===========================================================================
+#
+# Layout state for the /import/review case table is saved under a row in
+# `user_layout`. The acting_as key is emitted by lib/role.ts:
+#
+#   'admin' | 'persona:director' | 'persona:manager' | 'persona:quality_officer'
+#         | 'persona:finance_officer' | 'staff:<id>'
+#
+# The frontend treats one variant per (acting_as, page_key) as "default" and
+# loads it automatically on mount. is_default is enforced unique by a partial
+# index on the table.
+
+_USER_LAYOUT_COLS = (
+    "id, acting_as, page_key, variant_name, is_default, "
+    "layout_json, created_at, updated_at"
+)
+
+
+@app.get("/api/user_layout")
+def list_user_layouts(
+    acting_as: str = Query(..., min_length=1, max_length=64,
+                           description="e.g. 'admin', 'persona:director', 'staff:42'"),
+    page_key: str = Query(..., min_length=1, max_length=64,
+                          description="e.g. 'import_review'"),
+) -> dict:
+    """List all variants for one (acting_as, page_key). Default first, then alpha."""
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(f"""
+                SELECT {_USER_LAYOUT_COLS}
+                FROM user_layout
+                WHERE acting_as = %(acting_as)s
+                  AND page_key  = %(page_key)s
+                ORDER BY is_default DESC, variant_name ASC
+            """, {"acting_as": acting_as, "page_key": page_key})
+            return {"items": [dict(r) for r in cur.fetchall()]}
+
+
+@app.get("/api/user_layout/{layout_id}")
+def get_user_layout(layout_id: int = PathParam(..., ge=1)) -> dict:
+    """Return one variant by id."""
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(f"""
+                SELECT {_USER_LAYOUT_COLS}
+                FROM user_layout
+                WHERE id = %(id)s
+            """, {"id": layout_id})
+            row = cur.fetchone()
+            if row is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Layout {layout_id} not found.",
+                )
+            return dict(row)
+
+
+@app.post("/api/user_layout")
+def create_user_layout(body: dict[str, Any] = Body(...)) -> dict:
+    """
+    Create a new variant.
+
+    Body: {acting_as, page_key, variant_name, is_default?, layout_json}.
+    is_default defaults to false. If true, any existing default for the same
+    (acting_as, page_key) is cleared first so the partial-unique-index is
+    satisfied.
+    """
+    for required in ("acting_as", "page_key", "variant_name"):
+        if not body.get(required) or not isinstance(body[required], str):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Missing required string field: {required}",
+            )
+
+    is_default = bool(body.get("is_default", False))
+    layout_json = body.get("layout_json", {})
+    if not isinstance(layout_json, dict):
+        raise HTTPException(status_code=400, detail="layout_json must be a JSON object.")
+
+    params = {
+        "acting_as":    body["acting_as"],
+        "page_key":     body["page_key"],
+        "variant_name": body["variant_name"],
+        "is_default":   is_default,
+        "layout_json":  json.dumps(layout_json),
+    }
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            if is_default:
+                cur.execute("""
+                    UPDATE user_layout SET is_default = false
+                    WHERE acting_as = %(acting_as)s
+                      AND page_key  = %(page_key)s
+                      AND is_default = true
+                """, params)
+
+            try:
+                cur.execute(f"""
+                    INSERT INTO user_layout
+                      (acting_as, page_key, variant_name, is_default, layout_json)
+                    VALUES
+                      (%(acting_as)s, %(page_key)s, %(variant_name)s,
+                       %(is_default)s, %(layout_json)s::jsonb)
+                    RETURNING {_USER_LAYOUT_COLS}
+                """, params)
+            except Exception as exc:
+                conn.rollback()
+                msg = str(exc)
+                if "uq_user_layout_triple" in msg or "duplicate key" in msg.lower():
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            f"A variant named {body['variant_name']!r} already "
+                            f"exists for this role + page."
+                        ),
+                    )
+                raise HTTPException(status_code=400, detail=f"Create failed: {msg}")
+
+            row = cur.fetchone()
+            conn.commit()
+            return dict(row)
+
+
+@app.patch("/api/user_layout/{layout_id}")
+def update_user_layout(
+    layout_id: int = PathParam(..., ge=1),
+    body: dict[str, Any] = Body(...),
+) -> dict:
+    """
+    Update variant_name, is_default, and/or layout_json on an existing row.
+
+    Switching a row to is_default=true clears any other default on the same
+    (acting_as, page_key) pair first.
+    """
+    allowed = {"variant_name", "is_default", "layout_json"}
+    rejected = [k for k in body if k not in allowed]
+    if rejected:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Field(s) not editable: {rejected}. Allowed: {sorted(allowed)}",
+        )
+    if not body:
+        raise HTTPException(status_code=400, detail="Empty update body.")
+
+    if "layout_json" in body and not isinstance(body["layout_json"], dict):
+        raise HTTPException(status_code=400, detail="layout_json must be a JSON object.")
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            # Find the row so we know its (acting_as, page_key) for the
+            # default-clearing logic.
+            cur.execute("""
+                SELECT acting_as, page_key FROM user_layout WHERE id = %(id)s
+            """, {"id": layout_id})
+            existing = cur.fetchone()
+            if existing is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Layout {layout_id} not found.",
+                )
+
+            if body.get("is_default") is True:
+                cur.execute("""
+                    UPDATE user_layout SET is_default = false
+                    WHERE acting_as = %(acting_as)s
+                      AND page_key  = %(page_key)s
+                      AND id        <> %(id)s
+                      AND is_default = true
+                """, {**existing, "id": layout_id})
+
+            set_parts: list[str] = []
+            params: dict[str, Any] = {"id": layout_id}
+            if "variant_name" in body:
+                set_parts.append("variant_name = %(variant_name)s")
+                params["variant_name"] = body["variant_name"]
+            if "is_default" in body:
+                set_parts.append("is_default = %(is_default)s")
+                params["is_default"] = bool(body["is_default"])
+            if "layout_json" in body:
+                set_parts.append("layout_json = %(layout_json)s::jsonb")
+                params["layout_json"] = json.dumps(body["layout_json"])
+
+            sql = f"""
+                UPDATE user_layout
+                SET {', '.join(set_parts)},
+                    updated_at = NOW()
+                WHERE id = %(id)s
+                RETURNING {_USER_LAYOUT_COLS}
+            """
+
+            try:
+                cur.execute(sql, params)
+            except Exception as exc:
+                conn.rollback()
+                msg = str(exc)
+                if "uq_user_layout_triple" in msg or "duplicate key" in msg.lower():
+                    raise HTTPException(
+                        status_code=409,
+                        detail="A variant with that name already exists for this role + page.",
+                    )
+                raise HTTPException(status_code=400, detail=f"Update failed: {msg}")
+
+            row = cur.fetchone()
+            conn.commit()
+            return dict(row)
+
+
+@app.delete("/api/user_layout/{layout_id}")
+def delete_user_layout(layout_id: int = PathParam(..., ge=1)) -> dict:
+    """Delete one variant. Returns {'deleted_id': N}."""
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                DELETE FROM user_layout WHERE id = %(id)s RETURNING id
+            """, {"id": layout_id})
+            row = cur.fetchone()
+            if row is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Layout {layout_id} not found.",
+                )
+            conn.commit()
+            return {"deleted_id": layout_id}
 
 
 # ===========================================================================
