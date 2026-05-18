@@ -1377,6 +1377,84 @@ def finalize_cases(body: dict = Body(default_factory=dict)) -> dict:
 
 
 # ===========================================================================
+# Gate-check endpoint — GET /api/cases/gate?year=X&month=Y
+# ===========================================================================
+# Tells the frontend whether the "Total bonus" button is unlocked for a
+# given period. Total bonus runs a full month-wide engine pass that
+# persists draft bonus rows, so it should only be allowed once every case
+# in the period has been processed past 'uploaded' and 'in_review' into
+# 'submitted' (or already 'closed').
+#
+# Gate is satisfied for (year, month) when:
+#   - zero cases in 'uploaded'
+#   - zero cases in 'in_review'
+#   - at least one case in 'submitted' or 'closed' (i.e. something to total)
+#
+# Response shape:
+#   {
+#     "year": int,
+#     "month": int,
+#     "ready_for_total_bonus": bool,
+#     "state_counts": {"uploaded": int, "in_review": int,
+#                      "submitted": int, "closed": int},
+#     "blocker_case_ids": [int, ...]   # cases still in uploaded + in_review
+#   }
+#
+# Open to any authenticated user — the frontend uses this on the Submitted
+# board to enable/disable the Total bonus button and to render a tooltip
+# listing the blockers.
+# ---------------------------------------------------------------------------
+
+@app.get("/api/cases/gate", dependencies=[Depends(get_current_user)])
+def cases_gate(
+    year: int = Query(..., ge=2020, le=2099),
+    month: int = Query(..., ge=1, le=12),
+) -> dict:
+    """Gate-check for the Total bonus button — see comment block above."""
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT workflow_state,
+                       COUNT(*)::int  AS n,
+                       ARRAY_AGG(id ORDER BY id) AS ids
+                FROM tx_case
+                WHERE run_year = %s AND run_month = %s
+                GROUP BY workflow_state
+                """,
+                (year, month),
+            )
+            rows = cur.fetchall()
+
+    state_counts = {"uploaded": 0, "in_review": 0, "submitted": 0, "closed": 0}
+    blocker_case_ids: list[int] = []
+    for r in rows:
+        state = r["workflow_state"]
+        # Defensive: ignore any unexpected workflow_state values rather than
+        # crashing the gate endpoint.
+        if state in state_counts:
+            state_counts[state] = r["n"]
+            if state in ("uploaded", "in_review"):
+                blocker_case_ids.extend(r["ids"])
+
+    blocker_case_ids.sort()
+
+    ready = (
+        state_counts["uploaded"] == 0
+        and state_counts["in_review"] == 0
+        and (state_counts["submitted"] + state_counts["closed"]) > 0
+    )
+
+    return {
+        "year": year,
+        "month": month,
+        "ready_for_total_bonus": ready,
+        "state_counts": state_counts,
+        "blocker_case_ids": blocker_case_ids,
+    }
+
+
+# ===========================================================================
 # Bulk workflow_state transition — POST /api/cases/transition
 # ===========================================================================
 
