@@ -51,6 +51,15 @@ from backend.approvals import (
     get_case_approvals,
     override_approval,
 )
+from backend.overrides import (
+    CaseNotFoundError as OverrideCaseNotFoundError,
+    EmptyReasonError,
+    InvalidAmountError,
+    StaffNotOnCaseError,
+    WorkflowStateError,
+    list_case_overrides,
+    replace_case_overrides,
+)
 
 from backend.auth import (
     COOKIE_NAME,
@@ -550,6 +559,7 @@ def list_cases(
             c.vp_staff_id,            vp.canonical_name        AS vp_name,
             c.target_owner_staff_id,  target_owner.canonical_name AS target_owner_name,
             c.workflow_state,
+            c.calculated_at,
             c.pre_sales_staff_id,     ps.canonical_name        AS pre_sales_name,
 
             -- Phase 5 + v6.2: new tx_case columns
@@ -585,7 +595,29 @@ def list_cases(
                 JOIN ref_service_fee rsf ON s.service_fee_id = rsf.id
                 WHERE s.case_id = c.id),
                 '[]'::json
-            ) AS services
+            ) AS services,
+
+            -- Phase 14 Block 4 / C: Per-slot management overrides
+            -- (1-to-many child of tx_case, edited on the Submitted board).
+            -- Same JSON-array pattern as services. Empty array when none.
+            COALESCE(
+                (SELECT json_agg(
+                    json_build_object(
+                        'id',         o.id,
+                        'staff_id',   o.staff_id,
+                        'staff_name', os.canonical_name,
+                        'amount',     o.amount,
+                        'reason',     o.reason,
+                        'created_at', o.created_at,
+                        'updated_at', o.updated_at
+                    )
+                    ORDER BY os.canonical_name
+                )
+                FROM tx_case_override o
+                LEFT JOIN ref_staff os ON os.id = o.staff_id
+                WHERE o.case_id = c.id),
+                '[]'::json
+            ) AS overrides
 
         FROM tx_case c
         LEFT JOIN ref_institution inst         ON c.institution_id          = inst.id
@@ -1119,6 +1151,163 @@ def override_case_approval(
 
 
 # ===========================================================================
+# Per-slot case overrides (Phase 14 Block 4 / C)
+# ===========================================================================
+# Two endpoints:
+#   GET /api/cases/{id}/overrides           — list current overrides + available staff
+#   PUT /api/cases/{id}/overrides           — replace the whole list (DQO/ADMIN/DIR/FO)
+# Plus a finalize endpoint:
+#   POST /api/cases/finalize                — Submitted+Calculated → Closed
+# ===========================================================================
+
+@app.get(
+    "/api/cases/{case_id}/overrides",
+    dependencies=[Depends(get_current_user)],
+)
+def list_case_overrides_endpoint(case_id: int = PathParam(..., ge=1)) -> dict:
+    """List current overrides for a case, plus the case's slot staff so
+    the UI can populate the 'add override' dropdown.
+    """
+    try:
+        return list_case_overrides(case_id)
+    except OverrideCaseNotFoundError as e:
+        raise HTTPException(404, str(e))
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(500, f"Failed to load overrides: {type(e).__name__}: {e}")
+
+
+@app.put(
+    "/api/cases/{case_id}/overrides",
+    dependencies=[Depends(require_role(["DQO", "ADMIN", "DIRECTOR", "FO"]))],
+)
+def put_case_overrides_endpoint(
+    case_id: int = PathParam(..., ge=1),
+    body: dict = Body(default_factory=dict),
+    user: UserInfo = Depends(get_current_user),
+) -> dict:
+    """Replace the whole override list for a case.
+
+    Body:
+        {
+            "overrides": [
+                {"staff_id": int, "amount": int, "reason": "str"},
+                ...
+            ]
+        }
+
+    Validation (all-or-nothing):
+      - Case must exist and be in workflow_state='submitted'
+      - Every staff_id must match a slot on the case
+      - Every amount must be a non-zero int
+      - Every reason must be non-empty after trimming
+      - No duplicate staff_ids
+
+    Returns the fresh list_case_overrides() output on success.
+    """
+    overrides = body.get("overrides")
+    if not isinstance(overrides, list):
+        raise HTTPException(400, "Body must contain 'overrides' as a list")
+
+    try:
+        return replace_case_overrides(
+            case_id=case_id,
+            overrides=overrides,
+            user_id=user.id,
+        )
+    except OverrideCaseNotFoundError as e:
+        raise HTTPException(404, str(e))
+    except WorkflowStateError as e:
+        raise HTTPException(409, str(e))
+    except StaffNotOnCaseError as e:
+        raise HTTPException(400, str(e))
+    except (EmptyReasonError, InvalidAmountError) as e:
+        raise HTTPException(400, str(e))
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(500, f"Failed to save overrides: {type(e).__name__}: {e}")
+
+
+@app.post(
+    "/api/cases/finalize",
+    dependencies=[Depends(require_role(["DQO", "ADMIN", "DIRECTOR", "FO"]))],
+)
+def finalize_cases(body: dict = Body(default_factory=dict)) -> dict:
+    """Transition Submitted+Calculated cases to Closed.
+
+    Body:
+        {"case_ids": [1, 2, 3]}
+
+    Each case must be:
+      - in workflow_state = 'submitted'
+      - have calculated_at IS NOT NULL (engine has run for it)
+
+    All-or-nothing: if any case fails the precondition, none are finalized.
+    """
+    case_ids = body.get("case_ids", [])
+    if not isinstance(case_ids, list) or not all(isinstance(i, int) for i in case_ids):
+        raise HTTPException(400, "case_ids must be a list of integers")
+    if not case_ids:
+        raise HTTPException(400, "case_ids cannot be empty")
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, workflow_state, calculated_at
+                FROM tx_case
+                WHERE id = ANY(%s)
+                """,
+                (case_ids,),
+            )
+            rows_by_id = {r["id"]: r for r in cur.fetchall()}
+
+            missing = [cid for cid in case_ids if cid not in rows_by_id]
+            if missing:
+                raise HTTPException(404, f"Cases not found: {missing}")
+
+            not_submitted = [
+                r["id"] for r in rows_by_id.values()
+                if r["workflow_state"] != "submitted"
+            ]
+            if not_submitted:
+                raise HTTPException(
+                    400,
+                    f"Cannot finalize — these cases are not in 'submitted': "
+                    f"{not_submitted}",
+                )
+
+            not_calculated = [
+                r["id"] for r in rows_by_id.values()
+                if r["calculated_at"] is None
+            ]
+            if not_calculated:
+                raise HTTPException(
+                    400,
+                    f"Cannot finalize — these cases have not been calculated "
+                    f"yet (no payment rows): {not_calculated}. Run the engine "
+                    f"first.",
+                )
+
+            cur.execute(
+                """
+                UPDATE tx_case
+                SET workflow_state = 'closed', updated_at = NOW()
+                WHERE id = ANY(%s)
+                RETURNING id
+                """,
+                (case_ids,),
+            )
+            finalized_ids = [r["id"] for r in cur.fetchall()]
+            conn.commit()
+
+    return {
+        "finalized": len(finalized_ids),
+        "ids": finalized_ids,
+    }
+
+
+# ===========================================================================
 # Bulk workflow_state transition — POST /api/cases/transition
 # ===========================================================================
 
@@ -1454,6 +1643,46 @@ def get_reference_list(list_name: str = PathParam(..., min_length=1)) -> dict:
 # Engine run — POST /api/engine/run
 # ===========================================================================
 
+def _stamp_calculated_at_for_period(
+    year: int, month: int, contract_id: Optional[str] = None
+) -> None:
+    """Refresh tx_case.calculated_at after a successful engine run.
+
+    Sets calculated_at = NOW() for every case in (year, month) that has at
+    least one tx_bonus_payment row, and clears it to NULL for cases that
+    don't. This keeps the column consistent across re-runs (the engine
+    deletes payment rows before re-writing, so a re-run can legitimately
+    leave a case without payment rows if it now errors or is skipped).
+
+    If contract_id is given, only that one case is touched (single-case
+    debug runs).
+    """
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            params: list[Any] = [year, month]
+            extra_clause = ""
+            if contract_id is not None:
+                extra_clause = " AND c.contract_id = %s"
+                params.append(contract_id)
+
+            cur.execute(
+                f"""
+                UPDATE tx_case c
+                SET calculated_at = CASE
+                    WHEN EXISTS (
+                        SELECT 1 FROM tx_bonus_payment p WHERE p.case_id = c.id
+                    ) THEN NOW()
+                    ELSE NULL
+                END
+                WHERE c.run_year = %s
+                  AND c.run_month = %s
+                  {extra_clause}
+                """,
+                params,
+            )
+            conn.commit()
+
+
 @app.post("/api/engine/run", dependencies=[Depends(require_role(["FO", "ADMIN"]))])
 def run_engine_endpoint(body: dict = Body(default_factory=dict)) -> dict:
     """
@@ -1493,13 +1722,26 @@ def run_engine_endpoint(body: dict = Body(default_factory=dict)) -> dict:
         raise HTTPException(400, "contract_id must be a string")
 
     try:
-        return run_engine_api(
+        result = run_engine_api(
             year=year,
             month=month,
             persist=persist,
             limit=limit,
             contract_id=contract_id,
         )
+
+        # Phase 14 Block 4 / C — stamp tx_case.calculated_at on every case
+        # in this (year, month) that now has at least one tx_bonus_payment
+        # row, and CLEAR it on cases that don't. The engine deletes existing
+        # payment rows for the period before re-writing, so a re-run
+        # correctly re-stamps surviving cases and nulls out cases that
+        # errored/were skipped this time.
+        #
+        # Only fires when persist=True (dry-runs don't touch tx_case state).
+        if persist:
+            _stamp_calculated_at_for_period(year, month, contract_id)
+
+        return result
     except Exception as exc:
         # Phase 13e debug: write the full traceback to stdout with explicit
         # flush so Railway's default log view always shows it. (stderr is
