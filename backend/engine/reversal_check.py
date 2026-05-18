@@ -156,7 +156,10 @@ def check_no_live_payments(
         rows = cur.fetchall()
 
     if rows:
-        conflicts = [(int(r[0]), int(r[1])) for r in rows]
+        # get_connection() defaults to dict_row factory — rows are dicts,
+        # not tuples. SQL above aliases the two columns as staff_id and
+        # live_count.
+        conflicts = [(int(r["staff_id"]), int(r["live_count"])) for r in rows]
         raise LivePaymentRowsExistError(run_year, run_month, conflicts)
 
 
@@ -187,7 +190,10 @@ def snapshot_priority_quota_tracker(conn) -> dict[int, dict[str, int]]:
     with conn.cursor() as cur:
         cur.execute(sql)
         for row in cur.fetchall():
-            pli_id, direct, sub = row[0], row[1], row[2]
+            # dict_row cursor — use column names, not indices.
+            pli_id = row["priority_list_institution_id"]
+            direct = row["count_direct"]
+            sub = row["count_sub"]
             snapshot[int(pli_id)] = {
                 "count_direct": int(direct),
                 "count_sub": int(sub),
@@ -289,12 +295,13 @@ def compute_priority_impact_warnings(
             # Quota shifted but no other staff have live priority rows here
             continue
 
-        institution_id = int(rows[0][3])
+        # dict_row cursor — use column names from the SQL SELECT list above.
+        institution_id = int(rows[0]["institution_id"])
         affected = [
             AffectedStaffEntry(
-                staff_id=int(r[0]),
-                case_count=int(r[1]),
-                total_priority_bonus=int(r[2]),
+                staff_id=int(r["staff_id"]),
+                case_count=int(r["case_count"]),
+                total_priority_bonus=int(r["total_priority_bonus"]),
             )
             for r in rows
         ]
