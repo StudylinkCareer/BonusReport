@@ -96,6 +96,7 @@ import {
 import { useRouter } from 'next/navigation';
 import { BonusEstimateModal } from '@/app/_components/BonusEstimateModal';
 import { CaseApprovalsModal } from '@/app/_components/CaseApprovalsModal';
+import { CaseOverridesModal } from '@/app/_components/CaseOverridesModal';
 
 // ===========================================================================
 // Types
@@ -175,6 +176,20 @@ type Case = {
 
   // Phase 5 — Services (multi-select via tx_case_service junction)
   services: CaseService[];
+
+  // Phase 14 Block 4 / C — Per-slot management overrides
+  calculated_at: string | null;          // engine-stamped when payments were written
+  overrides: CaseOverrideSummary[];      // 0..3 rows mirroring slot staff
+};
+
+type CaseOverrideSummary = {
+  id: number;
+  staff_id: number;
+  staff_name: string | null;
+  amount: number;
+  reason: string;
+  created_at: string | null;
+  updated_at: string | null;
 };
 
 type CaseService = {
@@ -1648,6 +1663,8 @@ function CasesTable({
   const [estimateModalCaseId, setEstimateModalCaseId] = useState<number | null>(null);
   // Approvals modal (P14 Block 3 / B) — open when set to a case id.
   const [approvalsModalCaseId, setApprovalsModalCaseId] = useState<number | null>(null);
+  // Overrides modal (P14 Block 4 / C) — open when set to a case id.
+  const [overridesModalCaseId, setOverridesModalCaseId] = useState<number | null>(null);
   const [transitionError, setTransitionError] = useState<string | null>(null);
 
   // Calculate flow (only used on workflow_state === 'submitted').
@@ -1658,6 +1675,16 @@ function CasesTable({
   const [calculateError, setCalculateError] = useState<string | null>(null);
   const [calculateMessage, setCalculateMessage] = useState<
     | { ok: true; payment_count: number; net_total: number; skipped: number; errored: number }
+    | null
+  >(null);
+
+  // Finalize flow (Phase 14 Block 4 / C) — Submitted+Calculated → Closed.
+  // Decoupled from Calculate so the user can review overrides between the
+  // two steps.
+  const [finalizing, setFinalizing] = useState(false);
+  const [finalizeError, setFinalizeError] = useState<string | null>(null);
+  const [finalizeMessage, setFinalizeMessage] = useState<
+    | { ok: true; count: number }
     | null
   >(null);
 
@@ -1778,6 +1805,54 @@ function CasesTable({
                   👥 Approvals
                 </button>
               ),
+            } as ColumnDef<Case>,
+          ]
+        : []),
+      // Overrides column (P14 Block 4 / C) — only on the Submitted pillar.
+      // Shows a count + signed total (or "Add" if empty) and opens the
+      // CaseOverridesModal on click.
+      ...(workflowState === 'submitted'
+        ? [
+            {
+              id: 'overrides',
+              size: 130,
+              minSize: 110,
+              enableSorting: false,
+              enableColumnFilter: false,
+              enableResizing: false,
+              header: () => (
+                <span className="text-xs text-gray-600">Overrides</span>
+              ),
+              cell: ({ row }) => {
+                const c = row.original;
+                const n = c.overrides?.length ?? 0;
+                const total = (c.overrides ?? []).reduce(
+                  (a, o) => a + (o.amount ?? 0),
+                  0,
+                );
+                return (
+                  <button
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setOverridesModalCaseId(c.id);
+                    }}
+                    className={`rounded px-2 py-0.5 text-xs font-medium ${
+                      n === 0
+                        ? 'bg-gray-50 text-gray-600 hover:bg-gray-100'
+                        : total < 0
+                        ? 'bg-rose-50 text-rose-700 hover:bg-rose-100'
+                        : 'bg-emerald-50 text-emerald-700 hover:bg-emerald-100'
+                    }`}
+                    title={
+                      n === 0
+                        ? 'No overrides set — click to add'
+                        : `${n} override(s), total ${fmtVnd(total)}`
+                    }
+                  >
+                    {n === 0 ? '＋ Override' : `⚖ ${n} · ${fmtVnd(total)}`}
+                  </button>
+                );
+              },
             } as ColumnDef<Case>,
           ]
         : []),
@@ -2200,6 +2275,79 @@ function CasesTable({
           );
         },
       },
+      // -----------------------------------------------------------------
+      // Phase 14 Block 4 — extra metadata columns
+      // -----------------------------------------------------------------
+      {
+        id: 'handover_flag',
+        header: 'Handover',
+        accessorFn: (row) => (row.handover_flag ? 'Y' : ''),
+        size: 90,
+        minSize: 80,
+        cell: ({ row }) => {
+          const c = row.original;
+          // Display-only badge. handover_flag is engine-derived from
+          // imported data and not user-editable on this screen.
+          return c.handover_flag ? (
+            <span className="rounded bg-amber-100 px-1.5 py-0.5 text-xs font-medium text-amber-800">
+              Handover
+            </span>
+          ) : (
+            <span className="text-xs text-gray-400">—</span>
+          );
+        },
+      },
+      {
+        id: 'case_transition',
+        header: 'Transition',
+        accessorFn: (row) => row.case_transition ?? '',
+        size: 160,
+        cell: ({ row }) => {
+          const c = row.original;
+          return (
+            <TextCell
+              value={c.case_transition}
+              onSave={(v) => onSave(c.id, { case_transition: v })}
+            />
+          );
+        },
+      },
+      {
+        id: 'period',
+        header: 'Period',
+        // Composite read-only field: "YYYY-MM" formed from run_year + run_month.
+        // Sortable by string since zero-padded months compare correctly.
+        accessorFn: (row) =>
+          `${row.run_year}-${String(row.run_month).padStart(2, '0')}`,
+        size: 100,
+        minSize: 90,
+        cell: ({ row }) => {
+          const c = row.original;
+          return (
+            <span className="font-mono text-xs text-gray-700">
+              {c.run_year}-{String(c.run_month).padStart(2, '0')}
+            </span>
+          );
+        },
+      },
+      {
+        id: 'package_payment_basis',
+        header: 'Pay basis',
+        accessorFn: (row) => row.package_payment_basis ?? '',
+        size: 120,
+        minSize: 100,
+        cell: ({ row }) => {
+          const c = row.original;
+          // Display-only — derived from the chosen package.
+          return c.package_payment_basis ? (
+            <span className="rounded bg-slate-100 px-1.5 py-0.5 text-xs font-medium text-slate-700">
+              {c.package_payment_basis}
+            </span>
+          ) : (
+            <span className="text-xs text-gray-400">—</span>
+          );
+        },
+      },
       {
         id: 'notes',
         header: 'Notes',
@@ -2272,24 +2420,8 @@ function CasesTable({
         body: JSON.stringify({ case_ids: selectedIds, to_state: nextState }),
       });
       if (!res.ok) {
-        // FastAPI returns {"detail": "..."} for HTTPException. Read the body
-        // as text once, then try to parse JSON and pull the .detail field —
-        // falling back to the raw text if it isn't JSON. The backend's
-        // detail message is already self-explanatory (e.g. "Cannot submit
-        // — some cases have unapproved required slots: case_id=1: missing
-        // ['counsellor']; case_id=5: missing ['case_officer']"), so we drop
-        // the "HTTP 400:" prefix that was here previously.
-        const raw = await res.text();
-        let detail = raw;
-        try {
-          const body = JSON.parse(raw);
-          if (typeof body?.detail === 'string') {
-            detail = body.detail;
-          }
-        } catch {
-          // Not JSON — keep raw text.
-        }
-        throw new Error(detail);
+        const detail = await res.text();
+        throw new Error(`HTTP ${res.status}: ${detail}`);
       }
       setRowSelection({});
       onTransitioned();
@@ -2344,7 +2476,9 @@ function CasesTable({
         `  • DELETE all existing bonus payments for that period\n` +
         `  • Re-calculate from imported tx_case rows (ALL staff, not just yours)\n` +
         `  • Write fresh tx_bonus_payment rows\n\n` +
-        `On success, your selected cases will be moved to "Closed".\n\n` +
+        `Your selected cases will stay on the Submitted board with a\n` +
+        `"Calculated" stamp. Use the Finalize button to move them to Closed\n` +
+        `once you've reviewed any management overrides.\n\n` +
         `This is idempotent — safe to re-run.`,
     );
     if (!confirmed) return;
@@ -2387,20 +2521,11 @@ function CasesTable({
         totalErrored += result.errored?.length ?? 0;
       }
 
-      // 2. Transition the calculated cases to 'closed'.
-      const tRes = await fetch('/api/cases/transition', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ case_ids: selectedIds, to_state: 'closed' }),
-      });
-      if (!tRes.ok) {
-        const detail = await tRes.text();
-        throw new Error(
-          `Calculation succeeded but transition to Closed failed ` +
-            `(HTTP ${tRes.status}: ${detail}). The bonus rows have been ` +
-            `written; you can manually move the cases.`,
-        );
-      }
+      // 2. (Phase 14 Block 4 / C) DO NOT auto-transition to 'closed' here.
+      //    The engine_run endpoint now stamps tx_case.calculated_at for
+      //    successful cases server-side. Cases stay on the Submitted board
+      //    so the Bonus Admin can review/edit management overrides, then
+      //    click Finalize to advance them to Closed.
 
       setCalculateMessage({
         ok: true,
@@ -2409,13 +2534,61 @@ function CasesTable({
         skipped: totalSkipped,
         errored: totalErrored,
       });
-      setRowSelection({});
+      // Keep the selection so the user can immediately click "Finalize" on
+      // the same cases. (Previously we cleared it because they were about
+      // to disappear from the Submitted board.)
       onTransitioned();
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : String(e);
       setCalculateError(msg);
     } finally {
       setCalculating(false);
+    }
+  }
+
+  // Phase 14 Block 4 / C — Finalize: move Submitted+Calculated → Closed.
+  //
+  // The /api/cases/finalize endpoint is all-or-nothing: every selected case
+  // must be in 'submitted' state AND have calculated_at IS NOT NULL. If any
+  // case fails the precondition, none are transitioned and the backend
+  // returns a 400 with detail listing the offending case_ids.
+  //
+  // Use this AFTER you've run Calculate and reviewed management overrides.
+  async function bulkFinalize() {
+    if (selectedIds.length === 0) return;
+
+    const confirmed = window.confirm(
+      `Move ${selectedIds.length} case(s) to Closed?\n\n` +
+        `Preconditions (checked server-side, all-or-nothing):\n` +
+        `  • All cases must still be in Submitted state\n` +
+        `  • All cases must have been calculated (engine has run for them)\n\n` +
+        `Closed cases disappear from this board.`,
+    );
+    if (!confirmed) return;
+
+    setFinalizing(true);
+    setFinalizeError(null);
+    setFinalizeMessage(null);
+
+    try {
+      const res = await fetch('/api/cases/finalize', {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ case_ids: selectedIds }),
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new Error(body.detail ?? `HTTP ${res.status}`);
+      }
+      const result = (await res.json()) as { finalized: number; ids: number[] };
+      setFinalizeMessage({ ok: true, count: result.finalized });
+      setRowSelection({});
+      onTransitioned();
+    } catch (e: unknown) {
+      setFinalizeError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setFinalizing(false);
     }
   }
 
@@ -2530,20 +2703,36 @@ function CasesTable({
         </div>
         <div className="flex items-center gap-2">
           {showSelect && selectedIds.length > 0 && workflowState === 'submitted' && (
-            <button
-              onClick={bulkCalculate}
-              disabled={calculating}
-              className={`rounded px-3 py-1 font-medium text-white ${
-                calculating
-                  ? 'bg-gray-400 cursor-not-allowed'
-                  : 'bg-emerald-600 hover:bg-emerald-700'
-              }`}
-              title="Run the engine on the selected cases, then move them to Closed"
-            >
-              {calculating
-                ? 'Running engine…'
-                : `Calculate ${selectedIds.length} & Close →`}
-            </button>
+            <>
+              <button
+                onClick={bulkCalculate}
+                disabled={calculating || finalizing}
+                className={`rounded px-3 py-1 font-medium text-white ${
+                  calculating
+                    ? 'bg-gray-400 cursor-not-allowed'
+                    : 'bg-emerald-600 hover:bg-emerald-700'
+                }`}
+                title="Run the engine on the period(s) covering the selected cases. Cases stay on this board so you can review overrides afterwards."
+              >
+                {calculating
+                  ? 'Running engine…'
+                  : `Calculate ${selectedIds.length}`}
+              </button>
+              <button
+                onClick={bulkFinalize}
+                disabled={finalizing || calculating}
+                className={`rounded px-3 py-1 font-medium text-white ${
+                  finalizing
+                    ? 'bg-gray-400 cursor-not-allowed'
+                    : 'bg-blue-600 hover:bg-blue-700'
+                }`}
+                title="Move calculated cases to Closed. Requires the engine to have run for each selected case."
+              >
+                {finalizing
+                  ? 'Finalizing…'
+                  : `Finalize ${selectedIds.length} → Closed`}
+              </button>
+            </>
           )}
           {showSelect && selectedIds.length > 0 && workflowState !== 'submitted' && nextState && (
             <button
@@ -2608,7 +2797,21 @@ function CasesTable({
           {calculateMessage.errored > 0 && (
             <> · <span className="font-medium text-red-700">errored {calculateMessage.errored}</span></>
           )}
-          .
+          . Selected cases are stamped as Calculated and remain on this board —
+          review overrides, then click Finalize.
+        </div>
+      )}
+
+      {finalizeError && (
+        <div className="border-b border-red-200 bg-red-50 px-3 py-2 text-xs text-red-800">
+          <strong>Finalize failed:</strong> {finalizeError}
+        </div>
+      )}
+
+      {finalizeMessage?.ok && (
+        <div className="border-b border-blue-200 bg-blue-50 px-3 py-2 text-xs text-blue-800">
+          <strong>Finalized {finalizeMessage.count} case(s)</strong> — moved to
+          Closed.
         </div>
       )}
 
@@ -2748,6 +2951,11 @@ function CasesTable({
       <CaseApprovalsModal
         caseId={approvalsModalCaseId}
         onClose={() => setApprovalsModalCaseId(null)}
+      />
+      <CaseOverridesModal
+        caseId={overridesModalCaseId}
+        onClose={() => setOverridesModalCaseId(null)}
+        onSaved={onTransitioned}
       />
     </div>
   );
