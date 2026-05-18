@@ -42,13 +42,17 @@ from backend.auth import (
     UserInfo,
     create_access_token,
     get_current_user,
+    require_role,
     verify_password,
 )
 
 
 app = FastAPI(title="BonusReport API")
 from backend.api.imports import router as imports_router
-app.include_router(imports_router)
+app.include_router(
+    imports_router,
+    dependencies=[Depends(require_role(["DQO", "ADMIN", "DIRECTOR", "FO"]))],
+)
 
 
 # ===========================================================================
@@ -171,7 +175,7 @@ def me(user: UserInfo = Depends(get_current_user)) -> UserInfo:
 # Staff list
 # ===========================================================================
 
-@app.get("/api/staff")
+@app.get("/api/staff", dependencies=[Depends(get_current_user)])
 def list_staff() -> list[dict]:
     """All staff with primary role + office."""
     sql = """
@@ -200,7 +204,7 @@ def list_staff() -> list[dict]:
 # Imports list (audit log)
 # ===========================================================================
 
-@app.get("/api/imports")
+@app.get("/api/imports", dependencies=[Depends(require_role(["DQO", "ADMIN", "DIRECTOR", "FO"]))])
 def list_imports(
     year: Optional[int] = Query(None, ge=2020, le=2099),
     month: Optional[int] = Query(None, ge=1, le=12),
@@ -419,7 +423,7 @@ EDITABLE_FIELDS = {
 }
 
 
-@app.get("/api/cases")
+@app.get("/api/cases", dependencies=[Depends(get_current_user)])
 def list_cases(
     # --- mode selectors (one of these mode sets must be active) ----------
     staff_id: Optional[int] = Query(None, description="ref_staff.id; matches any role"),
@@ -596,7 +600,7 @@ def list_cases(
 # PATCH /api/cases/{id} — edit a single case before engine run
 # ===========================================================================
 
-@app.patch("/api/cases/{case_id}")
+@app.patch("/api/cases/{case_id}", dependencies=[Depends(get_current_user)])
 def update_case(
     case_id: int = PathParam(..., ge=1),
     updates: dict[str, Any] = Body(
@@ -712,7 +716,7 @@ VALID_BONUS_EVENTS = {
 }
 
 
-@app.patch("/api/cases/{case_id}/services")
+@app.patch("/api/cases/{case_id}/services", dependencies=[Depends(get_current_user)])
 def replace_case_services(case_id: int, body: dict = Body(default_factory=dict)) -> dict:
     """Replace the entire services list for a case (idempotent).
 
@@ -935,7 +939,7 @@ LEGAL_TRANSITIONS: dict[str, set[str]] = {
 }
 
 
-@app.post("/api/cases/transition")
+@app.post("/api/cases/transition", dependencies=[Depends(require_role(["DQO", "ADMIN", "DIRECTOR", "FO"]))])
 def transition_cases(body: dict = Body(default_factory=dict)) -> dict:
     """Bulk-transition a list of cases to a new workflow_state.
 
@@ -1211,7 +1215,7 @@ REF_LIST_STATIC: dict[str, list[str]] = {
 }
 
 
-@app.get("/api/reference/{list_name}")
+@app.get("/api/reference/{list_name}", dependencies=[Depends(get_current_user)])
 def get_reference_list(list_name: str = PathParam(..., min_length=1)) -> dict:
     """Return options for a single dropdown."""
     if list_name in REF_LIST_QUERIES:
@@ -1234,7 +1238,7 @@ def get_reference_list(list_name: str = PathParam(..., min_length=1)) -> dict:
 # Engine run — POST /api/engine/run
 # ===========================================================================
 
-@app.post("/api/engine/run")
+@app.post("/api/engine/run", dependencies=[Depends(require_role(["FO", "ADMIN"]))])
 def run_engine_endpoint(body: dict = Body(default_factory=dict)) -> dict:
     """
     Run the bonus engine for a single (year, month) period.
@@ -1302,7 +1306,7 @@ def run_engine_endpoint(body: dict = Body(default_factory=dict)) -> dict:
 # Bonus payments — GET /api/bonus
 # ===========================================================================
 
-@app.get("/api/bonus")
+@app.get("/api/bonus", dependencies=[Depends(require_role(["DIRECTOR", "FO", "ADMIN"]))])
 def list_bonus_payments(
     year: int = Query(..., ge=2020, le=2099, description="Run year"),
     month: int = Query(..., ge=1, le=12, description="Run month 1–12"),
@@ -1377,7 +1381,7 @@ def list_bonus_payments(
 # Per-staff bao cao reports (Phase 16)
 # ===========================================================================
 
-@app.get("/api/bonus/periods")
+@app.get("/api/bonus/periods", dependencies=[Depends(require_role(["DIRECTOR", "FO", "ADMIN"]))])
 def list_bonus_periods() -> list[dict]:
     """All (run_year, run_month) periods present in tx_case, ordered most-
     recent-first. Each row carries:
@@ -1516,7 +1520,7 @@ def _section_sort_key(section_name: str):
         return (999, section_name)
 
 
-@app.get("/api/bonus/reports/{year}/{month}")
+@app.get("/api/bonus/reports/{year}/{month}", dependencies=[Depends(require_role(["DIRECTOR", "FO", "ADMIN"]))])
 def per_staff_bao_cao(
     year: int = PathParam(..., ge=2020, le=2099),
     month: int = PathParam(..., ge=1, le=12),
@@ -1783,7 +1787,7 @@ _USER_LAYOUT_COLS = (
 )
 
 
-@app.get("/api/user_layout")
+@app.get("/api/user_layout", dependencies=[Depends(get_current_user)])
 def list_user_layouts(
     acting_as: str = Query(..., min_length=1, max_length=64,
                            description="e.g. 'admin', 'persona:director', 'staff:42'"),
@@ -1803,7 +1807,7 @@ def list_user_layouts(
             return {"items": [dict(r) for r in cur.fetchall()]}
 
 
-@app.get("/api/user_layout/{layout_id}")
+@app.get("/api/user_layout/{layout_id}", dependencies=[Depends(get_current_user)])
 def get_user_layout(layout_id: int = PathParam(..., ge=1)) -> dict:
     """Return one variant by id."""
     with get_connection() as conn:
@@ -1822,7 +1826,7 @@ def get_user_layout(layout_id: int = PathParam(..., ge=1)) -> dict:
             return dict(row)
 
 
-@app.post("/api/user_layout")
+@app.post("/api/user_layout", dependencies=[Depends(get_current_user)])
 def create_user_layout(body: dict[str, Any] = Body(...)) -> dict:
     """
     Create a new variant.
@@ -1889,7 +1893,7 @@ def create_user_layout(body: dict[str, Any] = Body(...)) -> dict:
             return dict(row)
 
 
-@app.patch("/api/user_layout/{layout_id}")
+@app.patch("/api/user_layout/{layout_id}", dependencies=[Depends(get_current_user)])
 def update_user_layout(
     layout_id: int = PathParam(..., ge=1),
     body: dict[str, Any] = Body(...),
@@ -1973,7 +1977,7 @@ def update_user_layout(
             return dict(row)
 
 
-@app.delete("/api/user_layout/{layout_id}")
+@app.delete("/api/user_layout/{layout_id}", dependencies=[Depends(get_current_user)])
 def delete_user_layout(layout_id: int = PathParam(..., ge=1)) -> dict:
     """Delete one variant. Returns {'deleted_id': N}."""
     with get_connection() as conn:
@@ -1995,7 +1999,7 @@ def delete_user_layout(layout_id: int = PathParam(..., ge=1)) -> dict:
 # Pillar counts — drives the 4-pillar home page tiles (Phase 15)
 # ===========================================================================
 
-@app.get("/api/pillars/counts")
+@app.get("/api/pillars/counts", dependencies=[Depends(get_current_user)])
 def pillar_counts(
     # Case Workload filter bar — same params as /api/cases. Counts per
     # pillar reflect whatever filter the user has applied on the home page
@@ -2069,7 +2073,7 @@ def pillar_counts(
 VALID_WORKFLOW_STATES = {"uploaded", "in_review", "submitted", "closed"}
 
 
-@app.get("/api/pillars/{state}/cases")
+@app.get("/api/pillars/{state}/cases", dependencies=[Depends(get_current_user)])
 def list_cases_by_pillar(state: str = PathParam(..., min_length=1)) -> dict:
     """List all cases at a given workflow_state. Used by the pillar drill-down views.
 
@@ -2133,7 +2137,7 @@ def list_cases_by_pillar(state: str = PathParam(..., min_length=1)) -> dict:
 # Bonus reversal — Phase 13b/c
 # ===========================================================================
 
-@app.get("/api/bonus/reverse/authorised-keys")
+@app.get("/api/bonus/reverse/authorised-keys", dependencies=[Depends(require_role(["DIRECTOR", "FO", "ADMIN"]))])
 def list_reversal_authorised_keys() -> dict:
     """
     Acting-as keys allowed to reverse bonus runs.
@@ -2164,7 +2168,7 @@ def list_reversal_authorised_keys() -> dict:
     return {"authorised_keys": rows}
 
 
-@app.get("/api/bonus/reverse/reasons")
+@app.get("/api/bonus/reverse/reasons", dependencies=[Depends(require_role(["DIRECTOR", "FO", "ADMIN"]))])
 def list_reversal_reasons() -> dict:
     """
     User-selectable reversal reason codes for the Reverse modal dropdown.
@@ -2195,7 +2199,7 @@ def list_reversal_reasons() -> dict:
     return {"reasons": rows}
 
 
-@app.post("/api/bonus/reverse-only")
+@app.post("/api/bonus/reverse-only", dependencies=[Depends(require_role(["DIRECTOR", "FO", "ADMIN"]))])
 def reverse_only(body: dict = Body(default_factory=dict)) -> dict:
     """
     Phase 13e — Reverse a staff's bonus payments for one period AND move
@@ -2316,7 +2320,7 @@ def reverse_only(body: dict = Body(default_factory=dict)) -> dict:
         )
 
 
-@app.post("/api/bonus/reverse-and-rerun-cascade")
+@app.post("/api/bonus/reverse-and-rerun-cascade", dependencies=[Depends(require_role(["DIRECTOR", "FO", "ADMIN"]))])
 def reverse_and_rerun_cascade(body: dict = Body(default_factory=dict)) -> dict:
     """
     Reverse a staff's bonus payments for one period, re-run the engine for
