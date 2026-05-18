@@ -1172,7 +1172,17 @@ def run_engine_endpoint(body: dict = Body(default_factory=dict)) -> dict:
             contract_id=contract_id,
         )
     except Exception as exc:
-        traceback.print_exc()
+        # Phase 13e debug: write the full traceback to stdout with explicit
+        # flush so Railway's default log view always shows it. (stderr is
+        # buffered/filtered in some log viewers; stdout+flush is reliable.)
+        print("=" * 60, flush=True)
+        print(
+            f"ENGINE RUN FAILED — year={year} month={month} "
+            f"contract_id={contract_id!r} limit={limit!r} persist={persist}",
+            flush=True,
+        )
+        print(traceback.format_exc(), flush=True)
+        print("=" * 60, flush=True)
         raise HTTPException(
             status_code=500,
             detail=f"Engine run failed: {type(exc).__name__}: {exc}",
