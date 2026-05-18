@@ -40,6 +40,17 @@ from backend.engine_runner.simulator import (
     CasePeriodMissingError,
     estimate_bonus_for_case,
 )
+from backend.approvals import (
+    ApprovalAlreadyRecordedError,
+    CaseNotFoundError as ApprovalCaseNotFoundError,
+    EmptyOverrideReasonError,
+    SlotNotFoundError,
+    UserNotOnCaseError,
+    approve_my_slots,
+    check_approvals_for_transition,
+    get_case_approvals,
+    override_approval,
+)
 
 from backend.auth import (
     COOKIE_NAME,
@@ -1003,6 +1014,111 @@ def estimate_case_bonus(
 
 
 # ===========================================================================
+# Approvals (Phase 14 Block 3 / B)
+# ===========================================================================
+# Three endpoints:
+#   GET    /api/cases/{id}/approvals          — list slot status (any user)
+#   POST   /api/cases/{id}/approve            — self-approve (any user)
+#   POST   /api/cases/{id}/override-approval  — manager override (DQO/ADMIN/
+#                                                DIRECTOR/FO)
+# The transition endpoint below blocks in_review -> submitted until all
+# required slots are approved.
+# ===========================================================================
+
+@app.get(
+    "/api/cases/{case_id}/approvals",
+    dependencies=[Depends(get_current_user)],
+)
+def list_case_approvals(case_id: int = PathParam(..., ge=1)) -> dict:
+    """Return the approval status of every applicable slot on the case."""
+    try:
+        return get_case_approvals(case_id)
+    except ApprovalCaseNotFoundError as e:
+        raise HTTPException(404, str(e))
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(500, f"Failed to load approvals: {type(e).__name__}: {e}")
+
+
+@app.post(
+    "/api/cases/{case_id}/approve",
+    dependencies=[Depends(get_current_user)],
+)
+def self_approve_case(
+    case_id: int = PathParam(..., ge=1),
+    user: UserInfo = Depends(get_current_user),
+) -> dict:
+    """Approve any slot on the case where user.staff_id matches.
+
+    Idempotent — re-approving an already-approved slot is a no-op (it'll
+    appear in `already_approved`, not `approved_slots`).
+    """
+    try:
+        return approve_my_slots(
+            case_id=case_id,
+            user_id=user.id,
+            user_staff_id=user.staff_id,
+        )
+    except UserNotOnCaseError as e:
+        raise HTTPException(403, str(e))
+    except ApprovalCaseNotFoundError as e:
+        raise HTTPException(404, str(e))
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(500, f"Approval failed: {type(e).__name__}: {e}")
+
+
+@app.post(
+    "/api/cases/{case_id}/override-approval",
+    dependencies=[Depends(require_role(["DQO", "ADMIN", "DIRECTOR", "FO"]))],
+)
+def override_case_approval(
+    case_id: int = PathParam(..., ge=1),
+    body: dict = Body(default_factory=dict),
+    user: UserInfo = Depends(get_current_user),
+) -> dict:
+    """Manager approves a slot on behalf of the assigned staff member.
+
+    Body:
+        {
+            "role_id": int,
+            "staff_id": int,
+            "reason": "Staff on leave"
+        }
+    """
+    role_id = body.get("role_id")
+    staff_id = body.get("staff_id")
+    reason = body.get("reason")
+
+    if not isinstance(role_id, int):
+        raise HTTPException(400, "role_id (int) is required")
+    if not isinstance(staff_id, int):
+        raise HTTPException(400, "staff_id (int) is required")
+    if not isinstance(reason, str):
+        raise HTTPException(400, "reason (string) is required")
+
+    try:
+        return override_approval(
+            case_id=case_id,
+            role_id=role_id,
+            staff_id=staff_id,
+            user_id=user.id,
+            reason=reason,
+        )
+    except EmptyOverrideReasonError as e:
+        raise HTTPException(400, str(e))
+    except SlotNotFoundError as e:
+        raise HTTPException(400, str(e))
+    except ApprovalAlreadyRecordedError as e:
+        raise HTTPException(409, str(e))
+    except ApprovalCaseNotFoundError as e:
+        raise HTTPException(404, str(e))
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(500, f"Override failed: {type(e).__name__}: {e}")
+
+
+# ===========================================================================
 # Bulk workflow_state transition — POST /api/cases/transition
 # ===========================================================================
 
@@ -1101,6 +1217,27 @@ def transition_cases(body: dict = Body(default_factory=dict)) -> dict:
                     f"Illegal transition {from_state!r} -> {to_state!r}. "
                     f"Legal next states from {from_state!r}: {sorted(legal_next) or 'none'}",
                 )
+
+            # ---- approval guard ------------------------------------------
+            # Phase 14 Block 3 (B): require all required slots approved
+            # before in_review -> submitted.
+            if from_state == "in_review" and to_state == "submitted":
+                missing = check_approvals_for_transition(case_ids)
+                if missing:
+                    sample = sorted(missing.items())[:5]
+                    detail_lines = [
+                        f"case_id={cid}: missing {slots}"
+                        for cid, slots in sample
+                    ]
+                    extra = (
+                        f" (and {len(missing) - 5} more)"
+                        if len(missing) > 5 else ""
+                    )
+                    raise HTTPException(
+                        400,
+                        "Cannot submit — some cases have unapproved required "
+                        f"slots{extra}: " + "; ".join(detail_lines),
+                    )
 
             # ---- apply the update ----------------------------------------
             cur.execute(

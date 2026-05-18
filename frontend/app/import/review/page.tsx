@@ -95,6 +95,7 @@ import {
 } from '@/lib/filters';
 import { useRouter } from 'next/navigation';
 import { BonusEstimateModal } from '@/app/_components/BonusEstimateModal';
+import { CaseApprovalsModal } from '@/app/_components/CaseApprovalsModal';
 
 // ===========================================================================
 // Types
@@ -1645,6 +1646,8 @@ function CasesTable({
   const [transitioning, setTransitioning] = useState(false);
   // Bonus-estimate modal (P14 Block 3) — open when set to a case id.
   const [estimateModalCaseId, setEstimateModalCaseId] = useState<number | null>(null);
+  // Approvals modal (P14 Block 3 / B) — open when set to a case id.
+  const [approvalsModalCaseId, setApprovalsModalCaseId] = useState<number | null>(null);
   const [transitionError, setTransitionError] = useState<string | null>(null);
 
   // Calculate flow (only used on workflow_state === 'submitted').
@@ -1744,6 +1747,35 @@ function CasesTable({
                   title="Preview the bonus this case would generate"
                 >
                   💰 Estimate
+                </button>
+              ),
+            } as ColumnDef<Case>,
+          ]
+        : []),
+      // Approvals column (P14 Block 3 / B) — only on the In Review pillar.
+      // Click opens CaseApprovalsModal.
+      ...(workflowState === 'in_review'
+        ? [
+            {
+              id: 'approvals',
+              size: 90,
+              minSize: 90,
+              enableSorting: false,
+              enableColumnFilter: false,
+              enableResizing: false,
+              header: () => (
+                <span className="text-xs text-gray-600">Approvals</span>
+              ),
+              cell: ({ row }) => (
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setApprovalsModalCaseId(row.original.id);
+                  }}
+                  className="rounded bg-indigo-50 px-2 py-0.5 text-xs font-medium text-indigo-700 hover:bg-indigo-100"
+                  title="View approval status for this case"
+                >
+                  👥 Approvals
                 </button>
               ),
             } as ColumnDef<Case>,
@@ -2696,6 +2728,10 @@ function CasesTable({
       <BonusEstimateModal
         caseId={estimateModalCaseId}
         onClose={() => setEstimateModalCaseId(null)}
+      />
+      <CaseApprovalsModal
+        caseId={approvalsModalCaseId}
+        onClose={() => setApprovalsModalCaseId(null)}
       />
     </div>
   );
