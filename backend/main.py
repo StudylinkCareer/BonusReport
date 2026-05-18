@@ -645,25 +645,50 @@ def list_cases(
             --   - Other users see only rows where staff_id = their own.
             -- `is_draft` distinguishes pre-Publish (published_at IS NULL)
             -- rows from already-published ones.
-            -- `final_paid` is computed inline so the engine writer doesn't
-            -- need to persist it; matches the Phase 10b formula:
-            --    final_paid = net_payable + COALESCE(mgmt_override_amount, 0)
+            -- Reversed rows (reversed_at IS NOT NULL) are excluded — the
+            -- reversal flow zeroes them out and they shouldn't show on
+            -- the board.
+            --
+            -- tx_bonus_payment breaks the bonus into components rather
+            -- than storing a single "base_bonus". The frontend can use
+            -- either the raw components or the convenience fields:
+            --   base_bonus  = net_payable - priority_bonus
+            --                              - priority_unlocked_amount
+            --     (everything in this payment that isn't priority-related)
+            --   final_paid  = net_payable + COALESCE(mgmt_override_amount, 0)
+            --     (per Phase 10b: the override is additive on top)
             COALESCE(
                 (SELECT json_agg(
                     json_build_object(
-                        'staff_id',                 bp.staff_id,
-                        'staff_name',               bp_staff.canonical_name,
-                        'role_id',                  bp.role_id,
-                        'role_code',                bp_role.code,
-                        'base_bonus',               bp.base_bonus,
-                        'priority_bonus',           bp.priority_bonus,
-                        'priority_withheld_amount', bp.priority_withheld_amount,
-                        'priority_schedule_type',   bp.priority_schedule_type,
-                        'mgmt_override_amount',     bp.mgmt_override_amount,
-                        'net_payable',              bp.net_payable,
-                        'final_paid',               (bp.net_payable + COALESCE(bp.mgmt_override_amount, 0)),
-                        'is_draft',                 (bp.published_at IS NULL),
-                        'published_at',             bp.published_at
+                        'staff_id',                  bp.staff_id,
+                        'staff_name',                bp_staff.canonical_name,
+                        'role_id',                   bp.role_id,
+                        'role_code',                 bp_role.code,
+                        'slot',                      bp.slot,
+                        -- Raw engine-output components
+                        'tier',                      bp.tier,
+                        'tier_bonus',                bp.tier_bonus,
+                        'package_bonus',             bp.package_bonus,
+                        'addon_bonus',               bp.addon_bonus,
+                        'flat_local_enrolment_bonus', bp.flat_local_enrolment_bonus,
+                        'priority_bonus',            bp.priority_bonus,
+                        'priority_withheld_amount',  bp.priority_withheld_amount,
+                        'priority_unlocked_amount',  bp.priority_unlocked_amount,
+                        'priority_schedule_type',    bp.priority_schedule_type,
+                        'presales_share_taken',      bp.presales_share_taken,
+                        'advance_offset',            bp.advance_offset,
+                        'gross_bonus',               bp.gross_bonus,
+                        'net_payable',               bp.net_payable,
+                        'mgmt_override_amount',      bp.mgmt_override_amount,
+                        -- Computed convenience fields (formulas above)
+                        'base_bonus',                (bp.net_payable
+                                                        - COALESCE(bp.priority_bonus, 0)
+                                                        - COALESCE(bp.priority_unlocked_amount, 0)),
+                        'final_paid',                (bp.net_payable
+                                                        + COALESCE(bp.mgmt_override_amount, 0)),
+                        -- Draft / published status
+                        'is_draft',                  (bp.published_at IS NULL),
+                        'published_at',              bp.published_at
                     )
                     ORDER BY bp_staff.canonical_name NULLS LAST, bp.staff_id
                 )
@@ -671,16 +696,19 @@ def list_cases(
                 LEFT JOIN ref_staff bp_staff ON bp_staff.id = bp.staff_id
                 LEFT JOIN dim_role  bp_role  ON bp_role.id  = bp.role_id
                 WHERE bp.case_id = c.id
+                  AND bp.reversed_at IS NULL
                   AND (%s OR bp.staff_id = %s)),
                 '[]'::json
             ) AS bonus_rows,
 
-            -- Total count of bonus rows on this case, ignoring viewer
-            -- filter. Lets the UI show "1 of 3 staff" badges without
-            -- leaking amounts (the slot identities are already public
-            -- via counsellor_name / case_officer_name etc).
+            -- Total count of bonus rows on this case (ignoring viewer
+            -- filter, also excluding reversed rows). Lets the UI show
+            -- "1 of 3 staff" badges without leaking amounts — the slot
+            -- identities are already public via counsellor_name /
+            -- case_officer_name etc.
             (SELECT COUNT(*)::int FROM tx_bonus_payment bp_all
-             WHERE bp_all.case_id = c.id) AS bonus_rows_total
+             WHERE bp_all.case_id = c.id
+               AND bp_all.reversed_at IS NULL) AS bonus_rows_total
 
         FROM tx_case c
         LEFT JOIN ref_institution inst         ON c.institution_id          = inst.id
