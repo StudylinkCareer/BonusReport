@@ -523,7 +523,6 @@ def update_case(
             try:
                 cur.execute(sql, params)
             except Exception as exc:
-                traceback.print_exc()
                 conn.rollback()
                 raise HTTPException(status_code=400, detail=f"Update failed: {exc!s}")
             row = cur.fetchone()
@@ -1173,6 +1172,7 @@ def run_engine_endpoint(body: dict = Body(default_factory=dict)) -> dict:
             contract_id=contract_id,
         )
     except Exception as exc:
+        traceback.print_exc()
         raise HTTPException(
             status_code=500,
             detail=f"Engine run failed: {type(exc).__name__}: {exc}",
