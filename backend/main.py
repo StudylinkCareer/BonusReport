@@ -34,6 +34,12 @@ from backend.engine_runner.api_runner import (
     run_engine_api,
     run_engine_cascade_api,
 )
+from backend.engine_runner.simulator import (
+    CaseNotFoundError,
+    CaseNotInReviewError,
+    CasePeriodMissingError,
+    estimate_bonus_for_case,
+)
 
 from backend.auth import (
     COOKIE_NAME,
@@ -920,6 +926,79 @@ def replace_case_services(case_id: int, body: dict = Body(default_factory=dict))
         "case_id": case_id,
         "services": services,
         "service_review_pending": bool(review_row["service_review_pending"]) if review_row else False,
+    }
+
+
+# ===========================================================================
+# Bonus simulator — GET /api/cases/{case_id}/estimate-bonus
+# ===========================================================================
+# Dry-run the bonus engine on a single case to preview the bonus.
+# Used by staff during review to see what their bonus would be before the
+# case is calculated for real. Available only when workflow_state ==
+# 'in_review'. Never writes to the DB.
+# ===========================================================================
+
+@app.get(
+    "/api/cases/{case_id}/estimate-bonus",
+    dependencies=[Depends(get_current_user)],
+)
+def estimate_case_bonus(
+    case_id: int = PathParam(..., ge=1),
+    user: UserInfo = Depends(get_current_user),
+) -> dict:
+    """Preview the bonus for a single case without persisting anything.
+
+    Visibility:
+      - Reviewers (DQO / ADMIN / DIRECTOR / FO): see all slots on the case.
+      - Everyone else (typically STAFF): see only their own slot(s),
+        matched by user.staff_id.
+
+    Returns 400 if the case isn't in 'in_review', 404 if it doesn't exist.
+    """
+    try:
+        result = estimate_bonus_for_case(case_id)
+    except CaseNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except CaseNotInReviewError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except CasePeriodMissingError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=500,
+            detail=f"Estimate failed: {type(e).__name__}: {e}",
+        )
+
+    # Role-based filter on the returned payment list
+    is_reviewer = bool(set(user.roles) & {"DQO", "ADMIN", "DIRECTOR", "FO"})
+    if is_reviewer:
+        visible = result["payments"]
+        viewing_mode = "all_slots"
+    else:
+        # STAFF (or any user without a reviewer role) sees only their
+        # own slot(s). Users with no staff_id (function users without
+        # reviewer role — shouldn't happen in practice) get nothing.
+        if user.staff_id is None:
+            visible = []
+        else:
+            visible = [
+                p for p in result["payments"]
+                if p.get("staff_id") == user.staff_id
+            ]
+        viewing_mode = "own_slot_only"
+
+    return {
+        "case": result["case"],
+        "payments": visible,
+        "viewing_mode": viewing_mode,
+        "skipped": result["skipped"],
+        "errored": result["errored"],
+        "disclaimer": (
+            "Estimate only — the final bonus may differ when this period "
+            "is calculated by Finance. Numbers reflect the case data and "
+            "reference rates at the moment of preview."
+        ),
     }
 
 
