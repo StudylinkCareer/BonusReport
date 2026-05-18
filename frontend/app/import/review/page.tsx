@@ -2272,8 +2272,24 @@ function CasesTable({
         body: JSON.stringify({ case_ids: selectedIds, to_state: nextState }),
       });
       if (!res.ok) {
-        const detail = await res.text();
-        throw new Error(`HTTP ${res.status}: ${detail}`);
+        // FastAPI returns {"detail": "..."} for HTTPException. Read the body
+        // as text once, then try to parse JSON and pull the .detail field —
+        // falling back to the raw text if it isn't JSON. The backend's
+        // detail message is already self-explanatory (e.g. "Cannot submit
+        // — some cases have unapproved required slots: case_id=1: missing
+        // ['counsellor']; case_id=5: missing ['case_officer']"), so we drop
+        // the "HTTP 400:" prefix that was here previously.
+        const raw = await res.text();
+        let detail = raw;
+        try {
+          const body = JSON.parse(raw);
+          if (typeof body?.detail === 'string') {
+            detail = body.detail;
+          }
+        } catch {
+          // Not JSON — keep raw text.
+        }
+        throw new Error(detail);
       }
       setRowSelection({});
       onTransitioned();
