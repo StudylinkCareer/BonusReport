@@ -23,7 +23,7 @@ sys.modules["backend"] = _backend_pkg
 
 from typing import Any, Optional
 
-from fastapi import Body, FastAPI, HTTPException, Path as PathParam, Query
+from fastapi import Body, Depends, FastAPI, HTTPException, Path as PathParam, Query, Response
 from psycopg.rows import dict_row
 
 from backend.data.connection import get_connection
@@ -33,6 +33,16 @@ from backend.engine_runner.api_runner import (
     reverse_only_api,
     run_engine_api,
     run_engine_cascade_api,
+)
+
+from backend.auth import (
+    COOKIE_NAME,
+    LoginRequest,
+    LoginResponse,
+    UserInfo,
+    create_access_token,
+    get_current_user,
+    verify_password,
 )
 
 
@@ -56,6 +66,105 @@ def health() -> dict:
     except Exception as e:
         raise HTTPException(status_code=503, detail=f"DB unreachable: {e}")
     return {"status": "ok", "db": "ok"}
+
+
+# ===========================================================================
+# Authentication (Phase 14, Block 2)
+# ===========================================================================
+# Three endpoints for the login lifecycle:
+#   POST /api/auth/login   — verify credentials, issue JWT cookie
+#   POST /api/auth/logout  — clear the cookie
+#   GET  /api/auth/me      — return current user info (so the frontend
+#                            can check 'am I logged in?' on page load)
+#
+# The JWT is delivered as an HttpOnly cookie, not in the response body —
+# this keeps it out of JavaScript's reach (defence against XSS).
+#
+# Future phase (2.3) will apply require_role() to existing endpoints to
+# actually enforce authorisation. For now these auth routes coexist with
+# the existing unauthenticated endpoints.
+# ===========================================================================
+
+@app.post("/api/auth/login", response_model=LoginResponse)
+def login(req: LoginRequest, response: Response) -> LoginResponse:
+    """Verify email + password, issue a JWT cookie, return user info."""
+    sql = """
+        SELECT
+            u.id,
+            u.email,
+            u.display_name,
+            u.password_hash,
+            u.staff_id,
+            u.employment_status,
+            rs.canonical_name AS linked_staff_name,
+            COALESCE(
+                ARRAY_AGG(r.code ORDER BY r.code)
+                    FILTER (WHERE r.code IS NOT NULL),
+                ARRAY[]::text[]
+            ) AS roles
+        FROM app_user u
+        LEFT JOIN ref_staff rs      ON rs.id = u.staff_id
+        LEFT JOIN app_user_role aur ON aur.user_id = u.id
+        LEFT JOIN dim_app_role r    ON r.id = aur.role_id
+        WHERE LOWER(u.email) = LOWER(%s)
+        GROUP BY u.id, rs.canonical_name
+    """
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, (req.email,))
+            row = cur.fetchone()
+
+    # Generic failure for both "no such user" and "wrong password" —
+    # prevents attackers from probing which emails exist.
+    if not row or not row["password_hash"]:
+        raise HTTPException(401, detail="invalid email or password")
+    if not verify_password(req.password, row["password_hash"]):
+        raise HTTPException(401, detail="invalid email or password")
+    if row["employment_status"] != "ACTIVE":
+        raise HTTPException(401, detail="account is inactive")
+
+    token = create_access_token(
+        user_id=row["id"],
+        email=row["email"],
+        roles=list(row["roles"]),
+        staff_id=row["staff_id"],
+    )
+    response.set_cookie(
+        key=COOKIE_NAME,
+        value=token,
+        max_age=8 * 60 * 60,   # 8 hours, in seconds
+        httponly=True,          # JavaScript can't read it (XSS defence)
+        secure=True,            # cookie only sent over HTTPS
+        samesite="lax",         # blocks most CSRF, allows same-site navigation
+        path="/",
+    )
+
+    return LoginResponse(
+        user=UserInfo(
+            id=row["id"],
+            email=row["email"],
+            display_name=row["display_name"],
+            roles=list(row["roles"]),
+            staff_id=row["staff_id"],
+            linked_staff_name=row["linked_staff_name"],
+        )
+    )
+
+
+@app.post("/api/auth/logout")
+def logout(response: Response) -> dict:
+    """Clear the auth cookie. Always succeeds — caller need not be logged in."""
+    response.delete_cookie(key=COOKIE_NAME, path="/", samesite="lax")
+    return {"success": True}
+
+
+@app.get("/api/auth/me", response_model=UserInfo)
+def me(user: UserInfo = Depends(get_current_user)) -> UserInfo:
+    """Return the current user's info. The frontend calls this on page
+    load to determine whether anyone is logged in (and if so, who).
+    Returns 401 if not authenticated."""
+    return user
+
 
 
 # ===========================================================================
