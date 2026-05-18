@@ -135,7 +135,7 @@ function UserBadge({
   onLogout: () => void
 }) {
   return (
-    <div className="fixed right-3 top-3 z-50 flex items-center gap-2 rounded-full border border-gray-200 bg-white px-3 py-1 text-xs shadow-sm">
+    <div className="fixed right-3 bottom-3 z-50 flex items-center gap-2 rounded-full border border-gray-200 bg-white px-3 py-1 text-xs shadow-sm">
       <div className="flex flex-col leading-tight">
         <span className="font-medium text-gray-800">{user.display_name}</span>
         <span className="text-[10px] text-gray-500">
