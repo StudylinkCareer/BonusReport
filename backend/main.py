@@ -1233,16 +1233,40 @@ def put_case_overrides_endpoint(
     dependencies=[Depends(require_role(["DQO", "ADMIN", "DIRECTOR", "FO"]))],
 )
 def finalize_cases(body: dict = Body(default_factory=dict)) -> dict:
-    """Transition Submitted+Calculated cases to Closed.
+    """Publish & Close — the "Close" button on the Submitted board.
+
+    Under the Block 5 draft/published model this endpoint does TWO things
+    in one atomic transaction:
+
+      1. Flips every draft bonus row attached to these cases to PUBLISHED
+         (sets tx_bonus_payment.published_at = NOW()). Once published,
+         the rows are visible at /bonus/yyyy/mm and locked against engine
+         overwrite — undoing requires going through tx_bonus_reversal.
+
+      2. Moves the cases themselves to workflow_state = 'closed', i.e.
+         out of the Submitted board and onto the Closed board.
+
+    Both halves either succeed together or roll back together.
 
     Body:
         {"case_ids": [1, 2, 3]}
 
-    Each case must be:
-      - in workflow_state = 'submitted'
-      - have calculated_at IS NOT NULL (engine has run for it)
+    Preconditions (all-or-nothing — any failure aborts the whole thing):
+      - Every case must exist (404 if not)
+      - Every case must be in workflow_state = 'submitted'
+      - Every case must have calculated_at IS NOT NULL (i.e. the Total
+        bonus button has been clicked and the engine has run)
+      - No case may have any ALREADY-PUBLISHED bonus rows (re-publish
+        is not allowed — reverse first via the existing reversal flow)
 
-    All-or-nothing: if any case fails the precondition, none are finalized.
+    Cases with zero bonus rows are fine. The user explicitly wants every
+    case to flow through to Closed regardless of whether bonus was
+    generated — so a case with no entitled staff still transitions
+    successfully; the bonus side is just a no-op for it.
+
+    Response shape preserves the Block 4 fields for frontend compatibility,
+    plus a new field for the published-row count:
+        {"finalized": int, "ids": [...], "published_payment_rows": int}
     """
     case_ids = body.get("case_ids", [])
     if not isinstance(case_ids, list) or not all(isinstance(i, int) for i in case_ids):
@@ -1252,6 +1276,7 @@ def finalize_cases(body: dict = Body(default_factory=dict)) -> dict:
 
     with get_connection() as conn:
         with conn.cursor() as cur:
+            # ---- Case existence and state checks --------------------------
             cur.execute(
                 """
                 SELECT id, workflow_state, calculated_at
@@ -1273,7 +1298,7 @@ def finalize_cases(body: dict = Body(default_factory=dict)) -> dict:
             if not_submitted:
                 raise HTTPException(
                     400,
-                    f"Cannot finalize — these cases are not in 'submitted': "
+                    f"Cannot publish — these cases are not in 'submitted': "
                     f"{not_submitted}",
                 )
 
@@ -1284,11 +1309,50 @@ def finalize_cases(body: dict = Body(default_factory=dict)) -> dict:
             if not_calculated:
                 raise HTTPException(
                     400,
-                    f"Cannot finalize — these cases have not been calculated "
-                    f"yet (no payment rows): {not_calculated}. Run the engine "
-                    f"first.",
+                    f"Cannot publish — these cases have not been calculated "
+                    f"yet (no engine run): {not_calculated}. Click Total "
+                    f"bonus first.",
                 )
 
+            # ---- Bonus-row precondition: nothing already published --------
+            # Once a row is published, the only legitimate path back to
+            # draft is the formal reversal flow. Reject re-publishes here
+            # so we never silently overwrite a published_at timestamp.
+            cur.execute(
+                """
+                SELECT DISTINCT case_id
+                FROM tx_bonus_payment
+                WHERE case_id = ANY(%s)
+                  AND published_at IS NOT NULL
+                """,
+                (case_ids,),
+            )
+            already_published = [r["case_id"] for r in cur.fetchall()]
+            if already_published:
+                raise HTTPException(
+                    400,
+                    f"Cannot publish — these cases have bonus rows that "
+                    f"were already published: {already_published}. To redo, "
+                    f"reverse first via the existing tx_bonus_reversal flow.",
+                )
+
+            # ---- Atomic publish + close ------------------------------------
+            # Step 1: flip every draft bonus row attached to these cases
+            #         to PUBLISHED. updated_at is set by the trg_set_updated_at
+            #         trigger automatically.
+            cur.execute(
+                """
+                UPDATE tx_bonus_payment
+                SET published_at = NOW()
+                WHERE case_id = ANY(%s)
+                  AND published_at IS NULL
+                RETURNING id
+                """,
+                (case_ids,),
+            )
+            published_payment_ids = [r["id"] for r in cur.fetchall()]
+
+            # Step 2: transition the cases to Closed.
             cur.execute(
                 """
                 UPDATE tx_case
@@ -1298,12 +1362,17 @@ def finalize_cases(body: dict = Body(default_factory=dict)) -> dict:
                 """,
                 (case_ids,),
             )
-            finalized_ids = [r["id"] for r in cur.fetchall()]
+            closed_case_ids = [r["id"] for r in cur.fetchall()]
+
             conn.commit()
 
     return {
-        "finalized": len(finalized_ids),
-        "ids": finalized_ids,
+        # Legacy field names — preserved so the existing frontend code
+        # in /import/review/page.tsx (Block 4) keeps working unchanged.
+        "finalized": len(closed_case_ids),
+        "ids": closed_case_ids,
+        # New field — Batch B will surface this in the success banner.
+        "published_payment_rows": len(published_payment_ids),
     }
 
 
