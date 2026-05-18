@@ -38,11 +38,19 @@ from typing import Any, Iterable
 # ---------------------------------------------------------------------------
 
 class LivePaymentRowsExistError(Exception):
-    """Raised when the engine refuses to persist because live payment rows
-    exist for one or more (run_year, run_month, staff_id) combinations.
+    """Raised when the engine refuses to persist because PUBLISHED payment
+    rows exist for one or more (run_year, run_month, staff_id) combinations.
 
-    The reverse + re-run flow (POST /api/bonus/reverse) must be used first
-    to flag the existing rows as reversed before new rows can be written.
+    Phase 14 Block 5 update — "live" now means "published and not reversed".
+    Draft rows (published_at IS NULL) are no longer blockers — the persist
+    routine wipes and re-inserts them freely, supporting the new Submitted-
+    board flow where Total bonus can be re-clicked to refresh draft values
+    before the user commits via Publish & Close.
+
+    Once a row is published (published_at IS NOT NULL), it's locked against
+    overwrite. To redo a published period, use the formal reversal flow
+    (POST /api/bonus/reverse-only or reverse-and-rerun-cascade), which sets
+    reversal_id on the existing rows so they no longer count as live.
 
     Attributes
     ----------
@@ -64,8 +72,9 @@ class LivePaymentRowsExistError(Exception):
         )
         super().__init__(
             f"Refusing to persist bonus run for {year}-{month:02d}: "
-            f"live payment rows already exist for these staff. "
-            f"Reverse them first via POST /api/bonus/reverse. {details}"
+            f"PUBLISHED payment rows already exist for these staff. "
+            f"To redo a published period, reverse it first via "
+            f"POST /api/bonus/reverse-only. {details}"
         )
 
 
@@ -104,24 +113,33 @@ def check_no_live_payments(
     run_month: int,
     staff_ids: Iterable[int] | None = None,
 ) -> None:
-    """Refuse if any live (non-reversed) tx_bonus_payment rows exist for the
-    given (run_year, run_month, staff_id) combinations.
+    """Refuse if any PUBLISHED, non-reversed tx_bonus_payment rows exist for
+    the given (run_year, run_month, staff_id) combinations.
 
     Called from persist_payments before any INSERT, ONLY when persist=True.
     Dry runs skip this check.
+
+    Phase 14 Block 5: drafts (published_at IS NULL) no longer block re-runs.
+    The Total bonus button can be clicked repeatedly to refresh draft values
+    while reviewers iterate on overrides and slot assignments. Only after
+    the Close button publishes the rows (sets published_at) do they become
+    locked against engine overwrite — at which point the formal reversal
+    flow is required to undo them.
 
     Parameters
     ----------
     conn : psycopg connection (opens its own cursor for the precheck query)
     run_year, run_month : target run period
     staff_ids : iterable of staff_id values to check. If None, the entire
-        period is checked (any staff_id with live rows triggers the refusal).
-        For staff-scoped re-runs, pass a single-element list.
+        period is checked (any staff_id with published live rows triggers
+        the refusal). For staff-scoped re-runs, pass a single-element list.
 
     Raises
     ------
     LivePaymentRowsExistError
-        If any live rows exist for the queried combinations.
+        If any PUBLISHED (and non-reversed) rows exist for the queried
+        combinations. Draft rows are ignored — persist_payments will wipe
+        and reinsert them as part of its normal idempotency cleanup.
     """
     if staff_ids is None:
         # Period-wide check
@@ -131,6 +149,7 @@ def check_no_live_payments(
              WHERE run_year = %s
                AND run_month = %s
                AND reversal_id IS NULL
+               AND published_at IS NOT NULL
              GROUP BY staff_id
              ORDER BY staff_id
         """
@@ -145,6 +164,7 @@ def check_no_live_payments(
              WHERE run_year = %s
                AND run_month = %s
                AND reversal_id IS NULL
+               AND published_at IS NOT NULL
                AND staff_id = ANY(%s)
              GROUP BY staff_id
              ORDER BY staff_id
