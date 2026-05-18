@@ -94,6 +94,7 @@ import {
   type Filters,
 } from '@/lib/filters';
 import { useRouter } from 'next/navigation';
+import { BonusEstimateModal } from '@/app/_components/BonusEstimateModal';
 
 // ===========================================================================
 // Types
@@ -1642,6 +1643,8 @@ function CasesTable({
   // Row selection (only used in workflow_state / pillar mode).
   const [rowSelection, setRowSelection] = useState<RowSelectionState>({});
   const [transitioning, setTransitioning] = useState(false);
+  // Bonus-estimate modal (P14 Block 3) — open when set to a case id.
+  const [estimateModalCaseId, setEstimateModalCaseId] = useState<number | null>(null);
   const [transitionError, setTransitionError] = useState<string | null>(null);
 
   // Calculate flow (only used on workflow_state === 'submitted').
@@ -1713,6 +1716,35 @@ function CasesTable({
                   onClick={(e) => e.stopPropagation()}
                   aria-label={`Select case ${row.original.contract_id ?? row.original.id}`}
                 />
+              ),
+            } as ColumnDef<Case>,
+          ]
+        : []),
+      // Estimate-bonus column (P14 Block 3) — only on the In Review pillar.
+      // Each row gets a small button that opens BonusEstimateModal.
+      ...(workflowState === 'in_review'
+        ? [
+            {
+              id: 'estimate',
+              size: 90,
+              minSize: 90,
+              enableSorting: false,
+              enableColumnFilter: false,
+              enableResizing: false,
+              header: () => (
+                <span className="text-xs text-gray-600">Bonus</span>
+              ),
+              cell: ({ row }) => (
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setEstimateModalCaseId(row.original.id);
+                  }}
+                  className="rounded bg-emerald-50 px-2 py-0.5 text-xs font-medium text-emerald-700 hover:bg-emerald-100"
+                  title="Preview the bonus this case would generate"
+                >
+                  💰 Estimate
+                </button>
               ),
             } as ColumnDef<Case>,
           ]
@@ -2659,6 +2691,12 @@ function CasesTable({
           onResetAll={resetPinning}
         />
       </div>
+      {/* Bonus-estimate modal (P14 Block 3). Rendered at component root so
+          it overlays everything; null caseId keeps it dismissed. */}
+      <BonusEstimateModal
+        caseId={estimateModalCaseId}
+        onClose={() => setEstimateModalCaseId(null)}
+      />
     </div>
   );
 }
