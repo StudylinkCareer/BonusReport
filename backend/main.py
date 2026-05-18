@@ -523,6 +523,7 @@ def update_case(
             try:
                 cur.execute(sql, params)
             except Exception as exc:
+                traceback.print_exc()
                 conn.rollback()
                 raise HTTPException(status_code=400, detail=f"Update failed: {exc!s}")
             row = cur.fetchone()
