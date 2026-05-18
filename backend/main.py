@@ -449,7 +449,7 @@ EDITABLE_FIELDS = {
 }
 
 
-@app.get("/api/cases", dependencies=[Depends(get_current_user)])
+@app.get("/api/cases")
 def list_cases(
     # --- mode selectors (one of these mode sets must be active) ----------
     staff_id: Optional[int] = Query(None, description="ref_staff.id; matches any role"),
@@ -470,6 +470,12 @@ def list_cases(
     client_type: Optional[str] = Query(None, description="Exact match on client_type_code"),
     institution_id: Optional[int] = Query(None, description="Exact match on institution_id"),
     office_id:      Optional[int] = Query(None, description="Exact match on case_office_id"),
+    # --- Viewer context (Phase 14 Block 5 Piece 5) -----------------------
+    # The viewer's roles + staff_id drive the per-viewer bonus filter on
+    # the aggregated `bonus_rows` column below. Authentication is still
+    # enforced (get_current_user raises 401 if no valid cookie), it just
+    # now also gives us the user object so we can shape the response.
+    user: UserInfo = Depends(get_current_user),
 ) -> list[dict]:
     """Cases either for one (year, month) period or for one workflow_state
     pillar, optionally narrowed by the Case Workload filter bar.
@@ -527,6 +533,20 @@ def list_cases(
     )
     where_clauses.extend(extra_where)
     params.extend(extra_params)
+
+    # -----------------------------------------------------------------------
+    # Per-viewer bonus filter (Phase 14 Block 5 Piece 5)
+    # -----------------------------------------------------------------------
+    # Admin-tier roles see every staff's bonus row on every case.
+    # Non-admin users (counsellors, COs, etc.) see only their own row.
+    # A user with no linked staff_id sees no bonus rows (defensive; rare).
+    #
+    # These two params are prepended to the SQL params tuple because the
+    # `bonus_rows` correlated subquery (in the SELECT list) sits BEFORE
+    # the WHERE clause and therefore consumes params first.
+    ADMIN_BONUS_VIEW_ROLES = {"DQO", "ADMIN", "DIRECTOR", "FO"}
+    viewer_is_admin: bool = bool(set(user.roles) & ADMIN_BONUS_VIEW_ROLES)
+    viewer_staff_id: Optional[int] = user.staff_id
 
     where_sql = " AND ".join(where_clauses)
 
@@ -617,7 +637,50 @@ def list_cases(
                 LEFT JOIN ref_staff os ON os.id = o.staff_id
                 WHERE o.case_id = c.id),
                 '[]'::json
-            ) AS overrides
+            ) AS overrides,
+
+            -- Phase 14 Block 5 Piece 5: Bonus payments aggregated per case,
+            -- filtered to what the viewer is permitted to see.
+            --   - Admin-tier viewers see every row.
+            --   - Other users see only rows where staff_id = their own.
+            -- `is_draft` distinguishes pre-Publish (published_at IS NULL)
+            -- rows from already-published ones.
+            -- `final_paid` is computed inline so the engine writer doesn't
+            -- need to persist it; matches the Phase 10b formula:
+            --    final_paid = net_payable + COALESCE(mgmt_override_amount, 0)
+            COALESCE(
+                (SELECT json_agg(
+                    json_build_object(
+                        'staff_id',                 bp.staff_id,
+                        'staff_name',               bp_staff.canonical_name,
+                        'role_id',                  bp.role_id,
+                        'role_code',                bp_role.code,
+                        'base_bonus',               bp.base_bonus,
+                        'priority_bonus',           bp.priority_bonus,
+                        'priority_withheld_amount', bp.priority_withheld_amount,
+                        'priority_schedule_type',   bp.priority_schedule_type,
+                        'mgmt_override_amount',     bp.mgmt_override_amount,
+                        'net_payable',              bp.net_payable,
+                        'final_paid',               (bp.net_payable + COALESCE(bp.mgmt_override_amount, 0)),
+                        'is_draft',                 (bp.published_at IS NULL),
+                        'published_at',             bp.published_at
+                    )
+                    ORDER BY bp_staff.canonical_name NULLS LAST, bp.staff_id
+                )
+                FROM tx_bonus_payment bp
+                LEFT JOIN ref_staff bp_staff ON bp_staff.id = bp.staff_id
+                LEFT JOIN dim_role  bp_role  ON bp_role.id  = bp.role_id
+                WHERE bp.case_id = c.id
+                  AND (%s OR bp.staff_id = %s)),
+                '[]'::json
+            ) AS bonus_rows,
+
+            -- Total count of bonus rows on this case, ignoring viewer
+            -- filter. Lets the UI show "1 of 3 staff" badges without
+            -- leaking amounts (the slot identities are already public
+            -- via counsellor_name / case_officer_name etc).
+            (SELECT COUNT(*)::int FROM tx_bonus_payment bp_all
+             WHERE bp_all.case_id = c.id) AS bonus_rows_total
 
         FROM tx_case c
         LEFT JOIN ref_institution inst         ON c.institution_id          = inst.id
@@ -641,7 +704,12 @@ def list_cases(
     """
     with get_connection() as conn:
         with conn.cursor() as cur:
-            cur.execute(sql, params)
+            # The two bonus-filter params (viewer_is_admin, viewer_staff_id)
+            # belong at the FRONT of the params tuple because the
+            # `bonus_rows` correlated subquery sits in the SELECT list
+            # — which Postgres binds parameters for before the WHERE clause.
+            all_params = [viewer_is_admin, viewer_staff_id] + list(params)
+            cur.execute(sql, all_params)
             return [dict(row) for row in cur.fetchall()]
 
 
