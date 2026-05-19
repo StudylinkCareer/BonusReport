@@ -38,6 +38,7 @@ type FileResult = {
   import_run_id?: number
   run_year?: number
   run_month?: number
+  bonus_year_month?: string
   staff_id?: number | null
   file_path?: string
   summary?: FileSummary
@@ -55,6 +56,7 @@ export default function UploadPage() {
   const router = useRouter()
   const [mode, setMode] = useState<Mode>('individual')
   const [files, setFiles] = useState<File[]>([])
+  const [bonusYearMonth, setBonusYearMonth] = useState<string>('')
   const [uploading, setUploading] = useState(false)
   const [response, setResponse] = useState<UploadResponse | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -83,6 +85,7 @@ export default function UploadPage() {
     if (next === mode) return
     setMode(next)
     setFiles([])
+    setBonusYearMonth('')
     setResponse(null)
     setError(null)
   }
@@ -91,6 +94,16 @@ export default function UploadPage() {
     if (files.length === 0) {
       setError('Please select at least one file.')
       return
+    }
+    if (mode === 'individual') {
+      if (!bonusYearMonth) {
+        setError('Please pick the bonus run month (YYYY-MM) for this upload.')
+        return
+      }
+      if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(bonusYearMonth)) {
+        setError('Bonus run month must be in YYYY-MM format (e.g. 2024-01).')
+        return
+      }
     }
     setUploading(true)
     setError(null)
@@ -103,6 +116,7 @@ export default function UploadPage() {
       fd.append('file', files[0])
     } else {
       for (const f of files) fd.append('files', f)
+      fd.append('bonus_year_month', bonusYearMonth)
     }
 
     try {
@@ -160,6 +174,31 @@ export default function UploadPage() {
       </div>
 
       {mode === 'individual' ? <IndividualNote /> : <ConsolidatedNote />}
+
+      {/* Bonus run month picker — Input sheet mode only.
+          DQO sets which bonus run these cases will be paid in. Independent
+          of run_year/run_month derived from each filename. */}
+      {mode === 'individual' && (
+        <div className="mb-4 rounded border border-blue-200 bg-blue-50 px-4 py-3">
+          <label htmlFor="bonus-ym" className="block text-sm font-semibold text-blue-900">
+            Bonus run month <span className="text-red-600">*</span>
+          </label>
+          <p className="mt-1 text-xs text-blue-800">
+            Which bonus run should these cases be paid in? Applied to every row in every
+            file in this upload. Independent of the filename&apos;s year/month
+            (so you can upload retroactively or forward-date a payment).
+          </p>
+          <input
+            id="bonus-ym"
+            type="month"
+            value={bonusYearMonth}
+            onChange={(e) => setBonusYearMonth(e.target.value)}
+            disabled={uploading}
+            className="mt-2 rounded border border-blue-300 bg-white px-3 py-1.5 text-sm focus:border-blue-500 focus:outline-none"
+            required
+          />
+        </div>
+      )}
 
       {/* Drop zone */}
       <div
@@ -269,6 +308,9 @@ export default function UploadPage() {
                     <div>
                       {r.run_year && r.run_month && (
                         <>Period: <strong>{r.run_year}-{String(r.run_month).padStart(2, '0')}</strong>{' · '}</>
+                      )}
+                      {r.bonus_year_month && (
+                        <>Bonus run: <strong>{r.bonus_year_month.slice(0, 7)}</strong>{' · '}</>
                       )}
                       Inserted: {r.summary?.inserted ?? 0}
                       {r.summary && r.summary.updated > 0 && <>, Updated: {r.summary.updated}</>}

@@ -117,6 +117,13 @@ _INSERT_COLUMNS = (
     "referring_source_type", "import_status",
     "incentive_amount", "notes",
     "run_year", "run_month",
+    # Phase 14 — DQO-keyed bonus run period, applied uniformly to every
+    # case in the upload. Distinct from run_year/run_month: those reflect
+    # when the case event happened (parsed from filename); this reflects
+    # which bonus run the case should be paid in. Default at upload is
+    # the same yyyy-mm but DQO can shift it (e.g. retroactive uploads,
+    # deferred payments). NOT NULL in tx_case schema — DQO must supply.
+    "bonus_year_month",
 )
 
 
