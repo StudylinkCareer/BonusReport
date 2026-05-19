@@ -10,16 +10,20 @@
 // the page already has it in state — avoids a second API call and keeps
 // the modal in sync with whatever the caller already shows in the cells.
 //
-// Phase 14 Block 5 B3 + reconciliation patch:
-//   * Earnings section now shows "Priority (computed)" derived from
-//     gross_bonus math, so Earnings always reconciles with Gross bonus.
-//     (The DB column priority_bonus is the PAID-THIS-RUN value, which
-//     can be 0 even when 175K of priority contributed to gross_bonus
-//     — e.g. carry-over data-gap cases. Showing only the paid value
-//     hid the discrepancy.)
-//   * New "Priority timing" section breaks down where the computed
-//     priority went: paid / withheld / unlocked / deferred. Only
-//     rendered when there's any priority activity to discuss.
+// Phase 14 Block 5 B3 + reconciliation patches:
+//   * Earnings section shows "Priority (computed)" derived from gross_bonus
+//     math, so Earnings always reconciles with Gross bonus. (The DB column
+//     priority_bonus is the PAID-THIS-RUN value, which can be 0 even when
+//     a non-zero priority contributed to gross_bonus — e.g. carry-over
+//     data-gap cases. Showing only the paid value hid the discrepancy.)
+//   * "Timing" section shows the full picture of where the difference
+//     between Gross and Net comes from:
+//       - Splittable withheld this run (status is_current_enrolled)
+//       - Splittable unlocked from prior month (carry-over release)
+//       - Priority paid / withheld / unlocked / deferred
+//     The splittable values are derived from (gross, net, priority_unlocked)
+//     since they aren't persisted as separate columns on tx_bonus_payment
+//     (the carry-over ledger lives in tx_carry_over_balance instead).
 
 import { useEffect, type ReactNode } from 'react';
 
@@ -99,6 +103,28 @@ function priorityComputedPreTiming(r: BonusRow): number {
     - r.flat_local_enrolment_bonus
     + r.presales_share_taken
   );
+}
+
+// Splittable withholding/unlocking this run, derived from gross/net delta.
+// These aren't separate columns on tx_bonus_payment (the carry-over ledger
+// lives in tx_carry_over_balance), so we reverse-engineer from observable
+// values. priority_unlocked_amount adds to net independently of the
+// splittable flow, so we factor it out to isolate the splittable delta.
+//
+// At most one of these can be > 0 per run:
+//   - splittableWithheld > 0: status is is_current_enrolled (visa pending);
+//     splittable portion held back, releases at visa-receipt month
+//   - splittableUnlocked > 0: status is is_carry_over with a matching prior
+//     withhold; released this run
+function splittableTiming(r: BonusRow): {
+  withheld: number;
+  unlocked: number;
+} {
+  const delta = r.gross_bonus - r.net_payable + r.priority_unlocked_amount;
+  return {
+    withheld: Math.max(0, delta),
+    unlocked: Math.max(0, -delta),
+  };
 }
 
 // ===========================================================================
@@ -242,10 +268,16 @@ function BonusRowCard({ row }: { row: BonusRow }) {
   const priorityDeferred =
     priorityComputed - r.priority_bonus - r.priority_withheld_amount;
 
-  // Show the priority-timing section only when there's any priority
-  // activity to discuss (computed > 0, or something unlocked from prior).
-  const hasPriorityActivity =
-    priorityComputed !== 0 || r.priority_unlocked_amount !== 0;
+  // Splittable timing — derived. The "missing 350K" in Current-Enrolled
+  // cases shows up here as `splittable.withheld`.
+  const splittable = splittableTiming(r);
+
+  // Show the timing section only when something interesting happened.
+  const hasTimingActivity =
+    splittable.withheld > 0 ||
+    splittable.unlocked > 0 ||
+    priorityComputed > 0 ||
+    r.priority_unlocked_amount > 0;
 
   return (
     <div
@@ -287,7 +319,7 @@ function BonusRowCard({ row }: { row: BonusRow }) {
       <div className="grid grid-cols-[1fr_auto] gap-x-6 gap-y-1 text-sm">
         {/*
           EARNINGS — components that contribute to Gross bonus.
-          The math now reconciles: Earnings - Deductions = Gross.
+          Math: sum of earnings - deductions = Gross.
         */}
         <GroupHeader>Earnings</GroupHeader>
         <ValueRow label="Tier bonus"                  value={r.tier_bonus} muted={!r.tier_bonus} />
@@ -296,7 +328,7 @@ function BonusRowCard({ row }: { row: BonusRow }) {
         <ValueRow label="Flat-local enrolment bonus"  value={r.flat_local_enrolment_bonus} muted={!r.flat_local_enrolment_bonus} />
         <ValueRow label="Priority (computed)"         value={priorityComputed} muted={!priorityComputed} />
 
-        {/* DEDUCTIONS — subtractions from Earnings. */}
+        {/* DEDUCTIONS — subtractions from Earnings before Gross. */}
         {(r.presales_share_taken !== 0 || r.advance_offset !== 0) && (
           <GroupHeader>Deductions</GroupHeader>
         )}
@@ -308,34 +340,50 @@ function BonusRowCard({ row }: { row: BonusRow }) {
         )}
 
         {/*
-          PRIORITY TIMING — how the computed priority was routed this run.
-          paid + withheld + deferred = computed (this run).
-          unlocked is separate — it's a release from a prior month's
-          withhold and adds to net_payable on top of the splittable portion.
+          TIMING — explains the difference between Gross and Net.
+          Splittable: status-driven withholding (current-enrolled holds back
+            half of the splittable portion until visa receipt).
+          Priority: independent timing rules — passes through at full value
+            under STANDARD_50_50, split under SPLIT_25_25_50, or deferred
+            in carry-over data-gap cases.
         */}
-        {hasPriorityActivity && (
+        {hasTimingActivity && (
           <>
-            <GroupHeader>Priority timing</GroupHeader>
-            <ValueRow
-              label="Paid this run"
-              value={r.priority_bonus}
-              muted={!r.priority_bonus}
-            />
+            <GroupHeader>Timing</GroupHeader>
+            {splittable.withheld > 0 && (
+              <ValueRow
+                label="Splittable withheld this run (releases at visa receipt)"
+                value={splittable.withheld}
+              />
+            )}
+            {splittable.unlocked > 0 && (
+              <ValueRow
+                label="Splittable unlocked from prior month"
+                value={splittable.unlocked}
+              />
+            )}
+            {(priorityComputed > 0 || r.priority_bonus > 0) && (
+              <ValueRow
+                label="Priority paid this run"
+                value={r.priority_bonus}
+                muted={!r.priority_bonus}
+              />
+            )}
             {r.priority_withheld_amount !== 0 && (
               <ValueRow
-                label="Withheld this run (releases at visa/year-end)"
+                label="Priority withheld this run (releases at visa/year-end)"
                 value={r.priority_withheld_amount}
               />
             )}
             {r.priority_unlocked_amount !== 0 && (
               <ValueRow
-                label="Unlocked from prior month"
+                label="Priority unlocked from prior month"
                 value={r.priority_unlocked_amount}
               />
             )}
             {priorityDeferred !== 0 && (
               <ValueRow
-                label="Deferred (carry-over data gap)"
+                label="Priority deferred (carry-over data gap)"
                 value={priorityDeferred}
                 muted
               />
