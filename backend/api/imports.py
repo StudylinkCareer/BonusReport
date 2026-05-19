@@ -40,7 +40,7 @@ import logging
 import os
 import re
 import unicodedata
-from datetime import date, datetime, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
@@ -82,18 +82,24 @@ router = APIRouter(prefix="/api/imports", tags=["imports"])
 
 # HTML <input type="month"> emits "YYYY-MM" natively. We accept that exact
 # format only — anything else is a 400. Backed by tx_case.bonus_year_month
-# which is a DATE column; we store it as the 1st of the named month.
+# which is a CHAR(7) string column; we pass the validated 'YYYY-MM' value
+# through to the writer verbatim.
 _BONUS_YYYY_MM_RE = re.compile(r"^(\d{4})-(0[1-9]|1[0-2])$")
 
 
-def _parse_bonus_year_month(value: str) -> date:
-    """Parse 'YYYY-MM' to date(YYYY, MM, 1). Raise HTTPException(400) otherwise."""
+def _parse_bonus_year_month(value: str) -> str:
+    """Validate 'YYYY-MM'. Raise HTTPException(400) on bad input.
+
+    Returns the canonical 'YYYY-MM' form (stripped of whitespace), suitable
+    for direct insertion into tx_case.bonus_year_month.
+    """
     if not value:
         raise HTTPException(
             status_code=400,
             detail="bonus_year_month is required (format YYYY-MM, e.g. 2024-01).",
         )
-    m = _BONUS_YYYY_MM_RE.match(value.strip())
+    cleaned = value.strip()
+    m = _BONUS_YYYY_MM_RE.match(cleaned)
     if not m:
         raise HTTPException(
             status_code=400,
@@ -101,8 +107,7 @@ def _parse_bonus_year_month(value: str) -> date:
                 f"bonus_year_month must be YYYY-MM (e.g. 2024-01). Got: {value!r}"
             ),
         )
-    year, month = int(m.group(1)), int(m.group(2))
-    return date(year, month, 1)
+    return cleaned
 
 
 # ---------------------------------------------------------------------------
@@ -128,15 +133,15 @@ async def upload_crm_reports(
     if not files:
         raise HTTPException(status_code=400, detail="At least one file required.")
 
-    bonus_run_date = _parse_bonus_year_month(bonus_year_month)
+    bonus_run_ym = _parse_bonus_year_month(bonus_year_month)
     log.info(
         "Upload batch: %d file(s), bonus_year_month=%s",
-        len(files), bonus_run_date.isoformat(),
+        len(files), bonus_run_ym,
     )
 
     results: list[dict] = []
     for upload in files:
-        results.append(await _process_one_file(upload, bonus_run_date))
+        results.append(await _process_one_file(upload, bonus_run_ym))
 
     return {
         "total_files": len(files),
@@ -150,7 +155,7 @@ async def upload_crm_reports(
 # Per-file processing
 # ---------------------------------------------------------------------------
 
-async def _process_one_file(upload: UploadFile, bonus_year_month: date) -> dict:
+async def _process_one_file(upload: UploadFile, bonus_year_month: str) -> dict:
     """Process a single uploaded file. Returns a result dict; never raises."""
     if not upload.filename:
         return {"success": False, "filename": None, "error": "No filename supplied."}
@@ -281,7 +286,7 @@ async def _process_one_file(upload: UploadFile, bonus_year_month: date) -> dict:
             "import_run_id": None,
             "run_year": year,
             "run_month": month,
-            "bonus_year_month": bonus_year_month.isoformat(),
+            "bonus_year_month": bonus_year_month,
             "staff_id": staff_id,
             "report_period": str(report_period),
             "file_path": str(dest_path),
@@ -296,7 +301,7 @@ async def _process_one_file(upload: UploadFile, bonus_year_month: date) -> dict:
         "import_run_id": import_run_id,
         "run_year": year,
         "run_month": month,
-        "bonus_year_month": bonus_year_month.isoformat(),
+        "bonus_year_month": bonus_year_month,
         "staff_id": staff_id,
         "report_period": str(report_period),
         "file_path": str(dest_path),
