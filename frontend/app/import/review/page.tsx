@@ -2702,53 +2702,91 @@ function CasesTable({
           )}
         </div>
         <div className="flex items-center gap-2">
-          {showSelect && selectedIds.length > 0 && workflowState === 'submitted' && (
-            <>
+          {/* Submitted-board action buttons.
+              Always rendered while on the Submitted pillar; disabled
+              (and label simplified) when no rows are selected. Avoids
+              the appear/disappear flicker of the previous gated render
+              and makes the buttons discoverable before the first click.
+              In Batch B these will be joined by a "gate" indicator
+              (period must be complete) for Total bonus. */}
+          {showSelect && workflowState === 'submitted' && (() => {
+            const noneSelected = selectedIds.length === 0;
+            const calcDisabled = calculating || finalizing || noneSelected;
+            const finalDisabled = finalizing || calculating || noneSelected;
+            return (
+              <>
+                <button
+                  onClick={bulkCalculate}
+                  disabled={calcDisabled}
+                  className={`rounded px-3 py-1 font-medium text-white ${
+                    calcDisabled
+                      ? 'bg-gray-300 cursor-not-allowed'
+                      : 'bg-emerald-600 hover:bg-emerald-700'
+                  }`}
+                  title={
+                    noneSelected
+                      ? 'Select one or more cases to calculate.'
+                      : 'Run the engine on the period(s) covering the selected cases. Cases stay on this board so you can review overrides afterwards.'
+                  }
+                >
+                  {calculating
+                    ? 'Running engine…'
+                    : noneSelected
+                      ? 'Calculate'
+                      : `Calculate ${selectedIds.length}`}
+                </button>
+                <button
+                  onClick={bulkFinalize}
+                  disabled={finalDisabled}
+                  className={`rounded px-3 py-1 font-medium text-white ${
+                    finalDisabled
+                      ? 'bg-gray-300 cursor-not-allowed'
+                      : 'bg-blue-600 hover:bg-blue-700'
+                  }`}
+                  title={
+                    noneSelected
+                      ? 'Select one or more calculated cases to close.'
+                      : 'Move calculated cases to Closed. Requires the engine to have run for each selected case.'
+                  }
+                >
+                  {finalizing
+                    ? 'Finalizing…'
+                    : noneSelected
+                      ? 'Finalize → Closed'
+                      : `Finalize ${selectedIds.length} → Closed`}
+                </button>
+              </>
+            );
+          })()}
+          {/* Move-to-next-state button (Uploaded → In Review, In Review →
+              Submitted, etc.). Same always-visible / disabled-when-empty
+              pattern as above for consistency. */}
+          {showSelect && workflowState !== 'submitted' && nextState && (() => {
+            const noneSelected = selectedIds.length === 0;
+            const moveDisabled = transitioning || noneSelected;
+            return (
               <button
-                onClick={bulkCalculate}
-                disabled={calculating || finalizing}
+                onClick={bulkTransition}
+                disabled={moveDisabled}
                 className={`rounded px-3 py-1 font-medium text-white ${
-                  calculating
-                    ? 'bg-gray-400 cursor-not-allowed'
-                    : 'bg-emerald-600 hover:bg-emerald-700'
-                }`}
-                title="Run the engine on the period(s) covering the selected cases. Cases stay on this board so you can review overrides afterwards."
-              >
-                {calculating
-                  ? 'Running engine…'
-                  : `Calculate ${selectedIds.length}`}
-              </button>
-              <button
-                onClick={bulkFinalize}
-                disabled={finalizing || calculating}
-                className={`rounded px-3 py-1 font-medium text-white ${
-                  finalizing
-                    ? 'bg-gray-400 cursor-not-allowed'
+                  moveDisabled
+                    ? 'bg-gray-300 cursor-not-allowed'
                     : 'bg-blue-600 hover:bg-blue-700'
                 }`}
-                title="Move calculated cases to Closed. Requires the engine to have run for each selected case."
+                title={
+                  noneSelected
+                    ? `Select one or more cases to move to ${nextStateLabel}.`
+                    : `Move the selected cases to ${nextStateLabel}.`
+                }
               >
-                {finalizing
-                  ? 'Finalizing…'
-                  : `Finalize ${selectedIds.length} → Closed`}
+                {transitioning
+                  ? 'Moving…'
+                  : noneSelected
+                    ? `Move to ${nextStateLabel} →`
+                    : `Move ${selectedIds.length} to ${nextStateLabel} →`}
               </button>
-            </>
-          )}
-          {showSelect && selectedIds.length > 0 && workflowState !== 'submitted' && nextState && (
-            <button
-              onClick={bulkTransition}
-              disabled={transitioning}
-              className={`rounded px-3 py-1 font-medium text-white ${
-                transitioning
-                  ? 'bg-gray-400 cursor-not-allowed'
-                  : 'bg-blue-600 hover:bg-blue-700'
-              }`}
-            >
-              {transitioning
-                ? 'Moving…'
-                : `Move ${selectedIds.length} to ${nextStateLabel} →`}
-            </button>
-          )}
+            );
+          })()}
           <VariantSwitcher
             actingAs={actingAs}
             pageKey="import_review"
