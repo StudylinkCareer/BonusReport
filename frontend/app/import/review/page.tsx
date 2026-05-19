@@ -97,6 +97,7 @@ import { useRouter } from 'next/navigation';
 import { BonusEstimateModal } from '@/app/_components/BonusEstimateModal';
 import { CaseApprovalsModal } from '@/app/_components/CaseApprovalsModal';
 import { CaseOverridesModal } from '@/app/_components/CaseOverridesModal';
+import { CaseBonusBreakdownModal } from '@/app/_components/CaseBonusBreakdownModal';
 
 // ===========================================================================
 // Types
@@ -1705,6 +1706,10 @@ function CasesTable({
   const [approvalsModalCaseId, setApprovalsModalCaseId] = useState<number | null>(null);
   // Overrides modal (P14 Block 4 / C) — open when set to a case id.
   const [overridesModalCaseId, setOverridesModalCaseId] = useState<number | null>(null);
+  // Bonus breakdown modal (P14 Block 5 / B3) — open when set to a case id.
+  // Triggered by clicking any of the four bonus cells (Base / Δ Override /
+  // Priority / Total) on the Submitted board.
+  const [bonusModalCaseId, setBonusModalCaseId] = useState<number | null>(null);
   const [transitionError, setTransitionError] = useState<string | null>(null);
 
   // Calculate flow (only used on workflow_state === 'submitted').
@@ -1935,41 +1940,68 @@ function CasesTable({
                     const totalAll = c.bonus_rows_total ?? n;
                     const anyDraft = rows.some((r) => r.is_draft);
 
+                    // The whole cell is a button → click opens the bonus
+                    // breakdown modal (B3). The modal handles every state
+                    // gracefully, including "no rows visible" cases.
+                    const handleClick = (e: React.MouseEvent) => {
+                      e.stopPropagation();
+                      setBonusModalCaseId(c.id);
+                    };
+
                     if (n === 0) {
-                      return <span className="text-xs text-gray-400">—</span>;
+                      return (
+                        <button
+                          onClick={handleClick}
+                          className="text-xs text-gray-400 hover:text-gray-700 hover:bg-gray-100 rounded px-2 py-0.5"
+                          title={
+                            totalAll === 0
+                              ? 'No bonus rows yet — click to confirm'
+                              : `${totalAll} row(s) exist on this case but not visible to you — click for details`
+                          }
+                        >
+                          —
+                        </button>
+                      );
                     }
                     if (n === 1) {
                       return (
-                        <span
-                          className={`text-xs ${
-                            anyDraft ? 'text-gray-700 italic' : 'text-gray-900'
+                        <button
+                          onClick={handleClick}
+                          className={`text-xs rounded px-2 py-0.5 hover:bg-gray-100 ${
+                            anyDraft
+                              ? 'text-gray-700 italic'
+                              : 'text-gray-900'
                           }`}
                           title={`${tooltipNoun} for ${rows[0].staff_name ?? 'this staff'}${
-                            anyDraft ? ' (draft — not yet published)' : ''
-                          }`}
+                            rows[0].role_code ? ` (${rows[0].role_code})` : ''
+                          }${anyDraft ? ' — draft, not yet published' : ''} · click for full breakdown`}
                         >
                           {fmtVnd(total)}
-                        </span>
+                        </button>
                       );
                     }
                     return (
-                      <span
-                        className={`text-xs ${
-                          anyDraft ? 'text-gray-700 italic' : 'text-gray-900'
+                      <button
+                        onClick={handleClick}
+                        className={`text-xs rounded px-2 py-0.5 hover:bg-gray-100 ${
+                          anyDraft
+                            ? 'text-gray-700 italic'
+                            : 'text-gray-900'
                         }`}
                         title={
                           `${tooltipNoun} across ${n} staff (of ${totalAll} on case): ` +
                           rows
                             .map(
                               (r) =>
-                                `${r.staff_name ?? '?'} ${fmtVnd(getValue(r))}`,
+                                `${r.staff_name ?? '?'}${r.role_code ? ` (${r.role_code})` : ''} ${fmtVnd(getValue(r))}`,
                             )
                             .join(', ') +
-                          (anyDraft ? ' — draft, not yet published' : '')
+                          (anyDraft ? ' — draft, not yet published' : '') +
+                          ' · click for full breakdown'
                         }
                       >
                         {n} · {fmtVnd(total)}
-                      </span>
+                      </button>
                     );
                   },
                 } as ColumnDef<Case>;
@@ -3142,6 +3174,14 @@ function CasesTable({
         caseId={overridesModalCaseId}
         onClose={() => setOverridesModalCaseId(null)}
         onSaved={onTransitioned}
+      />
+      <CaseBonusBreakdownModal
+        caseRow={
+          bonusModalCaseId == null
+            ? null
+            : cases.find((c) => c.id === bonusModalCaseId) ?? null
+        }
+        onClose={() => setBonusModalCaseId(null)}
       />
     </div>
   );
