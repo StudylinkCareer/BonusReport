@@ -180,6 +180,46 @@ type Case = {
   // Phase 14 Block 4 / C — Per-slot management overrides
   calculated_at: string | null;          // engine-stamped when payments were written
   overrides: CaseOverrideSummary[];      // 0..3 rows mirroring slot staff
+
+  // Phase 14 Block 5 Piece 5 — Bonus payment rows visible to this viewer.
+  // The backend already filters these per viewer (admins see all rows;
+  // non-admins see only rows where staff_id matches them). bonus_rows_total
+  // is the unfiltered count, useful for "1 of 3 staff" badges without
+  // leaking amounts.
+  bonus_rows: CaseBonusRow[];
+  bonus_rows_total: number;
+};
+
+type CaseBonusRow = {
+  staff_id: number | null;
+  staff_name: string | null;
+  role_id: number | null;
+  role_code: string | null;
+  slot: string | null;
+  // Raw engine-output components (all in đồng, as integers)
+  tier: string | null;
+  tier_bonus: number;
+  package_bonus: number;
+  addon_bonus: number;
+  flat_local_enrolment_bonus: number;
+  priority_bonus: number;
+  priority_withheld_amount: number;
+  priority_unlocked_amount: number;
+  priority_schedule_type: string;
+  presales_share_taken: number;
+  advance_offset: number;
+  gross_bonus: number;
+  net_payable: number;
+  mgmt_override_amount: number | null;
+  // Computed convenience fields (backend SQL formula — see main.py)
+  //   base_bonus = net_payable - priority_bonus - priority_unlocked_amount
+  //   final_paid = net_payable + COALESCE(mgmt_override_amount, 0)
+  base_bonus: number;
+  final_paid: number;
+  // Draft / published status — NULL published_at means the row is still
+  // a draft (re-runnable). Set on Publish & Close.
+  is_draft: boolean;
+  published_at: string | null;
 };
 
 type CaseOverrideSummary = {
@@ -1855,6 +1895,114 @@ function CasesTable({
               },
             } as ColumnDef<Case>,
           ]
+        : []),
+      // Bonus columns (P14 Block 5 / B2) — only on the Submitted pillar,
+      // populated from the per-viewer-filtered `bonus_rows` array.
+      //   - 0 rows visible → "—"
+      //   - 1 row visible  → the value
+      //   - 2+ rows visible → "N · total" (admin viewing multi-staff case;
+      //     click-to-expand modal lands in B3)
+      // Drafts vs published are not distinguished visually here; the B3
+      // breakdown modal surfaces that. All four columns sum across the
+      // viewer's visible rows so each cell answers "what bonus, total,
+      // does this case represent for me?"
+      ...(workflowState === 'submitted'
+        ? (
+            // Helper: render one of the four bonus cells. Same logic each
+            // time, only the value-extractor differs.
+            (() => {
+              function makeBonusColumn(
+                id: string,
+                label: string,
+                tooltipNoun: string,
+                getValue: (r: CaseBonusRow) => number,
+              ): ColumnDef<Case> {
+                return {
+                  id,
+                  size: 110,
+                  minSize: 90,
+                  enableSorting: false,
+                  enableColumnFilter: false,
+                  enableResizing: false,
+                  header: () => (
+                    <span className="text-xs text-gray-600">{label}</span>
+                  ),
+                  cell: ({ row }) => {
+                    const c = row.original;
+                    const rows = c.bonus_rows ?? [];
+                    const n = rows.length;
+                    const total = rows.reduce((a, r) => a + (getValue(r) ?? 0), 0);
+                    const totalAll = c.bonus_rows_total ?? n;
+                    const anyDraft = rows.some((r) => r.is_draft);
+
+                    if (n === 0) {
+                      return <span className="text-xs text-gray-400">—</span>;
+                    }
+                    if (n === 1) {
+                      return (
+                        <span
+                          className={`text-xs ${
+                            anyDraft ? 'text-gray-700 italic' : 'text-gray-900'
+                          }`}
+                          title={`${tooltipNoun} for ${rows[0].staff_name ?? 'this staff'}${
+                            anyDraft ? ' (draft — not yet published)' : ''
+                          }`}
+                        >
+                          {fmtVnd(total)}
+                        </span>
+                      );
+                    }
+                    return (
+                      <span
+                        className={`text-xs ${
+                          anyDraft ? 'text-gray-700 italic' : 'text-gray-900'
+                        }`}
+                        title={
+                          `${tooltipNoun} across ${n} staff (of ${totalAll} on case): ` +
+                          rows
+                            .map(
+                              (r) =>
+                                `${r.staff_name ?? '?'} ${fmtVnd(getValue(r))}`,
+                            )
+                            .join(', ') +
+                          (anyDraft ? ' — draft, not yet published' : '')
+                        }
+                      >
+                        {n} · {fmtVnd(total)}
+                      </span>
+                    );
+                  },
+                } as ColumnDef<Case>;
+              }
+
+              return [
+                makeBonusColumn(
+                  'bonus_base',
+                  'Base',
+                  'Base bonus (enrolment + package + services, no priority)',
+                  (r) => r.base_bonus,
+                ),
+                makeBonusColumn(
+                  'bonus_override',
+                  'Δ Override',
+                  'Engine-applied management override',
+                  (r) => r.mgmt_override_amount ?? 0,
+                ),
+                makeBonusColumn(
+                  'bonus_priority',
+                  'Priority',
+                  'Priority partner bonus paid this run',
+                  (r) => r.priority_bonus,
+                ),
+                makeBonusColumn(
+                  'bonus_total',
+                  'Total',
+                  'Total bonus (net_payable + applied override)',
+                  (r) => r.final_paid,
+                ),
+              ];
+            })()
+          )
         : []),
       {
         id: 'import_status',
