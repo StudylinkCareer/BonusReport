@@ -275,6 +275,12 @@ def run_consolidated(
                         record, notes = transform_row(
                             cursor, raw,
                             run_year=period.year, run_month=period.month,
+                            # For Mass Upload, the case's "bonus run" period is
+                            # the same as the period derived from its status +
+                            # dates. The DQO doesn't enter a single value at
+                            # the UI for consolidated uploads because the file
+                            # spans many months (used for regression testing).
+                            bonus_year_month=f"{period.year:04d}-{period.month:02d}",
                         )
                         write_transformer_output(
                             cursor, record, notes,

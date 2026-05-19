@@ -19,7 +19,6 @@ WriteResult fields and the file processes to completion.
 
 import logging
 from contextlib import nullcontext
-from datetime import date
 from pathlib import Path
 from typing import Optional
 
@@ -35,7 +34,7 @@ log = logging.getLogger(__name__)
 def run_file(
     path: Path | str,
     *,
-    bonus_year_month: date,
+    bonus_year_month: str,
     conn=None,
     run_year: Optional[int] = None,
     run_month: Optional[int] = None,
@@ -44,12 +43,13 @@ def run_file(
 
     Args:
         path: path to the xlsx file.
-        bonus_year_month: DQO-keyed bonus run period (1st of month) applied
-            uniformly to every row produced by this import. REQUIRED.
-            Distinct from run_year/run_month which reflect when the case
-            event happened (parsed from filename); this reflects which
-            bonus run the case should be paid in (supports retroactive /
-            forward-dated uploads).
+        bonus_year_month: DQO-keyed bonus run period in 'YYYY-MM' form,
+            applied uniformly to every row produced by this import.
+            REQUIRED. Distinct from run_year/run_month which reflect when
+            the case event happened (parsed from filename); this reflects
+            which bonus run the case should be paid in (supports
+            retroactive / forward-dated uploads). Stored to
+            tx_case.bonus_year_month (CHAR(7)).
         conn: optional pre-opened psycopg connection. If None, the
             orchestrator opens one and manages commit/rollback itself.
             If supplied, the caller is responsible for transaction control.
@@ -78,7 +78,7 @@ def run_file(
         run_month = info.month
     log.info(
         "Importing %s as run %d-%02d (bonus_year_month=%s)",
-        path.name, run_year, run_month, bonus_year_month.isoformat(),
+        path.name, run_year, run_month, bonus_year_month,
     )
 
     own_conn = conn is None

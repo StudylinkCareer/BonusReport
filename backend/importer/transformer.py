@@ -158,13 +158,15 @@ class CaseRecord:
     notes: Optional[str]
     run_year: int
     run_month: int
-    # Phase 14 — DQO-keyed bonus run period (1st of month). Set ONCE per
-    # upload by the DQO via the upload UI; the orchestrator applies the
-    # same value to every record produced by transform_row. Not derived
-    # from run_year/run_month because uploads can be retroactive or
-    # forward-dated (e.g. a Jan-2024 closed-file uploaded in March
-    # might be intended for the 2024-03 bonus run).
-    bonus_year_month: date
+    # Phase 14 — DQO-keyed bonus run period in 'YYYY-MM' form. Set ONCE
+    # per upload by the DQO via the upload UI (Input sheet mode); the
+    # orchestrator applies the same value to every record. For Mass
+    # Upload, derived per row from that row's run_year/run_month.
+    # Not derived from run_year/run_month in Input sheet mode because
+    # uploads can be retroactive or forward-dated (e.g. a Jan-2024
+    # closed-file uploaded in March might be intended for the 2024-03
+    # bonus run). Stored to tx_case.bonus_year_month (CHAR(7)).
+    bonus_year_month: str
 
 
 @dataclass(frozen=True)
@@ -355,7 +357,7 @@ def transform_row(
     *,
     run_year: int,
     run_month: int,
-    bonus_year_month: date,
+    bonus_year_month: str,
 ) -> tuple[Optional[CaseRecord], list[NoteRecord]]:
     notes: list[NoteRecord] = []
     data = raw.data
