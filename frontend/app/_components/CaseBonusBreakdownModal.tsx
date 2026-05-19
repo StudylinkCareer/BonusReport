@@ -10,7 +10,16 @@
 // the page already has it in state — avoids a second API call and keeps
 // the modal in sync with whatever the caller already shows in the cells.
 //
-// Phase 14 Block 5 B3.
+// Phase 14 Block 5 B3 + reconciliation patch:
+//   * Earnings section now shows "Priority (computed)" derived from
+//     gross_bonus math, so Earnings always reconciles with Gross bonus.
+//     (The DB column priority_bonus is the PAID-THIS-RUN value, which
+//     can be 0 even when 175K of priority contributed to gross_bonus
+//     — e.g. carry-over data-gap cases. Showing only the paid value
+//     hid the discrepancy.)
+//   * New "Priority timing" section breaks down where the computed
+//     priority went: paid / withheld / unlocked / deferred. Only
+//     rendered when there's any priority activity to discuss.
 
 import { useEffect, type ReactNode } from 'react';
 
@@ -71,6 +80,25 @@ type Props = {
 function fmtVnd(n: number | null | undefined): string {
   if (n == null) return '–';
   return n.toLocaleString('vi-VN') + ' đ';
+}
+
+// Pre-timing priority value, derived from gross_bonus math.
+// From calc.py:
+//   gross = tier + package + addon + priority + flat_local - presales_share
+// Solving for priority:
+//   priority = gross - tier - package - addon - flat_local + presales_share
+//
+// This is the priority value calc_priority.py computed, before
+// payment_timing decided how much to pay / withhold / defer.
+function priorityComputedPreTiming(r: BonusRow): number {
+  return (
+    r.gross_bonus
+    - r.tier_bonus
+    - r.package_bonus
+    - r.addon_bonus
+    - r.flat_local_enrolment_bonus
+    + r.presales_share_taken
+  );
 }
 
 // ===========================================================================
@@ -202,6 +230,23 @@ function EmptyState({ totalAll }: { totalAll: number }) {
 function BonusRowCard({ row }: { row: BonusRow }) {
   const r = row;
 
+  // Pre-timing priority (the value calc_priority.py computed).
+  // This is what contributed to gross_bonus, regardless of how
+  // payment_timing later routed it (paid / withheld / unlocked / deferred).
+  const priorityComputed = priorityComputedPreTiming(r);
+
+  // Priority "deferred" = computed - (paid + withheld). Non-zero when
+  // a carry-over data-gap occurs (priority computed in the original
+  // enrolment month but never paid because there's no matching prior
+  // withhold to release). This makes that state visible to reviewers.
+  const priorityDeferred =
+    priorityComputed - r.priority_bonus - r.priority_withheld_amount;
+
+  // Show the priority-timing section only when there's any priority
+  // activity to discuss (computed > 0, or something unlocked from prior).
+  const hasPriorityActivity =
+    priorityComputed !== 0 || r.priority_unlocked_amount !== 0;
+
   return (
     <div
       className={`rounded border p-4 ${
@@ -240,18 +285,18 @@ function BonusRowCard({ row }: { row: BonusRow }) {
 
       {/* Components grid: two columns. Left = labels, right = amounts. */}
       <div className="grid grid-cols-[1fr_auto] gap-x-6 gap-y-1 text-sm">
+        {/*
+          EARNINGS — components that contribute to Gross bonus.
+          The math now reconciles: Earnings - Deductions = Gross.
+        */}
         <GroupHeader>Earnings</GroupHeader>
-        <ValueRow label="Tier bonus"                  value={r.tier_bonus} />
-        <ValueRow label="Package bonus"               value={r.package_bonus} />
-        <ValueRow label="Add-on bonus"                value={r.addon_bonus} />
+        <ValueRow label="Tier bonus"                  value={r.tier_bonus} muted={!r.tier_bonus} />
+        <ValueRow label="Package bonus"               value={r.package_bonus} muted={!r.package_bonus} />
+        <ValueRow label="Add-on bonus"                value={r.addon_bonus} muted={!r.addon_bonus} />
         <ValueRow label="Flat-local enrolment bonus"  value={r.flat_local_enrolment_bonus} muted={!r.flat_local_enrolment_bonus} />
-        <ValueRow label="Priority bonus (paid)"       value={r.priority_bonus} />
-        <ValueRow
-          label="Priority unlocked (from prior month)"
-          value={r.priority_unlocked_amount}
-          muted={!r.priority_unlocked_amount}
-        />
+        <ValueRow label="Priority (computed)"         value={priorityComputed} muted={!priorityComputed} />
 
+        {/* DEDUCTIONS — subtractions from Earnings. */}
         {(r.presales_share_taken !== 0 || r.advance_offset !== 0) && (
           <GroupHeader>Deductions</GroupHeader>
         )}
@@ -262,17 +307,43 @@ function BonusRowCard({ row }: { row: BonusRow }) {
           <ValueRow label="Advance offset" value={-r.advance_offset} negative />
         )}
 
-        {r.priority_withheld_amount !== 0 && (
+        {/*
+          PRIORITY TIMING — how the computed priority was routed this run.
+          paid + withheld + deferred = computed (this run).
+          unlocked is separate — it's a release from a prior month's
+          withhold and adds to net_payable on top of the splittable portion.
+        */}
+        {hasPriorityActivity && (
           <>
-            <GroupHeader>Withheld for later</GroupHeader>
+            <GroupHeader>Priority timing</GroupHeader>
             <ValueRow
-              label="Priority withheld (released at year-end)"
-              value={r.priority_withheld_amount}
-              muted
+              label="Paid this run"
+              value={r.priority_bonus}
+              muted={!r.priority_bonus}
             />
+            {r.priority_withheld_amount !== 0 && (
+              <ValueRow
+                label="Withheld this run (releases at visa/year-end)"
+                value={r.priority_withheld_amount}
+              />
+            )}
+            {r.priority_unlocked_amount !== 0 && (
+              <ValueRow
+                label="Unlocked from prior month"
+                value={r.priority_unlocked_amount}
+              />
+            )}
+            {priorityDeferred !== 0 && (
+              <ValueRow
+                label="Deferred (carry-over data gap)"
+                value={priorityDeferred}
+                muted
+              />
+            )}
           </>
         )}
 
+        {/* TOTALS */}
         <GroupHeader>Totals</GroupHeader>
         <ValueRow label="Gross bonus"   value={r.gross_bonus} muted={!r.gross_bonus} />
         <ValueRow label="Net payable"   value={r.net_payable} />

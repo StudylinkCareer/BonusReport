@@ -235,7 +235,7 @@ def calculate_case(
                 f"tier={r.tier}; "
                 f"package={r.package} ({r.package_audit.get('reason') or r.package_audit.get('service_code')}); "
                 f"addon={r.addon} ({r.addon_audit.get('reason') or 'sum of items'}); "
-                f"priority={r.priority} ({r.priority_audit.get('reason') or r.priority_audit.get('partner_name')}); "
+                f"priority={r.priority} ({r.priority_audit.get('reason') or r.priority_audit.get('list_name')}); "
                 f"flat_local={r.flat_local}; "
                 f"presales_share={presales_share} ({presales_audit.get('reason') or presales_audit.get('sign_meaning')})"
             ),
