@@ -1,4 +1,4 @@
-'use client';
+  'use client';
 
 /**
  * SAVE TO: frontend/app/import/review/page.tsx
@@ -4121,11 +4121,22 @@ function SelectCell({
       ? options.filter((o) => o.toLowerCase().includes(lcDraft))
       : options;
 
-  const dropdownOptions = filtered.map((opt) => ({
-    key: opt,
-    label: opt,
-    isCurrent: opt === displayValue,
-  }));
+  // Sentinel for the explicit clear entry. The real string options are
+  // arbitrary text, so we use a sentinel that wouldn't appear as a
+  // legitimate value (starts with double-underscore in the same style as
+  // the FkCell/StaffCell fix).
+  const CLEAR_KEY = '__clear__';
+
+  const dropdownOptions = [
+    ...(displayValue != null
+      ? [{ key: CLEAR_KEY, label: '— Clear assignment —', isCurrent: false }]
+      : []),
+    ...filtered.map((opt) => ({
+      key: opt,
+      label: opt,
+      isCurrent: opt === displayValue,
+    })),
+  ];
 
   return (
     <div className="relative">
@@ -4137,7 +4148,13 @@ function SelectCell({
         options={dropdownOptions}
         draft={draft}
         setDraft={setDraft}
-        onPick={(key) => commit(key)}
+        onPick={(key) => {
+          if (key === CLEAR_KEY) {
+            commit(null);
+          } else {
+            commit(key);
+          }
+        }}
         onCancel={cancel}
         onCommitDraft={() => {
           const trimmed = draft.trim();
@@ -4294,11 +4311,41 @@ function FkCell({
         })
       : options;
 
-  const dropdownOptions = filtered.map((o) => ({
-    key: String(o.id),
-    label: (labelField === 'code' ? o.code : o.name) ?? '',
-    isCurrent: o.id === value,
-  }));
+  // Sentinel for the explicit clear entry. Won't collide with real ids
+  // (positive integers stringified). Mirrors the StaffCell pattern.
+  const CLEAR_KEY = '__clear__';
+
+  function clearValue() {
+    // Same effect as emptying the input and pressing Enter, but exposed
+    // as a discoverable dropdown item rather than hidden keyboard trick.
+    if (value === null) {
+      setEditing(false);
+      return;
+    }
+    setLocalLabel(null);
+    setState('saving');
+    setError(null);
+    onSave(null)
+      .then(() => {
+        setEditing(false);
+        setState('idle');
+      })
+      .catch((e) => {
+        setError(String(e instanceof Error ? e.message : e));
+        setState('error');
+      });
+  }
+
+  const dropdownOptions = [
+    ...(value !== null
+      ? [{ key: CLEAR_KEY, label: '— Clear assignment —', isCurrent: false }]
+      : []),
+    ...filtered.map((o) => ({
+      key: String(o.id),
+      label: (labelField === 'code' ? o.code : o.name) ?? '',
+      isCurrent: o.id === value,
+    })),
+  ];
 
   return (
     <div className="relative">
@@ -4310,7 +4357,13 @@ function FkCell({
         options={dropdownOptions}
         draft={draft}
         setDraft={setDraft}
-        onPick={(key) => pickById(Number(key))}
+        onPick={(key) => {
+          if (key === CLEAR_KEY) {
+            clearValue();
+          } else {
+            pickById(Number(key));
+          }
+        }}
         onCancel={cancel}
         onCommitDraft={commitDraft}
         placeholder={`type to search… (${options.length} options)`}
@@ -4411,6 +4464,28 @@ function StaffCell({
     pickById(match.id);
   }
 
+  function clearStaff() {
+    // Explicit "(none)" path — invoked when the user picks the
+    // "— Clear assignment —" entry from the dropdown. Equivalent to
+    // emptying the input and committing, but discoverable as a list item.
+    if (staffId === null) {
+      setEditing(false);
+      return;
+    }
+    setLocalName(null);
+    setState('saving');
+    setError(null);
+    onSave(null, null)
+      .then(() => {
+        setEditing(false);
+        setState('idle');
+      })
+      .catch((e) => {
+        setError(String(e instanceof Error ? e.message : e));
+        setState('error');
+      });
+  }
+
   if (!editing) {
     return (
       <div
@@ -4433,11 +4508,21 @@ function StaffCell({
       ? options.filter((o) => (o.name ?? '').toLowerCase().includes(lcDraft))
       : options;
 
-  const dropdownOptions = filtered.map((o) => ({
-    key: String(o.id),
-    label: o.name ?? '',
-    isCurrent: o.id === staffId,
-  }));
+  // Sentinel key for the clear option. Won't collide with real staff ids
+  // (which are positive integers stringified).
+  const CLEAR_KEY = '__clear__';
+
+  const dropdownOptions = [
+    // Only show the clear option when there's actually something to clear.
+    ...(staffId !== null
+      ? [{ key: CLEAR_KEY, label: '— Clear assignment —', isCurrent: false }]
+      : []),
+    ...filtered.map((o) => ({
+      key: String(o.id),
+      label: o.name ?? '',
+      isCurrent: o.id === staffId,
+    })),
+  ];
 
   return (
     <div className="relative">
@@ -4449,7 +4534,13 @@ function StaffCell({
         options={dropdownOptions}
         draft={draft}
         setDraft={setDraft}
-        onPick={(key) => pickById(Number(key))}
+        onPick={(key) => {
+          if (key === CLEAR_KEY) {
+            clearStaff();
+          } else {
+            pickById(Number(key));
+          }
+        }}
         onCancel={cancel}
         onCommitDraft={commitDraft}
         placeholder={`type to search… (${options.length} staff)`}
