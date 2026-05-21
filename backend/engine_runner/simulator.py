@@ -39,6 +39,7 @@ from backend.engine_runner.adapter import (
 )
 from backend.engine_runner.cli import (
     build_run_context,
+    load_case_services,
     load_cases,
     load_enrolments_by_staff_office,
     load_open_carry_overs,
@@ -229,9 +230,20 @@ def estimate_bonus_for_case(case_id: int) -> dict:
 
             case_row = case_rows[0]
 
+            # Load confirmed service fees for this case (one-element list,
+            # but same shape as the bulk runner).
+            case_service_map = load_case_services(
+                cursor,
+                case_ids=[case_row["id"]],
+            )
+
             # ---- 5. Adapt + calculate ------------------------------------
             try:
-                case_input = adapt_case(case_row, ref)
+                case_input = adapt_case(
+                    case_row,
+                    ref,
+                    addon_items=case_service_map.get(case_row["id"], []),
+                )
             except CaseNotAdaptableError as e:
                 skipped.append(f"Not adaptable: {e.reason}")
                 return {

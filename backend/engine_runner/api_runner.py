@@ -54,6 +54,7 @@ from backend.engine_runner.adapter import (
 )
 from backend.engine_runner.cli import (
     build_run_context,
+    load_case_services,
     load_cases,
     load_enrolments_by_staff_office,
     load_open_carry_overs,
@@ -396,12 +397,24 @@ def _run_engine_within_connection(
         case_office_id_map = {r["id"]: r["case_office_id"] for r in case_rows}
         case_contract_id_map = {r["id"]: r["contract_id"] for r in case_rows}
 
+        # Load confirmed service-fee attachments for these cases. The engine
+        # reads them via CaseInput.addon_items and pays via calc_addon.
+        # Without this load, service fees on a case are silently ignored.
+        case_service_map = load_case_services(
+            cursor,
+            case_ids=[r["id"] for r in case_rows],
+        )
+
         # Adapt + run engine per case
         for case_row in case_rows:
             cid = case_row.get("contract_id") or "<no-id>"
 
             try:
-                case_input = adapt_case(case_row, ref)
+                case_input = adapt_case(
+                    case_row,
+                    ref,
+                    addon_items=case_service_map.get(case_row["id"], []),
+                )
             except CaseNotAdaptableError as e:
                 skipped.append({"contract_id": cid, "reason": e.reason})
                 continue

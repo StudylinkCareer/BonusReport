@@ -247,6 +247,62 @@ def load_open_carry_overs(cursor: Any) -> dict[tuple[str, int], int]:
     }
 
 
+def load_case_services(
+    cursor: Any,
+    case_ids: list[int] | None = None,
+) -> dict[int, list[tuple[int, int]]]:
+    """
+    Load tx_case_service rows grouped by case_id.
+
+    Returns:
+        {case_id: [(service_fee_id, count), ...]}
+
+    The output shape matches the CaseInput.addon_items field that the
+    engine's calc_addon module reads. Empty list when no service fees
+    are attached to a case.
+
+    If case_ids is provided, only those cases are loaded. Pass the list
+    of case ids returned by load_cases() so we don't pull the world.
+    A None case_ids loads everything; an empty list short-circuits and
+    returns an empty dict.
+
+    Only rows with confirmed=TRUE are loaded. Unconfirmed rows are
+    operator drafts and must not flow into bonus calculation until
+    a reviewer confirms them.
+    """
+    if case_ids is not None and not case_ids:
+        return {}
+
+    if case_ids is None:
+        cursor.execute(
+            """
+            SELECT case_id, service_fee_id, count
+              FROM tx_case_service
+             WHERE confirmed = TRUE
+             ORDER BY case_id, id
+            """
+        )
+    else:
+        cursor.execute(
+            """
+            SELECT case_id, service_fee_id, count
+              FROM tx_case_service
+             WHERE confirmed = TRUE
+               AND case_id = ANY(%s)
+             ORDER BY case_id, id
+            """,
+            (case_ids,),
+        )
+
+    grouped: dict[int, list[tuple[int, int]]] = {}
+    for row in cursor.fetchall():
+        case_id = row["case_id"]
+        grouped.setdefault(case_id, []).append(
+            (row["service_fee_id"], row["count"])
+        )
+    return grouped
+
+
 def load_prior_priority_withholdings(cursor: Any) -> dict[tuple[str, int], int]:
     """
     Phase 12b: Load net remaining priority withholdings keyed by
