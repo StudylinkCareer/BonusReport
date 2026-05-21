@@ -158,6 +158,19 @@ class CaseRecord:
     bonus_year_month: str
 
 
+# DEPRECATED — kept only so legacy code that still imports it doesn't
+# crash. The new transformer never emits NoteRecords; warnings are now
+# inline on CaseRecord.flag_reason. Remove this class once
+# consolidated_orchestrator and any other legacy callers are migrated
+# or removed.
+@dataclass(frozen=True)
+class NoteRecord:
+    """Deprecated. Retained as an import-compatibility shim."""
+    warning_type: str
+    raw_value: Optional[str]
+    note: str
+
+
 # ---------------------------------------------------------------------------
 # Status escalation
 # ---------------------------------------------------------------------------
