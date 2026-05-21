@@ -38,12 +38,25 @@ TRANSFORMER V2 — KEY POLICY (locked design decisions):
    → partner. Office-first protects against personal-name variants
    colliding with sub-agent or partner names.
 
-8. SYSTEM TYPE cross-check (preserved): mismatch between System Type
-   text and the institution's active-agreement state at contract_date
-   produces a WARN-MISMATCH flag, but the row still imports.
+8. INSTITUTION TYPE — DB is authoritative (Phase 1 of long-term
+   institution-classification strategy). Logic:
+     a) Compute marker-derived classification from institution name:
+          `**` suffix → OUT_OF_SYSTEM
+          `*`  suffix → VIA_PARTNER  (master agent or group routing)
+          neither      → DIRECT
+     b) Look up ref_institution_agreement by (institution_id, contract_date).
+          When multiple rows match, VIA_PARTNER takes precedence over DIRECT
+          (group agreement drives the algorithm; institution-level direct
+           agreement only defines that institution's own target quota).
+     c) Store DB's system_status in tx_case.institution_type.
+     d) When marker-derived classification disagrees with DB row, flag
+        INSTITUTION_TYPE_DISAGREEMENT — but DB still wins. Business uses
+        the flag count over time to clean the DB; eventually markers
+        become decorative.
 
-9. ASTERISKS in institution names are LEGACY DATA. Pure alias lookup
-   (no parsing). Add aliases as needed.
+9. SYSTEM TYPE — case-level routing from CRM (Trong/Ngoài hệ thống),
+   stored on tx_case.system_type for audit. Cross-checked against the
+   DB classification for sanity.
 
 Import status escalation:
     OK < WARN-MISMATCH < UNRESOLVED < SCRAP
@@ -115,6 +128,16 @@ STATUS_SCRAP = "SCRAP"
 SYSTEM_TYPE_IN_VN = "Trong hệ thống"
 SYSTEM_TYPE_OUT_VN = "Ngoài hệ thống"
 
+# institution_type values (matches ref_institution_agreement.system_status)
+INST_IN_SYSTEM = "IN_SYSTEM"
+INST_OUT_OF_SYSTEM = "OUT_OF_SYSTEM"
+
+# Marker-derived classifications (intermediate, not stored on tx_case;
+# these are what the source-file asterisks ASSERT about the case routing)
+MARKER_OUT_OF_SYSTEM = "OUT_OF_SYSTEM"
+MARKER_VIA_PARTNER = "VIA_PARTNER"
+MARKER_DIRECT = "DIRECT"
+
 
 # ---------------------------------------------------------------------------
 # Output dataclass
@@ -151,6 +174,8 @@ class CaseRecord:
     case_officer_role_id: Optional[int]
     pre_sales_staff_id: Optional[int]
     referring_source_type: str
+    institution_type: Optional[str]          # DB-derived (IN_SYSTEM/OUT_OF_SYSTEM)
+    system_type: Optional[str]               # CRM raw text (audit)
     import_status: str
     import_warnings: Optional[str]
     incentive_amount: int
@@ -265,6 +290,26 @@ def _parse_system_type(text: Optional[str]) -> Optional[str]:
     return None
 
 
+def _classify_from_markers(institution_raw: Optional[str]) -> str:
+    """Derive routing classification from asterisk markers in the
+    institution name.
+
+    `**` suffix → OUT_OF_SYSTEM (canonical signal from source data)
+    `*`  suffix → VIA_PARTNER   (master agent or group routing)
+    neither      → DIRECT
+
+    Note: `**` is checked first because every string with `**` also
+    contains `*`.
+    """
+    if not institution_raw:
+        return MARKER_DIRECT
+    if "**" in institution_raw:
+        return MARKER_OUT_OF_SYSTEM
+    if "*" in institution_raw:
+        return MARKER_VIA_PARTNER
+    return MARKER_DIRECT
+
+
 def _parse_incentive(value: Any) -> int:
     """Customer incentive amount: yes/no flag or VND value -> int đồng."""
     if value is None:
@@ -330,32 +375,61 @@ def _get_staff_office(cursor, staff_id: Optional[int]) -> Optional[int]:
     return row["home_office_id"] if row else None
 
 
-def _has_active_agreement(
+def _resolve_institution_classification(
     cursor,
     institution_id: Optional[int],
     case_date: Optional[date],
-) -> bool:
-    """Does this institution have an active agreement at the case date?"""
+) -> Optional[str]:
+    """Look up institution_type from ref_institution_agreement.
+
+    Returns the institution's system_status (IN_SYSTEM / OUT_OF_SYSTEM)
+    active at case_date. Returns None if no agreement row matches.
+
+    PRECEDENCE RULE (locked):
+        When the institution has both a VIA_PARTNER agreement (i.e. via
+        a group) AND a DIRECT agreement active at the same date, the
+        VIA_PARTNER agreement wins. The group agreement drives the bonus
+        algorithm; a separate direct agreement on the same institution
+        only defines that institution's own target quota.
+
+        Tiebreaker: VIA_PARTNER > DIRECT.
+
+    case_date is the contract_signed_date. If absent, defaults to
+    CURRENT_DATE (acceptable because every row that gets here has
+    already been written to disk; missing dates are flagged separately).
+    """
     if institution_id is None:
-        return False
+        return None
+
     if case_date is None:
         cursor.execute(
-            """SELECT 1 FROM ref_institution_agreement
+            """SELECT system_status, agreement_type
+                 FROM ref_institution_agreement
                 WHERE institution_id = %s
+                  AND effective_from <= CURRENT_DATE
                   AND (effective_to IS NULL OR effective_to >= CURRENT_DATE)
+                ORDER BY
+                    CASE agreement_type WHEN 'VIA_PARTNER' THEN 0 ELSE 1 END,
+                    effective_from DESC
                 LIMIT 1""",
             (institution_id,),
         )
     else:
         cursor.execute(
-            """SELECT 1 FROM ref_institution_agreement
+            """SELECT system_status, agreement_type
+                 FROM ref_institution_agreement
                 WHERE institution_id = %s
                   AND effective_from <= %s
                   AND (effective_to IS NULL OR effective_to >= %s)
+                ORDER BY
+                    CASE agreement_type WHEN 'VIA_PARTNER' THEN 0 ELSE 1 END,
+                    effective_from DESC
                 LIMIT 1""",
             (institution_id, case_date, case_date),
         )
-    return cursor.fetchone() is not None
+
+    row = cursor.fetchone()
+    return row["system_status"] if row else None
 
 
 def _resolve_application_status(
@@ -544,11 +618,6 @@ def transform_row(
     course_start_date = _coerce_date(data.get(COL_COURSE_START))
     visa_received_date = _coerce_date(data.get(COL_VISA_RECEIVED))
 
-    # Note: if a date column had unparseable text (e.g. "TBD"), the reader
-    # already returned None. We don't flag here — too noisy. Flag only if
-    # an absent date matters for the downstream logic, which the engine
-    # handles itself.
-
     # ---- Institution -----------------------------------------------------
     institution_raw = _string_or_none(data.get(COL_INSTITUTION))
     institution_id = resolve_institution(cursor, institution_raw) if institution_raw else None
@@ -590,28 +659,59 @@ def transform_row(
                         STATUS_UNRESOLVED,
                     )
 
-    # ---- System Type vs agreement-existence cross-check -----------------
-    system_type = _parse_system_type(data.get(COL_SYSTEM_TYPE))
-    if system_type is not None and institution_id is not None:
-        has_agreement = _has_active_agreement(
-            cursor, institution_id, contract_signed_date
+    # ---- Institution type: DB-derived, marker-cross-checked --------------
+    # DB is authoritative. Source-file asterisk markers are cross-checked
+    # against the DB; disagreement is logged but DB still wins. Over time,
+    # disagreements should drop to zero as the DB is cleaned up.
+    institution_type = _resolve_institution_classification(
+        cursor, institution_id, contract_signed_date
+    )
+
+    if institution_id is not None and institution_type is None:
+        # Institution resolved but no agreement row found at case date.
+        flags.add(
+            f"NO_AGREEMENT: institution_id={institution_id} "
+            f"({institution_raw!r}) has no ref_institution_agreement row "
+            f"active at contract date {contract_signed_date}",
+            STATUS_WARN_MISMATCH,
         )
-        mismatch = (
-            (system_type == "IN" and not has_agreement)
-            or (system_type == "OUT" and has_agreement)
-        )
-        if mismatch:
+
+    # Cross-check DB classification against marker-derived classification.
+    # The marker classification is what the source file asserts; the DB is
+    # what we trust. Disagreement → warning, but DB wins.
+    marker_class = _classify_from_markers(institution_raw)
+    if institution_type is not None:
+        # Map DB system_status onto the marker space for comparison:
+        #   DB OUT_OF_SYSTEM ↔ marker OUT_OF_SYSTEM (`**`)
+        #   DB IN_SYSTEM     ↔ marker VIA_PARTNER OR DIRECT (`*` or none)
+        db_expects_out = (institution_type == INST_OUT_OF_SYSTEM)
+        marker_says_out = (marker_class == MARKER_OUT_OF_SYSTEM)
+        if db_expects_out != marker_says_out:
             flags.add(
-                f"SYSTEM_TYPE_MISMATCH: {data.get(COL_SYSTEM_TYPE)!r} "
-                f"disagrees with database (institution has "
-                f"{'an active' if has_agreement else 'no active'} "
-                f"agreement at contract_signed_date)",
+                f"INSTITUTION_TYPE_DISAGREEMENT: source markers say "
+                f"{marker_class}, DB says {institution_type} "
+                f"(institution_id={institution_id}, raw={institution_raw!r}). "
+                f"Using DB value.",
+                STATUS_WARN_MISMATCH,
+            )
+
+    # ---- System Type (CRM column, audit + sanity check) ------------------
+    system_type_raw = _string_or_none(data.get(COL_SYSTEM_TYPE))
+    system_type_parsed = _parse_system_type(data.get(COL_SYSTEM_TYPE))
+
+    # Cross-check CRM system_type column against DB institution_type.
+    if system_type_parsed is not None and institution_type is not None:
+        crm_says_out = (system_type_parsed == "OUT")
+        db_says_out = (institution_type == INST_OUT_OF_SYSTEM)
+        if crm_says_out != db_says_out:
+            flags.add(
+                f"SYSTEM_TYPE_DISAGREEMENT: CRM System Type column says "
+                f"{system_type_raw!r} ({'OUT' if crm_says_out else 'IN'}), "
+                f"DB institution_type is {institution_type}. Using DB value.",
                 STATUS_WARN_MISMATCH,
             )
 
     # ---- Application Status — canonical resolution ----------------------
-    # This is THE KEY FIX. The raw text is preserved for audit; the
-    # canonical id is what the engine uses.
     application_status_text = _string_or_none(data.get(COL_APPLICATION_STATUS))
     application_status_id = _resolve_application_status(
         cursor, application_status_text
@@ -654,6 +754,8 @@ def transform_row(
         case_officer_role_id=case_officer_role_id,
         pre_sales_staff_id=pre_sales_staff_id,
         referring_source_type=source_type,
+        institution_type=institution_type,
+        system_type=system_type_raw,
         import_status=flags.status,
         import_warnings=flags.as_string(),
         incentive_amount=_parse_incentive(_get_incentive_value(data)),

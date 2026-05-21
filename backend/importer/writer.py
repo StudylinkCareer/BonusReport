@@ -129,6 +129,8 @@ _INSERT_COLUMNS = (
     "case_officer_role_id",
     "pre_sales_staff_id",
     "referring_source_type",
+    "institution_type",
+    "system_type",
     "import_status",
     "import_warnings",
     "incentive_amount",
