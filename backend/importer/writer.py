@@ -67,6 +67,33 @@ class WriteResult:
         self.scrap += other.scrap
         self.errors.extend(other.errors)
 
+    # ---- Backward-compat shims ----------------------------------------
+    # The legacy API layer (api/imports.py) reads these attributes.
+    # In the new design rows are never skipped (everything goes inline
+    # as UNRESOLVED/SCRAP), and there are no "blocked" rows (UPSERT
+    # replaces, never blocks). Returning 0 for both keeps the API happy
+    # without lying about new outcomes.
+
+    @property
+    def rows_skipped(self) -> int:
+        return 0
+
+    @property
+    def blocked(self) -> int:
+        return 0
+
+    @property
+    def notes_attached(self) -> int:
+        return 0
+
+    @property
+    def notes_orphan(self) -> int:
+        return 0
+
+    @property
+    def blocked_details(self) -> list:
+        return []
+
 
 # ---------------------------------------------------------------------------
 # UPSERT SQL
@@ -103,7 +130,7 @@ _INSERT_COLUMNS = (
     "pre_sales_staff_id",
     "referring_source_type",
     "import_status",
-    "flag_reason",
+    "import_warnings",
     "incentive_amount",
     "notes",
     "run_year",
@@ -182,13 +209,24 @@ def write_transformer_output(
 ) -> None:
     """Persist one CaseRecord from transformer.transform_row().
 
+    Wraps the write in a SAVEPOINT so per-row failures (CHECK violations,
+    FK violations, etc.) only roll back THIS row, not the entire file.
+    The orchestrator's outer transaction continues, and the file can
+    keep processing the remaining rows.
+
     Updates the WriteResult counters.
 
-    Per-row failures during write are caught, logged into result.errors,
-    and do NOT abort the file. Real DB-level exceptions bubble up.
+    Real DB-level exceptions (connection drop, savepoint exhaustion)
+    bubble up to the orchestrator.
     """
+    # Per-row savepoint name. Using id() gives a unique name per call so
+    # nested or repeated saves don't collide.
+    sp_name = f"row_{id(record) & 0xFFFFFFFF:x}"
+    cursor.execute(f"SAVEPOINT {sp_name}")
     try:
         _case_id, was_inserted = write_case(cursor, record)
+        cursor.execute(f"RELEASE SAVEPOINT {sp_name}")
+
         if was_inserted:
             result.inserted += 1
         else:
@@ -204,12 +242,23 @@ def write_transformer_output(
         elif record.import_status == "SCRAP":
             result.scrap += 1
         else:
-            # Unknown status — shouldn't happen but don't crash
             log.warning(
                 "Unknown import_status %r for contract %s",
                 record.import_status, record.contract_id,
             )
     except Exception as exc:
+        # Roll back just this row; the orchestrator's transaction stays alive
+        try:
+            cursor.execute(f"ROLLBACK TO SAVEPOINT {sp_name}")
+            cursor.execute(f"RELEASE SAVEPOINT {sp_name}")
+        except Exception as cleanup_exc:
+            # If savepoint cleanup itself fails, the connection is probably
+            # in a bad state — let the outer handler deal with it
+            log.exception(
+                "Savepoint cleanup failed after row error: %s", cleanup_exc
+            )
+            raise
+
         msg = (
             f"Failed to write tx_case for contract={record.contract_id} "
             f"run={record.run_year}-{record.run_month:02d}: {exc!r}"

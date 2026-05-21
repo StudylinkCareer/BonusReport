@@ -9,7 +9,7 @@ TRANSFORMER V2 — KEY POLICY (locked design decisions):
 
 1. NEVER DROP A ROW. Every RawRow becomes a CaseRecord. If something
    can't be resolved, the record gets import_status='UNRESOLVED' and
-   flag_reason populated. The writer always inserts. SCRAP is reserved
+   import_warnings populated. The writer always inserts. SCRAP is reserved
    for cases where the row is genuinely unusable (date in a text field,
    missing contract id, etc.).
 
@@ -19,11 +19,13 @@ TRANSFORMER V2 — KEY POLICY (locked design decisions):
 
 3. DEPARTED STAFF — looked up from ref_staff.employment_status, NOT a
    hardcoded list. Cases attributed to departed staff get
-   import_status='UNRESOLVED' with flag_reason explaining; DQO decides
-   whether to release for engine processing.
+   import_status='UNRESOLVED' with import_warnings explaining; DQO
+   decides whether to release for engine processing.
 
-4. WARNINGS ARE INLINE on flag_reason (concatenated semicolon-separated
-   strings). No separate staging table.
+4. WARNINGS ARE INLINE on import_warnings (concatenated semicolon-separated
+   strings). No separate staging table. Note: flag_reason is a different
+   column with workflow semantics (CORRECTIONS/ASSIGNMENTS) — not touched
+   by the importer.
 
 5. ROLE IS INTRINSIC to the staff member, not the column. role_id always
    comes from ref_staff.primary_role_id.
@@ -150,7 +152,7 @@ class CaseRecord:
     pre_sales_staff_id: Optional[int]
     referring_source_type: str
     import_status: str
-    flag_reason: Optional[str]
+    import_warnings: Optional[str]
     incentive_amount: int
     notes: Optional[str]
     run_year: int
@@ -160,7 +162,7 @@ class CaseRecord:
 
 # DEPRECATED — kept only so legacy code that still imports it doesn't
 # crash. The new transformer never emits NoteRecords; warnings are now
-# inline on CaseRecord.flag_reason. Remove this class once
+# inline on CaseRecord.import_warnings. Remove this class once
 # consolidated_orchestrator and any other legacy callers are migrated
 # or removed.
 @dataclass(frozen=True)
@@ -193,7 +195,7 @@ def _escalate(current: str, candidate: str) -> str:
 # ---------------------------------------------------------------------------
 
 class _FlagBag:
-    """Accumulates flag_reason fragments and escalates import_status.
+    """Accumulates import_warnings fragments and escalates import_status.
 
     Use:
         flags = _FlagBag()
@@ -201,7 +203,7 @@ class _FlagBag:
                   STATUS_UNRESOLVED)
         ...
         record = CaseRecord(..., import_status=flags.status,
-                            flag_reason=flags.as_string())
+                            import_warnings=flags.as_string())
     """
 
     def __init__(self) -> None:
@@ -653,7 +655,7 @@ def transform_row(
         pre_sales_staff_id=pre_sales_staff_id,
         referring_source_type=source_type,
         import_status=flags.status,
-        flag_reason=flags.as_string(),
+        import_warnings=flags.as_string(),
         incentive_amount=_parse_incentive(_get_incentive_value(data)),
         notes=_string_or_none(data.get(COL_NOTES)),
         run_year=run_year,
