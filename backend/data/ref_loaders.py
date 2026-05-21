@@ -500,6 +500,16 @@ def load_priority_targets(conn: psycopg.Connection) -> dict[int, dict]:
 #   so the row's own copy of that value is also called status_code)
 # Keyed by the status string, not the row id, because that's how the
 # engine looks it up: ref.status_splits[case.status_code].
+#
+# Alias expansion (added 2026-05-20):
+#   ref_status_alias maps CRM-variant spellings (e.g. comma'd or
+#   parenthesised forms) to a canonical ref_status_split.status. After
+#   loading the canonical rows, load_status_splits expands the dict
+#   so that ref.status_splits[alias_text] returns the same dict object
+#   as ref.status_splits[canonical_status]. This means engine code
+#   doesn't need to know about aliases — it just looks up whatever
+#   status string the case has. The 'status_code' field inside the
+#   row dict always carries the CANONICAL status, not the alias.
 STATUS_SPLIT_SELECT = """
     id,
     status                  AS status_code,
@@ -517,12 +527,52 @@ STATUS_SPLIT_SELECT = """
 """
 
 
+def load_status_aliases(conn: psycopg.Connection) -> dict[str, str]:
+    """Load ref_status_alias into {alias_text: canonical_status}.
+
+    Returns an empty dict if the table doesn't exist (defensive — allows
+    the engine to keep running pre-Phase-13b without alias support).
+    """
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT alias_text, canonical_status FROM ref_status_alias")
+            return dict(cur.fetchall())
+    except psycopg.errors.UndefinedTable:
+        # Table doesn't exist yet — return empty to preserve backward compat
+        conn.rollback()  # clear the failed-query state
+        return {}
+
+
 def load_status_splits(conn: psycopg.Connection) -> dict[str, dict]:
-    """Load ref_status_split into {status_code: {col: val, ...}}."""
+    """Load ref_status_split into {status_code: {col: val, ...}}.
+
+    Also expands the dict with ref_status_alias entries: for each alias,
+    the alias_text maps to the SAME row dict as the canonical_status.
+    The engine looks up case.application_status verbatim against this
+    dict; alias resolution is invisible to the engine.
+
+    The 'status_code' field within each row dict is always the
+    canonical status, regardless of which key (canonical or alias)
+    was used to retrieve it.
+    """
     sql = f"SELECT {STATUS_SPLIT_SELECT} FROM ref_status_split"
     with conn.cursor() as cur:
         cur.execute(sql)
-        return _rows_by_column(cur, 'status_code')
+        canonical = _rows_by_column(cur, 'status_code')
+
+    # Expand with aliases — each alias resolves to the same row dict
+    # as its canonical_status. Skip aliases whose canonical isn't loaded
+    # (shouldn't happen given the FK, but defensive).
+    aliases = load_status_aliases(conn)
+    for alias_text, canonical_status in aliases.items():
+        row = canonical.get(canonical_status)
+        if row is None:
+            continue  # canonical missing — alias is dead, ignore
+        # Map the alias_text to the SAME row object. Sharing the dict
+        # reference is intentional — any future mutation reaches both.
+        canonical[alias_text] = row
+
+    return canonical
 
 
 # ---------------------------------------------------------------------------

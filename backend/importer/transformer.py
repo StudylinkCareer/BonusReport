@@ -2,56 +2,52 @@
 backend/importer/transformer.py
 
 Convert a RawRow (from reader.py) into a CaseRecord ready for tx_case
-insertion, plus zero or more NoteRecords for tx_case_notes_staging.
+insertion. The transformer reads (via resolvers) and produces dataclasses.
+It does NOT execute SQL writes.
 
-The transformer reads (via resolvers) and produces dataclasses. It does NOT
-execute SQL writes.
+TRANSFORMER V2 — KEY POLICY (locked design decisions):
 
-KEY POLICY CHANGES (Phase7prep_v2_extension, 2026-05-05):
+1. NEVER DROP A ROW. Every RawRow becomes a CaseRecord. If something
+   can't be resolved, the record gets import_status='UNRESOLVED' and
+   flag_reason populated. The writer always inserts. SCRAP is reserved
+   for cases where the row is genuinely unusable (date in a text field,
+   missing contract id, etc.).
 
-1. Asterisks in institution names are LEGACY DATA and should never be parsed
-   as syntax. They are alias variants — the team adds asterisk-decorated
-   forms to ref_institution_alias as needed. The transformer just looks up
-   the raw string in the alias table; if it doesn't resolve, the row gets
-   an UNRESOLVED_INSTITUTION warning and the team adds the alias.
+2. APPLICATION STATUS resolves to a canonical id via the alias table
+   (ref_status_split_alias). Both the canonical id and the raw text are
+   stored on tx_case. Engine joins on the id.
 
-2. Routing partner (Group / Master Agent) is NOT recorded on tx_case from
-   institution name parsing. It is derivable at engine runtime from the
-   institution's active VIA_PARTNER agreement in ref_institution_agreement.
+3. DEPARTED STAFF — looked up from ref_staff.employment_status, NOT a
+   hardcoded list. Cases attributed to departed staff get
+   import_status='UNRESOLVED' with flag_reason explaining; DQO decides
+   whether to release for engine processing.
 
-3. The Refer Source Agent column is the ONLY source of routing info recorded
-   on tx_case. Resolution order (Phase 11b, 2026-05-08): office → sub_agent
-   → partner. Office-first protects against accidental matches when a
-   personal-name variant (e.g. 'Hoang Le – VP Mel') collides with a
-   sub-agent or partner string. If blank → OFFICE_ONLY with no
-   referring_office_id. If neither resolves → UNRESOLVED.
+4. WARNINGS ARE INLINE on flag_reason (concatenated semicolon-separated
+   strings). No separate staging table.
 
-4. System Type vs. agreement-existence cross-check (replaces the old
-   classification-based check):
-     - If System Type says "Trong hệ thống" (in-system) but institution has
-       no active agreement at contract_signed_date → mismatch
-     - If System Type says "Ngoài hệ thống" (out-of-system) but institution
-       DOES have an active agreement → mismatch
+5. ROLE IS INTRINSIC to the staff member, not the column. role_id always
+   comes from ref_staff.primary_role_id.
 
-5. CO_SUB slot rule (patch4): CO_SUB staff always populate the case_officer
-   slot, never the counsellor slot, regardless of which Excel column they
-   appeared in. Same-person-both-columns collapses to a single slot.
-   Different-person-each-column with the counsellor being CO_SUB triggers
-   a CO_SUB_SLOT_CONFLICT warning. This prevents the engine from emitting
-   two BonusPayment rows per case for sub-agent files.
+6. CO_SUB slot rule (preserved from v1): CO_SUB staff always populate
+   case_officer slot, never counsellor slot, regardless of which Excel
+   column they appeared in.
 
-6. Departed-staff warning suppression (Phase 11b, 2026-05-08): when
-   DEPARTED_STAFF fires for a name in either staff column, the redundant
-   UNRESOLVED_COUNSELLOR / UNRESOLVED_CASE_OFFICER warning for the same
-   name is suppressed. The departed-staff list is the authoritative reason
-   the lookup misses; the second warning is noise.
+7. REFER SOURCE resolution order (preserved from v1): office → sub_agent
+   → partner. Office-first protects against personal-name variants
+   colliding with sub-agent or partner names.
 
-OTHER LOCKED POLICY (do not re-derive):
-  * Role is intrinsic to the staff member, not the column. The role_id
-    always comes from ref_staff.primary_role_id.
-  * Departed staff cases are marked SCRAP and skipped from engine processing.
-  * Office-only cases (empty Refer Source, no other partner signal) =>
-    source_type='OFFICE_ONLY'.
+8. SYSTEM TYPE cross-check (preserved): mismatch between System Type
+   text and the institution's active-agreement state at contract_date
+   produces a WARN-MISMATCH flag, but the row still imports.
+
+9. ASTERISKS in institution names are LEGACY DATA. Pure alias lookup
+   (no parsing). Add aliases as needed.
+
+Import status escalation:
+    OK < WARN-MISMATCH < UNRESOLVED < SCRAP
+    Once at SCRAP the row is unusable for bonus calculation; engine
+    skips. UNRESOLVED is recoverable — DQO can fix the underlying data
+    and re-import.
 """
 
 from dataclasses import dataclass
@@ -76,17 +72,12 @@ from backend.importer.resolvers import (
 # Constants
 # ---------------------------------------------------------------------------
 
-DEPARTED_STAFF_NAMES: frozenset[str] = frozenset({
-    "Đào Ngọc Sơn",
-    "Nguyễn Thị Kim Dung",
-})
-
 INCENTIVE_THRESHOLD_VND = 5_000_000
 
 # Role identifiers (matches dim_role.id)
 ROLE_ID_CO_SUB = 18  # dim_role.code = 'CO_SUB' (D6.R6 sub-agent CO scheme)
 
-# CRM column keys
+# Canonical column names (must match ref_column_alias.canonical_name)
 COL_CONTRACT_ID = "Contract ID"
 COL_STUDENT_ID = "Student ID"
 COL_STUDENT_NAME = "Student Name"
@@ -111,33 +102,37 @@ SOURCE_PARTNER = "PARTNER"
 SOURCE_SUB_AGENT = "SUB_AGENT"
 SOURCE_OFFICE_ONLY = "OFFICE_ONLY"
 SOURCE_UNRESOLVED = "UNRESOLVED"
-SOURCE_NONE = "NONE"
 
 # import_status values
 STATUS_OK = "OK"
-STATUS_UNRESOLVED = "UNRESOLVED"
-STATUS_UNRESOLVED_PARTNER = "UNRESOLVED-PARTNER"
-STATUS_SCRAP = "SCRAP"
 STATUS_WARN_MISMATCH = "WARN-MISMATCH"
+STATUS_UNRESOLVED = "UNRESOLVED"
+STATUS_SCRAP = "SCRAP"
 
+# Vietnamese system_type strings (from CRM)
 SYSTEM_TYPE_IN_VN = "Trong hệ thống"
 SYSTEM_TYPE_OUT_VN = "Ngoài hệ thống"
 
 
 # ---------------------------------------------------------------------------
-# Output dataclasses
+# Output dataclass
 # ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
 class CaseRecord:
+    """The canonical, transformer-resolved form of one CRM row.
+
+    Field types match tx_case columns. None = no value, no resolution,
+    or explicitly absent in the source.
+    """
     contract_id: str
     student_id: Optional[str]
     student_name: str
     contract_signed_date: Optional[date]
     course_start_date: Optional[date]
     visa_received_date: Optional[date]
-    case_office_id: int
-    country_id: int
+    case_office_id: Optional[int]
+    country_id: Optional[int]
     institution_id: Optional[int]
     referring_partner_id: Optional[int]
     referring_sub_agent_id: Optional[int]
@@ -145,7 +140,8 @@ class CaseRecord:
     institution_text_raw: Optional[str]
     referring_agent_text_raw: Optional[str]
     client_type_code: Optional[str]
-    application_status: Optional[str]
+    application_status: Optional[str]        # raw text (audit)
+    application_status_id: Optional[int]     # canonical id (engine reads)
     course_status: Optional[str]
     counsellor_staff_id: Optional[int]
     counsellor_role_id: Optional[int]
@@ -154,62 +150,72 @@ class CaseRecord:
     pre_sales_staff_id: Optional[int]
     referring_source_type: str
     import_status: str
+    flag_reason: Optional[str]
     incentive_amount: int
     notes: Optional[str]
     run_year: int
     run_month: int
-    # Phase 14 — DQO-keyed bonus run period in 'YYYY-MM' form. Set ONCE
-    # per upload by the DQO via the upload UI (Input sheet mode); the
-    # orchestrator applies the same value to every record. For Mass
-    # Upload, derived per row from that row's run_year/run_month.
-    # Not derived from run_year/run_month in Input sheet mode because
-    # uploads can be retroactive or forward-dated (e.g. a Jan-2024
-    # closed-file uploaded in March might be intended for the 2024-03
-    # bonus run). Stored to tx_case.bonus_year_month (CHAR(7)).
     bonus_year_month: str
 
 
-@dataclass(frozen=True)
-class NoteRecord:
-    warning_type: str
-    raw_value: Optional[str]
-    note: str
+# ---------------------------------------------------------------------------
+# Status escalation
+# ---------------------------------------------------------------------------
+
+_STATUS_SEVERITY = {
+    STATUS_OK: 0,
+    STATUS_WARN_MISMATCH: 1,
+    STATUS_UNRESOLVED: 2,
+    STATUS_SCRAP: 3,
+}
+
+
+def _escalate(current: str, candidate: str) -> str:
+    """Return whichever of current/candidate is more severe."""
+    return candidate if _STATUS_SEVERITY[candidate] > _STATUS_SEVERITY[current] else current
 
 
 # ---------------------------------------------------------------------------
-# Parsing helpers (value coercion only — no semantic parsing)
+# Flag accumulator
 # ---------------------------------------------------------------------------
 
-def _parse_system_type(text: Optional[str]) -> Optional[str]:
-    if text is None:
-        return None
-    s = str(text).strip()
-    if s == SYSTEM_TYPE_IN_VN:
-        return "IN"
-    if s == SYSTEM_TYPE_OUT_VN:
-        return "OUT"
-    return None
+class _FlagBag:
+    """Accumulates flag_reason fragments and escalates import_status.
+
+    Use:
+        flags = _FlagBag()
+        flags.add("UNRESOLVED_COUNSELLOR: 'Some Name' not in ref_staff",
+                  STATUS_UNRESOLVED)
+        ...
+        record = CaseRecord(..., import_status=flags.status,
+                            flag_reason=flags.as_string())
+    """
+
+    def __init__(self) -> None:
+        self.status: str = STATUS_OK
+        self._parts: list[str] = []
+
+    def add(self, msg: str, severity: str) -> None:
+        self._parts.append(msg)
+        self.status = _escalate(self.status, severity)
+
+    def as_string(self) -> Optional[str]:
+        if not self._parts:
+            return None
+        return "; ".join(self._parts)
 
 
-def _parse_incentive(value: Any) -> int:
-    if value is None:
-        return 0
-    if isinstance(value, bool):
-        return INCENTIVE_THRESHOLD_VND if value else 0
-    if isinstance(value, (int, float)):
-        return int(value) if value > 0 else 0
-    s = str(value).strip().lower()
-    if s in {"yes", "y"}:
-        return INCENTIVE_THRESHOLD_VND
-    if s in {"no", "n", ""}:
-        return 0
-    digits = s.replace(",", "").replace(".", "").replace(" ", "")
-    if digits.isdigit():
-        return int(digits)
-    return 0
-
+# ---------------------------------------------------------------------------
+# Parsing helpers
+# ---------------------------------------------------------------------------
 
 def _coerce_date(value: Any) -> Optional[date]:
+    """datetime/date -> date. Anything else -> None.
+
+    The reader has already converted d/m/yyyy strings to datetime, so
+    by this point text values in date columns mean garbage we couldn't
+    parse — caller should check separately and flag.
+    """
     if value is None:
         return None
     if isinstance(value, datetime):
@@ -232,6 +238,68 @@ def _is_datetime_value(value: Any) -> bool:
     return isinstance(value, (datetime, date))
 
 
+def _parse_system_type(text: Optional[str]) -> Optional[str]:
+    """'Trong hệ thống' -> 'IN', 'Ngoài hệ thống' -> 'OUT', else None."""
+    if text is None:
+        return None
+    s = str(text).strip()
+    if s == SYSTEM_TYPE_IN_VN:
+        return "IN"
+    if s == SYSTEM_TYPE_OUT_VN:
+        return "OUT"
+    return None
+
+
+def _parse_incentive(value: Any) -> int:
+    """Customer incentive amount: yes/no flag or VND value -> int đồng."""
+    if value is None:
+        return 0
+    if isinstance(value, bool):
+        return INCENTIVE_THRESHOLD_VND if value else 0
+    if isinstance(value, (int, float)):
+        return int(value) if value > 0 else 0
+    s = str(value).strip().lower()
+    if s in {"yes", "y"}:
+        return INCENTIVE_THRESHOLD_VND
+    if s in {"no", "n", ""}:
+        return 0
+    digits = s.replace(",", "").replace(".", "").replace(" ", "")
+    if digits.isdigit():
+        return int(digits)
+    return 0
+
+
+def _normalize_pre_sales_name(name: Optional[str]) -> Optional[str]:
+    """'SURNAME, Given Names' -> 'Surname Given Names'.
+
+    Some Pre-sales entries use a Western convention where the surname
+    is written first, in ALL CAPS, followed by a comma and given names.
+    Example: 'MẠCH, Nguyễn Phi Vân' -> 'Mạch Nguyễn Phi Vân'.
+    """
+    if name is None:
+        return None
+    if "," not in name:
+        return name.strip() or None
+    surname, given = name.split(",", 1)
+    surname = surname.strip().title()
+    given = given.strip()
+    if not surname and not given:
+        return None
+    if not given:
+        return surname
+    if not surname:
+        return given
+    return f"{surname} {given}"
+
+
+def _get_incentive_value(data: dict[str, Any]) -> Any:
+    """Find the Customer Incentive column (any tail variant)."""
+    for header, value in data.items():
+        if header.startswith(COL_INCENTIVE_PREFIX):
+            return value
+    return None
+
+
 # ---------------------------------------------------------------------------
 # DB-touching helpers
 # ---------------------------------------------------------------------------
@@ -252,17 +320,9 @@ def _has_active_agreement(
     institution_id: Optional[int],
     case_date: Optional[date],
 ) -> bool:
-    """Does this institution have an active agreement at the given date?
-
-    Used by the System Type cross-check. Returns True if at least one row in
-    ref_institution_agreement covers the case date for this institution.
-
-    If case_date is None we fall back to "currently active" (effective_to NULL
-    or in the future).
-    """
+    """Does this institution have an active agreement at the case date?"""
     if institution_id is None:
         return False
-
     if case_date is None:
         cursor.execute(
             """SELECT 1 FROM ref_institution_agreement
@@ -283,68 +343,39 @@ def _has_active_agreement(
     return cursor.fetchone() is not None
 
 
-# ---------------------------------------------------------------------------
-# Status escalation
-# ---------------------------------------------------------------------------
+def _resolve_application_status(
+    cursor,
+    raw_text: Optional[str],
+) -> Optional[int]:
+    """Resolve raw status text to ref_status_split.id.
 
-_STATUS_SEVERITY = {
-    STATUS_OK: 0,
-    STATUS_WARN_MISMATCH: 1,
-    STATUS_UNRESOLVED_PARTNER: 2,
-    STATUS_UNRESOLVED: 3,
-    STATUS_SCRAP: 4,
-}
-
-
-def _escalate(current: str, candidate: str) -> str:
-    return candidate if _STATUS_SEVERITY[candidate] > _STATUS_SEVERITY[current] else current
-
-
-# ---------------------------------------------------------------------------
-# Pre-sales name normalization (Phase 15 B2)
-# ---------------------------------------------------------------------------
-
-def _normalize_pre_sales_name(name: Optional[str]) -> Optional[str]:
-    """Convert 'SURNAME, Given Names' to Vietnamese natural order.
-
-    Some Pre-sales entries use a Western convention where the surname is
-    written first, in ALL CAPS, followed by a comma and the given names.
-    Example: 'MẠCH, Nguyễn Phi Vân' -> 'Mạch Nguyễn Phi Vân'.
-
-    Conversion rule:
-      * If no comma is present, the name is returned unchanged.
-      * Otherwise split on the first comma, title-case the surname segment
-        (since the source convention is all-caps), strip whitespace from
-        both halves, and join with a single space.
-
-    The original raw form is what we surface in NOTES so operators can
-    reconcile back to the source when an UNRESOLVED_PRE_SALES warning fires.
+    Tries alias table first, then canonical name. Returns None if no
+    match. NBSP-tolerant, case-insensitive — matches the resolver
+    semantics in resolvers.resolve_status.
     """
-    if name is None:
+    if not raw_text:
         return None
-    if "," not in name:
-        return name.strip() or None
-    surname, given = name.split(",", 1)
-    surname = surname.strip().title()
-    given = given.strip()
-    if not surname and not given:
+    cleaned = " ".join(str(raw_text).split())
+    if not cleaned:
         return None
-    if not given:
-        return surname
-    if not surname:
-        return given
-    return f"{surname} {given}"
-
-
-# ---------------------------------------------------------------------------
-# Header lookup (handles 17- vs 18-column variants)
-# ---------------------------------------------------------------------------
-
-def _get_incentive_value(data: dict[str, Any]) -> Any:
-    for header, value in data.items():
-        if header.startswith(COL_INCENTIVE_PREFIX):
-            return value
-    return None
+    # Alias table first
+    cursor.execute(
+        """SELECT s.id
+           FROM ref_status_split_alias a
+           JOIN ref_status_split s ON s.id = a.status_id
+           WHERE LOWER(a.alias) = LOWER(%s)""",
+        (cleaned,),
+    )
+    row = cursor.fetchone()
+    if row:
+        return row["id"]
+    # Canonical name fallback
+    cursor.execute(
+        "SELECT id FROM ref_status_split WHERE LOWER(status) = LOWER(%s)",
+        (cleaned,),
+    )
+    row = cursor.fetchone()
+    return row["id"] if row else None
 
 
 # ---------------------------------------------------------------------------
@@ -358,167 +389,112 @@ def transform_row(
     run_year: int,
     run_month: int,
     bonus_year_month: str,
-) -> tuple[Optional[CaseRecord], list[NoteRecord]]:
-    notes: list[NoteRecord] = []
+) -> CaseRecord:
+    """Convert one RawRow into a CaseRecord. NEVER returns None.
+
+    A row missing its Contract ID returns a SCRAP record with the
+    contract_id field set to a placeholder so the writer still has
+    something to UPSERT on. A row with garbage data returns the
+    same — never lost, always inspectable.
+    """
+    flags = _FlagBag()
     data = raw.data
-    import_status = STATUS_OK
 
     # ---- Identity ---------------------------------------------------------
-    contract_id = _string_or_none(data.get(COL_CONTRACT_ID))
-    if not contract_id:
-        notes.append(NoteRecord(
-            warning_type="MISSING_CONTRACT_ID",
-            raw_value=None,
-            note=f"Row {raw.row_number}: blank Contract ID — row skipped.",
-        ))
-        return None, notes
+    contract_id_raw = _string_or_none(data.get(COL_CONTRACT_ID))
+    if not contract_id_raw:
+        # No contract id = the row can't be deduplicated or referenced.
+        # SCRAP it with a synthetic id so it still gets written.
+        flags.add(
+            f"MISSING_CONTRACT_ID: row {raw.row_number} has no Contract ID",
+            STATUS_SCRAP,
+        )
+        contract_id = f"NO-CONTRACT-ID-ROW-{raw.row_number}"
+    else:
+        contract_id = contract_id_raw
 
     student_id = _string_or_none(data.get(COL_STUDENT_ID))
     student_name = _string_or_none(data.get(COL_STUDENT_NAME)) or ""
 
-    # ---- Date-in-text-field SCRAP detection -------------------------------
+    # ---- Date-in-text-field SCRAP detection ------------------------------
     for col in (COL_REFER_SOURCE, COL_INSTITUTION, COL_COUNSELLOR,
                 COL_CASE_OFFICER, COL_PRE_SALES, COL_NOTES, COL_CLIENT_TYPE,
                 COL_SYSTEM_TYPE, COL_APPLICATION_STATUS):
         if _is_datetime_value(data.get(col)):
-            notes.append(NoteRecord(
-                warning_type="DATE_IN_TEXT_FIELD",
-                raw_value=str(data.get(col)),
-                note=f"Row {raw.row_number}: {col!r} contains a datetime value.",
-            ))
-            import_status = _escalate(import_status, STATUS_SCRAP)
+            flags.add(
+                f"DATE_IN_TEXT_FIELD: {col!r} contains a datetime value "
+                f"({data.get(col)!r})",
+                STATUS_SCRAP,
+            )
 
     # ---- Staff resolution -------------------------------------------------
     counsellor_text = _string_or_none(data.get(COL_COUNSELLOR))
     case_officer_text = _string_or_none(data.get(COL_CASE_OFFICER))
 
-    # Track whether each slot's name is on the departed list. When True, we
-    # suppress the redundant UNRESOLVED_COUNSELLOR / UNRESOLVED_CASE_OFFICER
-    # warning for that slot — DEPARTED_STAFF is the authoritative reason and
-    # the second warning is noise (Phase 11b cleanup).
-    counsellor_is_departed = counsellor_text in DEPARTED_STAFF_NAMES
-    case_officer_is_departed = case_officer_text in DEPARTED_STAFF_NAMES
-
-    if counsellor_is_departed or case_officer_is_departed:
-        notes.append(NoteRecord(
-            warning_type="DEPARTED_STAFF",
-            raw_value=counsellor_text if counsellor_is_departed else case_officer_text,
-            note=f"Row {raw.row_number}: case attributed to a departed staff member.",
-        ))
-        import_status = _escalate(import_status, STATUS_SCRAP)
-
     counsellor_staff_id = resolve_staff(cursor, counsellor_text) if counsellor_text else None
     case_officer_staff_id = resolve_staff(cursor, case_officer_text) if case_officer_text else None
 
-    if counsellor_text and counsellor_staff_id is None and not counsellor_is_departed:
-        notes.append(NoteRecord(
-            warning_type="UNRESOLVED_COUNSELLOR",
-            raw_value=counsellor_text,
-            note=f"Row {raw.row_number}: counsellor name not found in ref_staff.",
-        ))
-        import_status = _escalate(import_status, STATUS_UNRESOLVED)
-    if case_officer_text and case_officer_staff_id is None and not case_officer_is_departed:
-        notes.append(NoteRecord(
-            warning_type="UNRESOLVED_CASE_OFFICER",
-            raw_value=case_officer_text,
-            note=f"Row {raw.row_number}: case officer name not found in ref_staff.",
-        ))
-        import_status = _escalate(import_status, STATUS_UNRESOLVED)
+    if counsellor_text and counsellor_staff_id is None:
+        flags.add(
+            f"UNRESOLVED_COUNSELLOR: {counsellor_text!r} not in ref_staff",
+            STATUS_UNRESOLVED,
+        )
+    if case_officer_text and case_officer_staff_id is None:
+        flags.add(
+            f"UNRESOLVED_CASE_OFFICER: {case_officer_text!r} not in ref_staff",
+            STATUS_UNRESOLVED,
+        )
 
     counsellor_role_id = resolve_staff_role(cursor, counsellor_staff_id)
     case_officer_role_id = resolve_staff_role(cursor, case_officer_staff_id)
 
+    # Departed-staff lookup via DB (no hardcoded list)
     for sid, label in (
         (counsellor_staff_id, "counsellor"),
         (case_officer_staff_id, "case_officer"),
     ):
         if sid is not None and resolve_staff_employment(cursor, sid) == "DEPARTED":
-            notes.append(NoteRecord(
-                warning_type="DEPARTED_STAFF",
-                raw_value=str(sid),
-                note=f"Row {raw.row_number}: {label} marked DEPARTED in ref_staff.",
-            ))
-            import_status = _escalate(import_status, STATUS_SCRAP)
+            flags.add(
+                f"DEPARTED_STAFF: {label} (staff_id={sid}) is marked "
+                f"DEPARTED in ref_staff",
+                STATUS_UNRESOLVED,
+            )
 
-    # ---- Pre-sales resolution (Phase 15 B2) -------------------------------
-    # Mirrors the counsellor/case_officer pattern but kept in a separate
-    # block to minimise the diff against the existing logic. Pre-sales has
-    # no role_id column on tx_case — the slot itself carries that meaning.
-    #
-    # Names in the source can use a Western surname-first-with-comma form
-    # (e.g. 'MẠCH, Nguyễn Phi Vân'). _normalize_pre_sales_name() converts
-    # that to the Vietnamese natural order before resolve_staff lookup.
+    # ---- Pre-sales resolution --------------------------------------------
     pre_sales_text_raw = _string_or_none(data.get(COL_PRE_SALES))
     pre_sales_text = _normalize_pre_sales_name(pre_sales_text_raw)
-
-    pre_sales_is_departed = bool(pre_sales_text) and pre_sales_text in DEPARTED_STAFF_NAMES
-    if pre_sales_is_departed:
-        notes.append(NoteRecord(
-            warning_type="DEPARTED_STAFF",
-            raw_value=pre_sales_text_raw,
-            note=f"Row {raw.row_number}: case attributed to a departed Pre-sales staff member.",
-        ))
-        import_status = _escalate(import_status, STATUS_SCRAP)
-
     pre_sales_staff_id = resolve_staff(cursor, pre_sales_text) if pre_sales_text else None
 
-    if pre_sales_text and pre_sales_staff_id is None and not pre_sales_is_departed:
-        # Surface both forms in the note so operators can reconcile with the
-        # source if the normalization step changed the lookup string.
-        if pre_sales_text == pre_sales_text_raw:
-            note_msg = f"Row {raw.row_number}: pre-sales name {pre_sales_text!r} not found in ref_staff."
-        else:
-            note_msg = (
-                f"Row {raw.row_number}: pre-sales name not found in ref_staff "
-                f"(raw={pre_sales_text_raw!r}, normalized={pre_sales_text!r})."
-            )
-        notes.append(NoteRecord(
-            warning_type="UNRESOLVED_PRE_SALES",
-            raw_value=pre_sales_text_raw,
-            note=note_msg,
-        ))
-        import_status = _escalate(import_status, STATUS_UNRESOLVED)
+    if pre_sales_text and pre_sales_staff_id is None:
+        flags.add(
+            f"UNRESOLVED_PRE_SALES: {pre_sales_text_raw!r} (normalized "
+            f"{pre_sales_text!r}) not in ref_staff",
+            STATUS_UNRESOLVED,
+        )
 
-    if pre_sales_staff_id is not None and resolve_staff_employment(cursor, pre_sales_staff_id) == "DEPARTED":
-        notes.append(NoteRecord(
-            warning_type="DEPARTED_STAFF",
-            raw_value=str(pre_sales_staff_id),
-            note=f"Row {raw.row_number}: pre-sales marked DEPARTED in ref_staff.",
-        ))
-        import_status = _escalate(import_status, STATUS_SCRAP)
+    if pre_sales_staff_id is not None and resolve_staff_employment(
+            cursor, pre_sales_staff_id) == "DEPARTED":
+        flags.add(
+            f"DEPARTED_STAFF: pre_sales (staff_id={pre_sales_staff_id}) "
+            f"is marked DEPARTED in ref_staff",
+            STATUS_UNRESOLVED,
+        )
 
     # ---- CO_SUB slot rule -------------------------------------------------
-    # CO_SUB staff always populate case_officer slot, never counsellor slot,
-    # regardless of which Excel column they appeared in. Per the locked
-    # policy decision: role is intrinsic to the staff member.
-    #
-    # Three cases this handles:
-    #   1. Same CO_SUB person in both columns (the typical sub-agent file
-    #      pattern, e.g. Phạm Thị Lợi cases): counsellor cleared,
-    #      case_officer keeps the staff.
-    #   2. CO_SUB in counsellor column only (case_officer empty): migrate
-    #      across — CO_SUB doesn't belong in counsellor slot.
-    #   3. CO_SUB in counsellor + different person in case_officer: keep
-    #      case_officer's existing staff, drop the CO_SUB from counsellor,
-    #      and surface a warning for operator review.
+    # CO_SUB staff always populate case_officer slot, never counsellor slot.
     if counsellor_role_id == ROLE_ID_CO_SUB:
         if case_officer_staff_id is None:
-            # Migrate counsellor → case_officer slot
+            # Migrate counsellor → case_officer
             case_officer_staff_id = counsellor_staff_id
             case_officer_role_id = counsellor_role_id
         elif case_officer_staff_id != counsellor_staff_id:
-            notes.append(NoteRecord(
-                warning_type="CO_SUB_SLOT_CONFLICT",
-                raw_value=f"counsellor={counsellor_text!r}, "
-                          f"case_officer={case_officer_text!r}",
-                note=(f"Row {raw.row_number}: Counsellor column has CO_SUB "
-                      f"staff {counsellor_text!r} but Case Officer column "
-                      f"has a different staff member {case_officer_text!r}. "
-                      f"The CO_SUB entry is being dropped from counsellor "
-                      f"slot per the CO_SUB-only-in-case_officer rule. "
-                      f"Verify intended assignment."),
-            ))
-        # All three branches: clear the counsellor slot
+            flags.add(
+                f"CO_SUB_SLOT_CONFLICT: counsellor column has CO_SUB staff "
+                f"{counsellor_text!r} but case_officer column has different "
+                f"staff {case_officer_text!r}. CO_SUB entry dropped from "
+                f"counsellor slot per CO_SUB-only-in-case_officer rule",
+                STATUS_WARN_MISMATCH,
+            )
         counsellor_staff_id = None
         counsellor_role_id = None
 
@@ -529,60 +505,52 @@ def transform_row(
         or _get_staff_office(cursor, pre_sales_staff_id)
     )
     if case_office_id is None:
-        notes.append(NoteRecord(
-            warning_type="NO_RESOLVABLE_OFFICE",
-            raw_value=None,
-            note=(f"Row {raw.row_number}: cannot derive case_office_id — "
-                  f"no resolved staff member has a home_office_id."),
-        ))
-        return None, notes
+        flags.add(
+            "NO_RESOLVABLE_OFFICE: no resolved staff member has a home_office_id",
+            STATUS_UNRESOLVED,
+        )
 
     # ---- Country ---------------------------------------------------------
     country_text = _string_or_none(data.get(COL_COUNTRY))
     country_id = resolve_country(cursor, country_text) if country_text else None
-    if country_id is None:
-        notes.append(NoteRecord(
-            warning_type="UNRESOLVED_COUNTRY",
-            raw_value=country_text,
-            note=f"Row {raw.row_number}: Country of Study not in dim_country.",
-        ))
-        return None, notes
+    if country_text and country_id is None:
+        flags.add(
+            f"UNRESOLVED_COUNTRY: {country_text!r} not in dim_country",
+            STATUS_UNRESOLVED,
+        )
+    elif not country_text:
+        flags.add(
+            "MISSING_COUNTRY: Country of Study is blank",
+            STATUS_UNRESOLVED,
+        )
 
-    # ---- Dates we'll need ------------------------------------------------
+    # ---- Dates ------------------------------------------------------------
     contract_signed_date = _coerce_date(data.get(COL_CONTRACT_SIGNED))
+    course_start_date = _coerce_date(data.get(COL_COURSE_START))
+    visa_received_date = _coerce_date(data.get(COL_VISA_RECEIVED))
 
-    # ---- Institution resolution (pure alias lookup, no asterisk parsing) -
-    # Asterisk-decorated forms are aliases. If "WSU College *" is in the alias
-    # table, it resolves. If not, log UNRESOLVED_INSTITUTION; the team adds
-    # the alias and the next import resolves cleanly.
+    # Note: if a date column had unparseable text (e.g. "TBD"), the reader
+    # already returned None. We don't flag here — too noisy. Flag only if
+    # an absent date matters for the downstream logic, which the engine
+    # handles itself.
+
+    # ---- Institution -----------------------------------------------------
     institution_raw = _string_or_none(data.get(COL_INSTITUTION))
     institution_id = resolve_institution(cursor, institution_raw) if institution_raw else None
     if institution_raw and institution_id is None:
-        notes.append(NoteRecord(
-            warning_type="UNRESOLVED_INSTITUTION",
-            raw_value=institution_raw,
-            note=(f"Row {raw.row_number}: institution {institution_raw!r} not in "
-                  f"ref_institution / ref_institution_alias. Add the variant as an "
-                  f"alias if it's a known institution."),
-        ))
-        import_status = _escalate(import_status, STATUS_UNRESOLVED)
+        flags.add(
+            f"UNRESOLVED_INSTITUTION: {institution_raw!r} not in "
+            f"ref_institution / ref_institution_alias",
+            STATUS_UNRESOLVED,
+        )
 
     # ---- Refer Source Agent → routing ------------------------------------
-    # Resolution order (Phase 11b, 2026-05-08): office → sub_agent → partner.
-    # Office-first is intentional: a personal-name variant like
-    # 'Hoang Le – VP Mel' might collide with a sub-agent or partner
-    # name, and we want internal-office matches to take precedence.
-    #
-    # The institution's partner relationship (Group / Master Agent) is
-    # derivable at engine runtime from ref_institution_agreement; we do
-    # NOT record it on tx_case from institution name parsing.
     refer_text = _string_or_none(data.get(COL_REFER_SOURCE))
     referring_partner_id: Optional[int] = None
     referring_sub_agent_id: Optional[int] = None
     referring_office_id: Optional[int] = None
 
     if not refer_text:
-        # Blank Refer Source → office-only with no specific referring office
         source_type = SOURCE_OFFICE_ONLY
     else:
         office_id = resolve_office(cursor, refer_text)
@@ -601,18 +569,13 @@ def transform_row(
                     source_type = SOURCE_PARTNER
                 else:
                     source_type = SOURCE_UNRESOLVED
-                    notes.append(NoteRecord(
-                        warning_type="UNRESOLVED_REFER_SOURCE",
-                        raw_value=refer_text,
-                        note=(f"Row {raw.row_number}: Refer Source Agent "
-                              f"{refer_text!r} resolved to neither office, "
-                              f"sub-agent, nor partner."),
-                    ))
-                    import_status = _escalate(import_status, STATUS_UNRESOLVED)
+                    flags.add(
+                        f"UNRESOLVED_REFER_SOURCE: {refer_text!r} resolved "
+                        f"to neither office, sub-agent, nor partner",
+                        STATUS_UNRESOLVED,
+                    )
 
     # ---- System Type vs agreement-existence cross-check -----------------
-    # In-system / out-of-system is now derived from whether the institution
-    # has an active agreement at the contract date (see Phase7prep_v2_extension).
     system_type = _parse_system_type(data.get(COL_SYSTEM_TYPE))
     if system_type is not None and institution_id is not None:
         has_agreement = _has_active_agreement(
@@ -623,35 +586,41 @@ def transform_row(
             or (system_type == "OUT" and has_agreement)
         )
         if mismatch:
-            notes.append(NoteRecord(
-                warning_type="SYSTEM_TYPE_MISMATCH",
-                raw_value=f"{data.get(COL_SYSTEM_TYPE)} vs has_agreement={has_agreement}",
-                note=(f"Row {raw.row_number}: System Type "
-                      f"{data.get(COL_SYSTEM_TYPE)!r} disagrees with database "
-                      f"state (institution has "
-                      f"{'an active' if has_agreement else 'no active'} "
-                      f"agreement at case date)."),
-            ))
-            import_status = _escalate(import_status, STATUS_WARN_MISMATCH)
+            flags.add(
+                f"SYSTEM_TYPE_MISMATCH: {data.get(COL_SYSTEM_TYPE)!r} "
+                f"disagrees with database (institution has "
+                f"{'an active' if has_agreement else 'no active'} "
+                f"agreement at contract_signed_date)",
+                STATUS_WARN_MISMATCH,
+            )
 
-    # ---- Application status sanity check ---------------------------------
+    # ---- Application Status — canonical resolution ----------------------
+    # This is THE KEY FIX. The raw text is preserved for audit; the
+    # canonical id is what the engine uses.
     application_status_text = _string_or_none(data.get(COL_APPLICATION_STATUS))
-    if application_status_text and resolve_status(cursor, application_status_text) is None:
-        notes.append(NoteRecord(
-            warning_type="UNRESOLVED_APPLICATION_STATUS",
-            raw_value=application_status_text,
-            note=f"Row {raw.row_number}: Application Report Status not in ref_status_split.",
-        ))
-        import_status = _escalate(import_status, STATUS_UNRESOLVED)
+    application_status_id = _resolve_application_status(
+        cursor, application_status_text
+    )
+    if application_status_text and application_status_id is None:
+        flags.add(
+            f"UNRESOLVED_APPLICATION_STATUS: {application_status_text!r} "
+            f"not in ref_status_split / ref_status_split_alias",
+            STATUS_UNRESOLVED,
+        )
+    elif not application_status_text:
+        flags.add(
+            "MISSING_APPLICATION_STATUS: status column is blank",
+            STATUS_UNRESOLVED,
+        )
 
     # ---- Build the record ------------------------------------------------
-    record = CaseRecord(
+    return CaseRecord(
         contract_id=contract_id,
         student_id=student_id,
         student_name=student_name,
         contract_signed_date=contract_signed_date,
-        course_start_date=_coerce_date(data.get(COL_COURSE_START)),
-        visa_received_date=_coerce_date(data.get(COL_VISA_RECEIVED)),
+        course_start_date=course_start_date,
+        visa_received_date=visa_received_date,
         case_office_id=case_office_id,
         country_id=country_id,
         institution_id=institution_id,
@@ -662,6 +631,7 @@ def transform_row(
         referring_agent_text_raw=refer_text,
         client_type_code=_string_or_none(data.get(COL_CLIENT_TYPE)),
         application_status=application_status_text,
+        application_status_id=application_status_id,
         course_status=_string_or_none(data.get(COL_COURSE_STATUS)),
         counsellor_staff_id=counsellor_staff_id,
         counsellor_role_id=counsellor_role_id,
@@ -669,11 +639,11 @@ def transform_row(
         case_officer_role_id=case_officer_role_id,
         pre_sales_staff_id=pre_sales_staff_id,
         referring_source_type=source_type,
-        import_status=import_status,
+        import_status=flags.status,
+        flag_reason=flags.as_string(),
         incentive_amount=_parse_incentive(_get_incentive_value(data)),
         notes=_string_or_none(data.get(COL_NOTES)),
         run_year=run_year,
         run_month=run_month,
         bonus_year_month=bonus_year_month,
     )
-    return record, notes

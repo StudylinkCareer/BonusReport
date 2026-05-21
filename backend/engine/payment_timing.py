@@ -72,6 +72,21 @@ Current-Enrolled status but no withhold tracked) still falls under
 STRICT mode and pays 0 with the warning. This protects against
 double-payment when M1 history is missing.
 
+Decision 7 (added 2026-05-20, DD-OUT_SYSTEM_SPLIT_BYPASS): OUT_SYSTEM
+tier cases bypass the ref_status_split percentages and pay the full
+tier_bonus in the run-month. Applies regardless of role (Counsellor,
+CO_DIR, CO_SUB). The OUT_SYSTEM rate (Section A col 1 — Counsellor 600k
+/ CO 400k; Section B col 1 — CO_SUB 400k fixed) represents
+payment-for-work-completed at first appearance, not a placeholder
+expecting in-system follow-up stages. For CO_SUB partner-routed cases
+specifically, the visa work belongs to the partner agent — there is no
+future StudyLink-side event to release a deferred half, so applying the
+50/50 split would strand half the bonus. Detection: read
+payment_in.audit_json['tier']['tier'] (set by calc_tier.py). When it
+equals 'OUT_SYSTEM', force split_pct = 1.0 before computing
+splittable_payable. The withheld_amount logic in step 3 then
+short-circuits naturally because withheld_from_split = 0.
+
 # Priority exemption (Reading Y, added 2026-05-07)
 
 Priority bonus has its own payment-timing structure per the
@@ -403,6 +418,33 @@ def apply_payment_timing(
 
     split_pct = _resolve_split_pct(payment_in.slot_label, role_code, status_row)
 
+    # OUT_SYSTEM tier bypass (Decision 7, DD-OUT_SYSTEM_SPLIT_BYPASS):
+    # OUT_SYSTEM tier rates represent payment for work completed at the
+    # case's first appearance — not a placeholder expecting later
+    # in-system stages to release the remainder. There is no future
+    # visa-receipt event to trigger the deferred half (for CO_SUB
+    # partner-routed cases the visa work belongs to the partner; for
+    # Counsellor+CO out-system cases the work is paid as a one-shot
+    # OUT_SYSTEM rate). Force split_pct = 1.0 so the full tier_bonus
+    # is paid this run. The withheld_amount block in step 3 then
+    # short-circuits naturally because withheld_from_split = 0.
+    #
+    # Detection reads payment_in.audit_json['tier']['tier'] (set by
+    # calc_tier.py). The audit dict is always populated for non-zeroed
+    # payments; defensive .get() chain handles unexpected structure.
+    is_out_system_tier = (
+        payment_in.audit_json.get('tier', {}).get('tier') == 'OUT_SYSTEM'
+    )
+    if is_out_system_tier and split_pct != Decimal('1.0'):
+        timing_audit['out_system_split_bypass'] = {
+            'original_split_pct': str(split_pct),
+            'reason': (
+                'OUT_SYSTEM tier bypasses status-split per '
+                'DD-OUT_SYSTEM_SPLIT_BYPASS (Decision 7)'
+            ),
+        }
+        split_pct = Decimal('1.0')
+
     # Reading Y: priority is exempt from status splits. It has its own
     # payment-timing structure (50% at enrolment / 50% post-KPI), independent
     # of visa-contingent §3 splits. Apply split_pct only to the splittable
@@ -431,10 +473,16 @@ def apply_payment_timing(
     # of the SPLITTABLE gross not paid this month is withheld for next month
     # (when visa is granted and status moves to "Closed - Enrolled, then
     # Visa granted"). Priority withholding is handled separately in step 3.5.
+    #
+    # Note: when the OUT_SYSTEM bypass fired above, split_pct is 1.0 and
+    # withheld_from_split is 0. The status flag may still be
+    # is_current_enrolled=True, but with no actual withholding the audit
+    # note is suppressed to avoid misleading entries.
     withheld = 0
     if status_row.get('is_current_enrolled', False):
         withheld = withheld_from_split
-        timing_audit['withheld_reason'] = 'is_current_enrolled'
+        if withheld > 0:
+            timing_audit['withheld_reason'] = 'is_current_enrolled'
 
     # 3.5 Priority schedule decision (Phase 12b) ------------------------------
     # Walk the priority structure to determine if this case is at a priority

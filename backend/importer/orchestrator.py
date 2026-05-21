@@ -1,8 +1,15 @@
 """
 backend/importer/orchestrator.py
 
-Run the full import pipeline (reader → transformer → writer) for a single
-closed-file report and return a WriteResult summarising what happened.
+Run the full import pipeline (reader → transformer → writer) for a
+single closed-file report and return a WriteResult summarising what
+happened.
+
+Orchestrator v2 changes:
+  * Reader receives a cursor (to load ref_column_alias).
+  * No notes/staging handling — warnings go inline on tx_case.flag_reason.
+  * Transformer never returns None; every RawRow becomes a CaseRecord.
+  * Writer UPSERTs by (contract_id, run_year, run_month).
 
 Transaction policy:
   Per-file transactions. The orchestrator can either:
@@ -12,9 +19,9 @@ Transaction policy:
   When owning the connection: commits on success, rolls back on any
   unhandled exception, then re-raises (or swallows, see below).
 
-Per-row failures (transformer returning None, writer catching DB errors,
-writer reporting BLOCKED) do NOT abort the file — they're counted in the
-WriteResult fields and the file processes to completion.
+Per-row failures (writer catching DB errors) do NOT abort the file —
+they're counted in WriteResult.errors and the file processes to
+completion.
 """
 
 import logging
@@ -39,7 +46,7 @@ def run_file(
     run_year: Optional[int] = None,
     run_month: Optional[int] = None,
 ) -> WriteResult:
-    """Import a single closed-file xlsx into tx_case + tx_case_notes_staging.
+    """Import a single closed-file xlsx into tx_case.
 
     Args:
         path: path to the xlsx file.
@@ -48,8 +55,7 @@ def run_file(
             REQUIRED. Distinct from run_year/run_month which reflect when
             the case event happened (parsed from filename); this reflects
             which bonus run the case should be paid in (supports
-            retroactive / forward-dated uploads). Stored to
-            tx_case.bonus_year_month (CHAR(7)).
+            retroactive / forward-dated uploads).
         conn: optional pre-opened psycopg connection. If None, the
             orchestrator opens one and manages commit/rollback itself.
             If supplied, the caller is responsible for transaction control.
@@ -58,9 +64,6 @@ def run_file(
 
     Returns:
         WriteResult — populated with counts even if errors occurred.
-        Includes result.blocked and result.blocked_details listing any
-        rows rejected because (contract_id, application_status) already
-        existed in tx_case.
 
     Raises:
         FilenameParseError if year/month can't be derived from the filename.
@@ -88,39 +91,30 @@ def run_file(
         with active_conn.cursor() as cursor:
             try:
                 rows_seen = 0
-                for raw in iter_data_rows(path):
+                for raw in iter_data_rows(cursor, path):
                     rows_seen += 1
-                    record, notes = transform_row(
+                    record = transform_row(
                         cursor, raw,
-                        run_year=run_year, run_month=run_month,
+                        run_year=run_year,
+                        run_month=run_month,
                         bonus_year_month=bonus_year_month,
                     )
-                    write_transformer_output(
-                        cursor, record, notes,
-                        run_year=run_year, run_month=run_month,
-                        result=result,
-                    )
+                    write_transformer_output(cursor, record, result=result)
 
                 if own_conn:
                     active_conn.commit()
                 log.info(
-                    "Done %s: rows_seen=%d inserted=%d blocked=%d skipped=%d "
-                    "notes_attached=%d notes_orphan=%d errors=%d",
-                    path.name, rows_seen, result.inserted, result.blocked,
-                    result.rows_skipped, result.notes_attached,
-                    result.notes_orphan, len(result.errors),
+                    "Done %s: rows_seen=%d inserted=%d updated=%d "
+                    "ok=%d warn=%d unresolved=%d scrap=%d errors=%d",
+                    path.name, rows_seen,
+                    result.inserted, result.updated,
+                    result.ok, result.warn_mismatch,
+                    result.unresolved, result.scrap,
+                    len(result.errors),
                 )
-                if result.blocked > 0:
-                    log.info(
-                        "%d row(s) BLOCKED by existing (contract_id, application_status). "
-                        "See result.blocked_details for the list — the frontend should "
-                        "prompt the user about replace/delete based on existing "
-                        "workflow_state.",
-                        result.blocked,
-                    )
             except Exception as exc:
                 # Unhandled — usually a DB connection drop or bad SQL.
-                # Per-row failures are caught in writer.write_transformer_output
+                # Per-row failures are caught in write_transformer_output
                 # and don't reach here.
                 if own_conn:
                     active_conn.rollback()
@@ -129,7 +123,5 @@ def run_file(
                 result.errors.append(msg)
                 if not own_conn:
                     raise
-                # When we own the connection, swallow the exception and
-                # return the result so the CLI can move on to the next file.
 
     return result
