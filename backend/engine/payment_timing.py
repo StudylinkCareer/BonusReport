@@ -402,11 +402,29 @@ def apply_payment_timing(
     }
 
     # Zero-bonus shortcut — return everything zeroed.
+    #
+    # EXCEPTION: when the case carries a confirmed service-fee earning
+    # (addon_bonus > 0), the zero-bonus shortcut is SKIPPED. Service
+    # fees are paid for work that was completed (visa renewal, guardian
+    # change, etc.) even when the underlying study contract produced no
+    # enrolment commission. The zero-bonus rule applies to tier/package/
+    # priority earnings, not to ancillary service-fee earnings.
+    #
+    # In this branch the engine continues through the normal timing flow.
+    # tier_bonus/package_bonus/priority_bonus are already 0 (the calc
+    # modules saw the same status and didn't pay them), so net_payable
+    # naturally lands at the addon_bonus amount.
     if status_row.get('is_zero_bonus', False):
-        timing_audit['outcome'] = 'is_zero_bonus_no_payment'
-        return _zeroed_payment(payment_in, timing_audit, calc_notes_extra=(
-            f"Zero bonus per ref_status_split (status={case.status_code})."
-        ))
+        if payment_in.addon_bonus > 0:
+            timing_audit['zero_bonus_bypass'] = (
+                'addon_bonus_present_service_fee_path'
+            )
+            # Fall through to the normal timing flow below.
+        else:
+            timing_audit['outcome'] = 'is_zero_bonus_no_payment'
+            return _zeroed_payment(payment_in, timing_audit, calc_notes_extra=(
+                f"Zero bonus per ref_status_split (status={case.status_code})."
+            ))
 
     # 2. Resolve role + apply split percentage --------------------------------
     role_row = ref.roles.get(payment_in.role_id)
