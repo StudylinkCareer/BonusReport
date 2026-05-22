@@ -465,23 +465,32 @@ def apply_payment_timing(
 
     # Reading Y: priority is exempt from status splits. It has its own
     # payment-timing structure (50% at enrolment / 50% post-KPI), independent
-    # of visa-contingent §3 splits. Apply split_pct only to the splittable
-    # portion (tier + package + addon + flat_local - presales_share);
-    # priority passes through at full value here. Step 3.5 may later halve
-    # the priority portion under the SPLIT_25_25_50 rule.
+    # of visa-contingent §3 splits. The addon (service fee) is ALSO exempt
+    # from status splits — service fees are payment for work completed
+    # (visa renewal, guardian change, etc.) and have no deferred portion
+    # per §I.6 and the service_fee catalog ("fire at Step 2.8 and EXIT").
+    #
+    # Apply split_pct only to the truly splittable portion
+    # (tier + package + flat_local - presales_share);
+    # priority and addon both pass through at full value here. Step 3.5
+    # may later halve the priority portion under the SPLIT_25_25_50 rule.
     #
     # gross_bonus already accounts for presales_share (it was subtracted in
     # calc.py when constructing pre_timing). So gross_bonus - priority_bonus
-    # gives the splittable portion correctly.
+    # - addon_bonus gives the splittable portion correctly.
     priority_passthrough = payment_in.priority_bonus
-    splittable_gross = payment_in.gross_bonus - priority_passthrough
+    addon_passthrough = payment_in.addon_bonus
+    splittable_gross = (
+        payment_in.gross_bonus - priority_passthrough - addon_passthrough
+    )
     splittable_payable = int(Decimal(splittable_gross) * split_pct)
-    base_payable = splittable_payable + priority_passthrough
+    base_payable = splittable_payable + priority_passthrough + addon_passthrough
     withheld_from_split = splittable_gross - splittable_payable
 
     timing_audit['split_pct'] = str(split_pct)
     timing_audit['role_code'] = role_code
     timing_audit['priority_passthrough'] = priority_passthrough
+    timing_audit['addon_passthrough'] = addon_passthrough
     timing_audit['splittable_gross'] = splittable_gross
     timing_audit['splittable_payable'] = splittable_payable
     timing_audit['base_payable_after_split'] = base_payable
@@ -572,8 +581,8 @@ def apply_payment_timing(
                 priority_withheld = priority_passthrough - priority_now
                 priority_schedule_type = 'SPLIT_25_25_50'
                 # Replace the full priority in base_payable with just the
-                # half being paid now.
-                base_payable = splittable_payable + priority_now
+                # half being paid now. addon_passthrough still flows at 100%.
+                base_payable = splittable_payable + priority_now + addon_passthrough
                 priority_quota_audit['split_applied'] = True
                 priority_quota_audit['priority_full'] = priority_passthrough
                 priority_quota_audit['priority_now'] = priority_now
@@ -642,14 +651,17 @@ def apply_payment_timing(
                 timing_audit['priority_unlocked_from_prior'] = priority_unlocked
         elif _is_same_month_enrol_visa(case, ctx.year, ctx.month):
             # (b) Same-month enrol+visa — pay full splittable + full priority
+            #     + full addon
             #
             # Override the split_pct factor that step 2 applied. The
             # case is paying its entire 100% in this single month
             # (carry-over component = 100% - 100% = 0%).
-            base_payable = splittable_gross + priority_passthrough
+            base_payable = (
+                splittable_gross + priority_passthrough + addon_passthrough
+            )
             same_month_full_payment = True
             timing_audit['carry_over'] = (
-                'same_month_enrol_visa: full payment (splittable+priority), '
+                'same_month_enrol_visa: full payment (splittable+priority+addon), '
                 'split_pct override'
             )
             timing_audit['split_pct_override'] = '1.0'
