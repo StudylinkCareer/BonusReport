@@ -1063,6 +1063,11 @@ def main(argv: list[str] | None = None) -> int:
                 r["id"]: r["contract_id"] for r in case_rows
             }
 
+            case_service_map = load_case_services(
+                            cursor,
+                            case_ids=[r["id"] for r in case_rows],
+                        )
+
             # Adapt + run engine
             skipped: list[tuple[dict, str]] = []
             errored: list[tuple[dict, BaseException]] = []
@@ -1073,7 +1078,11 @@ def main(argv: list[str] | None = None) -> int:
                 contract_id = case_row.get("contract_id", "<no-id>")
 
                 try:
-                    case_input = adapt_case(case_row, ref)
+                    case_input = adapt_case(
+                       case_row,
+                       ref,
+                       addon_items=case_service_map.get(case_row["id"], []),
+                   )
                 except CaseNotAdaptableError as e:
                     skipped.append((case_row, e.reason))
                     continue

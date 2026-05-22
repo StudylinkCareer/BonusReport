@@ -11,16 +11,34 @@ Design notes
 * Pure function — no side effects, no DB calls. Takes a dict + ReferenceData,
   returns a CaseInput.
 * Skip rules — rows with non-adaptable import_status raise CaseNotAdaptableError.
-  NULL institution_id rejected EXCEPT when status has is_visa_only_paid=TRUE
-  (per DD-§I.6 — visa-only contracts have no institution).
+  NULL institution_id is rejected EXCEPT when client_type_code is one of the
+  service-only types (visa-only, guardian, tourist, migration, dependant)
+  which have no underlying educational-institution enrolment.
 * Loud on data-integrity issues — if a tx_case row references a staff_id not
   in ReferenceData.staff, that's a real bug and we raise rather than papering
   over it.
 
-CHANGES IN THIS REVISION (Phase 14a — DD-§I.6):
-  - NULL institution_id is now ALLOWED when application_status maps to a
-    ref_status_split row with is_visa_only_paid=TRUE. Other paths through
-    the adapter unchanged.
+CHANGES IN THIS REVISION (Phase 14b — Client Type Canonicalisation):
+  - Replaced status-flag-driven null-institution check (was: looking up
+    ref_status_split.is_visa_only_paid) with client_type-driven check.
+    The prior approach conflated workflow state (status) with contract type
+    (client_type) — a fabrication of a prior session, not in any procedural
+    document.
+  - Helper renamed: _status_allows_null_institution → _client_type_allows_null_institution.
+  - No longer needs ReferenceData lookup for the null-institution check.
+  - UNRESOLVED client_type_code values are filtered upstream via
+    import_status='UNRESOLVED' (already handled at line ~100 in is_adaptable)
+    so this helper does not need a special UNRESOLVED branch.
+
+Citations:
+  - Chính_sách_chỉ_tiêu__bonus__final_1_6_24.pdf §I.2 (KPI weights per service
+    type — 5 of the 9 canonical client types have weight 0 across all routes,
+    indicating no enrolment)
+  - Chính_sách_chỉ_tiêu__bonus__final_1_6_24.pdf §I.6 (fees-paid-non-enrolled
+    handling — separate concept, driven by application_status, untouched here)
+  - Chính_sách_chỉ_tiêu__bonus__final_1_6_24.pdf §I.7 (Vietnam domestic =
+    Counsellor only, no CO involvement — informs that VIETNAM_DOMESTIC IS
+    enrolment-based and so NOT in the no-institution set)
 """
 
 from __future__ import annotations
@@ -40,6 +58,23 @@ NON_ADAPTABLE_STATUSES: frozenset[str] = frozenset({
     "SCRAP",
     "UNRESOLVED",
     "UNRESOLVED-PARTNER",
+})
+
+
+# Canonical client_type_code values where institution_id may legitimately be NULL.
+# These are pure-service contracts with no enrolment at an educational
+# institution behind them.
+#
+# Per ref_client_type seed (Phase 14a migration 14a_v2). All 5 are weight-0
+# in §I.2 KPI calculations because no enrolment occurs. The other 4 canonical
+# client types (DU_HOC_FULL, DU_HOC_ENROL_ONLY, SUMMER_STUDY, VIETNAM_DOMESTIC)
+# all involve enrolment at an institution and so require institution_id.
+CLIENT_TYPES_NO_INSTITUTION: frozenset[str] = frozenset({
+    "VISA_ONLY_SERVICE",  # Visa Du học only — visa service, student enrolment elsewhere or none
+    "GUARDIAN_VISA",      # Visa Giám hộ
+    "TOURIST_VISA",       # Visa Du lịch
+    "MIGRATION_VISA",     # Visa Định cư
+    "DEPENDANT_VISA",     # Visa Phụ thuộc
 })
 
 
@@ -63,23 +98,28 @@ class CaseNotAdaptableError(Exception):
 
 
 # ---------------------------------------------------------------------------
-# Helper — does this status allow NULL institution_id?
+# Helper — does this client_type allow NULL institution_id?
 # ---------------------------------------------------------------------------
 
-def _status_allows_null_institution(
-    application_status: str | None,
-    ref: ReferenceData,
+def _client_type_allows_null_institution(
+    client_type_code: str | None,
 ) -> bool:
     """
-    NULL institution_id is permitted only for statuses with is_visa_only_paid=TRUE.
-    Per DD-§I.6 — visa-only contracts (485, etc.) have no institution.
+    NULL institution_id is permitted only for service-only client types
+    (visa-only, guardian, tourist, migration, dependant) which have no
+    underlying educational-institution enrolment.
+
+    Per Chính_sách_chỉ_tiêu__bonus__final_1_6_24.pdf §I.2 KPI weight table
+    (5 client types weight 0 across all routes — no enrolment) and §I.7
+    (Vietnam domestic IS an enrolment, so NOT in this set).
+
+    Returns False for None and for UNRESOLVED — both indicate the case
+    is not safe to process. (UNRESOLVED is typically filtered upstream
+    via import_status check, but this helper is defensive.)
     """
-    if application_status is None:
+    if client_type_code is None:
         return False
-    status_row = ref.status_splits.get(application_status)
-    if status_row is None:
-        return False
-    return bool(status_row.get('is_visa_only_paid', False))
+    return client_type_code in CLIENT_TYPES_NO_INSTITUTION
 
 
 # ---------------------------------------------------------------------------
@@ -92,15 +132,19 @@ def is_adaptable(tx_case_row: dict[str, Any], ref: ReferenceData) -> bool:
 
     Rules:
       * import_status must NOT be in NON_ADAPTABLE_STATUSES
-      * institution_id must NOT be NULL  (UNLESS status has is_visa_only_paid)
+      * institution_id must NOT be NULL (UNLESS client_type is service-only)
       * country_id must NOT be NULL
       * case_office_id must NOT be NULL
+
+    Note: ref parameter retained for signature stability; not used by the
+    null-institution check in this revision (was used to look up
+    ref_status_split.is_visa_only_paid in the prior revision).
     """
     if tx_case_row.get("import_status") in NON_ADAPTABLE_STATUSES:
         return False
     if tx_case_row.get("institution_id") is None:
-        if not _status_allows_null_institution(
-            tx_case_row.get("application_status"), ref
+        if not _client_type_allows_null_institution(
+            tx_case_row.get("client_type_code")
         ):
             return False
     if tx_case_row.get("country_id") is None:
@@ -126,7 +170,7 @@ def adapt_case(
 
     Args:
         tx_case_row: dict with column names from tx_case as keys
-        ref: ReferenceData snapshot (needed for staff name lookups + status row check)
+        ref: ReferenceData snapshot (needed for staff name lookups)
         prior_payments_by_slot: optional, populated by the runner
         addon_items: optional, populated by the runner
 
@@ -145,12 +189,17 @@ def adapt_case(
             f"import_status={tx_case_row.get('import_status')}",
         )
 
-    # NULL institution_id allowed only for is_visa_only_paid statuses
+    # NULL institution_id allowed only for service-only client types
     if tx_case_row.get("institution_id") is None:
-        if not _status_allows_null_institution(
-            tx_case_row.get("application_status"), ref
+        if not _client_type_allows_null_institution(
+            tx_case_row.get("client_type_code")
         ):
-            raise CaseNotAdaptableError(contract_id, "institution_id is NULL")
+            raise CaseNotAdaptableError(
+                contract_id,
+                f"institution_id is NULL and client_type_code="
+                f"{tx_case_row.get('client_type_code')!r} is not in "
+                f"CLIENT_TYPES_NO_INSTITUTION",
+            )
 
     if tx_case_row.get("country_id") is None:
         raise CaseNotAdaptableError(contract_id, "country_id is NULL")
@@ -198,7 +247,7 @@ def adapt_case(
         student_name=tx_case_row.get("student_name") or "",
         notes=tx_case_row.get("notes"),
 
-        institution_id=tx_case_row.get("institution_id"),  # Now optional (may be None)
+        institution_id=tx_case_row.get("institution_id"),  # May be None for service-only client types
         institution_text_raw=tx_case_row.get("institution_text_raw") or "",
         referring_partner_id=tx_case_row.get("referring_partner_id"),
         referring_sub_agent_id=tx_case_row.get("referring_sub_agent_id"),
