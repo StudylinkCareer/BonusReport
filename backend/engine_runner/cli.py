@@ -1131,7 +1131,9 @@ def persist_payments(
         split_pct_str = timing.get("split_pct", "1.0")
 
         # INSERT tx_bonus_payment (Phase 12b: 3 priority columns; Phase 14b: write
-        # mgmt_override_amount/_reason — frontend already reads these)
+        # mgmt_override_amount/_reason — frontend already reads these;
+        # Phase 15d: source_period_year/month + adjustment_type for delta marking.
+        # For ORIGINAL runs source_period = run_period and adjustment_type='NORMAL'.)
         cursor.execute(
             """INSERT INTO tx_bonus_payment (
                     case_id, slot, staff_id, role_id, office_id,
@@ -1144,6 +1146,7 @@ def persist_payments(
                     mgmt_override_amount, mgmt_override_reason,
                     calc_notes, audit_json,
                     run_year, run_month,
+                    source_period_year, source_period_month, adjustment_type,
                     calculated_at, created_at
                 ) VALUES (
                     %s, %s, %s, %s, %s,
@@ -1156,6 +1159,7 @@ def persist_payments(
                     %s, %s,
                     %s, %s,
                     %s, %s,
+                    %s, %s, %s,
                     NOW(), NOW()
                 )""",
             (
@@ -1172,6 +1176,8 @@ def persist_payments(
                 p.override_reason,
                 p.calc_notes, Json(_to_jsonable(audit)),
                 year, month,
+                # Phase 15d delta marking — original (non-delta) runs.
+                year, month, "NORMAL",
             ),
         )
         inserted_count += 1
