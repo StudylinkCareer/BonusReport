@@ -120,6 +120,7 @@ _INSERT_COLUMNS = (
     "referring_office_id",
     "referring_agent_text_raw",
     "client_type_code",
+    "package_fee_id",
     "application_status",
     "application_status_id",
     "course_status",
