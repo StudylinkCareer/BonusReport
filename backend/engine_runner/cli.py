@@ -841,7 +841,8 @@ def persist_payments(
         # Split pct from timing audit (stored as string)
         split_pct_str = timing.get("split_pct", "1.0")
 
-        # INSERT tx_bonus_payment (Phase 12b: 3 priority columns; Phase 14b: 2 override columns)
+        # INSERT tx_bonus_payment (Phase 12b: 3 priority columns; Phase 14b: write
+        # mgmt_override_amount/_reason — frontend already reads these)
         cursor.execute(
             """INSERT INTO tx_bonus_payment (
                     case_id, slot, staff_id, role_id, office_id,
@@ -851,7 +852,7 @@ def persist_payments(
                     advance_offset, gross_bonus, net_payable,
                     priority_withheld_amount, priority_unlocked_amount,
                     priority_schedule_type,
-                    override_applied, override_reason,
+                    mgmt_override_amount, mgmt_override_reason,
                     calc_notes, audit_json,
                     run_year, run_month,
                     calculated_at, created_at
@@ -876,7 +877,10 @@ def persist_payments(
                 p.advance_offset, p.gross_bonus, p.net_payable,
                 p.priority_withheld_amount, p.priority_unlocked_amount,
                 p.priority_schedule_type,
-                p.override_applied, p.override_reason,
+                # When no override exists, store NULL in mgmt_override_amount
+                # so the frontend's null-coalesce displays 0 correctly.
+                p.override_applied if p.override_applied > 0 else None,
+                p.override_reason,
                 p.calc_notes, Json(_to_jsonable(audit)),
                 year, month,
             ),
