@@ -2098,11 +2098,11 @@ def preview_engine_scope_endpoint(body: dict = Body(default_factory=dict)) -> di
 
                 # Look up staff names for dialog copy (read-only).
                 cur.execute(
-                    "SELECT id, full_name FROM ref_staff WHERE id = ANY(%s)",
+                    "SELECT id, canonical_name FROM ref_staff WHERE id = ANY(%s)",
                     (resolution.staff_ids,),
                 )
                 name_by_id = {
-                    row["id"]: row["full_name"] for row in cur.fetchall()
+                    row["id"]: row["canonical_name"] for row in cur.fetchall()
                 }
     except ClosedCasesInTriggerSet as exc:
         raise HTTPException(409, str(exc))
