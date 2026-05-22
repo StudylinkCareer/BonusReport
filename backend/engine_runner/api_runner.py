@@ -54,6 +54,7 @@ from backend.engine_runner.adapter import (
 )
 from backend.engine_runner.cli import (
     build_run_context,
+    load_case_overrides,
     load_case_services,
     load_cases,
     load_enrolments_by_staff_office,
@@ -374,6 +375,8 @@ def _run_engine_within_connection(
         priority_ytd = aggregate_ytd(cursor, year=year, month=month)
         prior_withholdings = load_open_carry_overs(cursor)
         prior_priority_withholdings = load_prior_priority_withholdings(cursor)
+        # Phase 14b: management overrides from tx_case_override
+        case_overrides = load_case_overrides(cursor)
         enrolments = load_enrolments_by_staff_office(
             cursor, year=year, month=month,
         )
@@ -383,6 +386,7 @@ def _run_engine_within_connection(
             year=year, month=month,
             priority_quota_tracker=priority_quota_tracker,
             prior_priority_withholdings=prior_priority_withholdings,
+            case_overrides=case_overrides,
         )
 
         case_rows = load_cases(
