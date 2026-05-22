@@ -18,12 +18,11 @@ Lookup table: ref_service_fee.
 Slot eligibility:
   counsellor (any role)             → eligible (gets counsellor_signing_bonus)
   case_officer with CO_DIR role     → eligible (gets co_signing_bonus)
-  case_officer with CO_SUB role     → NOT eligible
-                                        (CO_SUB staff work with sub-agents,
-                                         do not earn package signing bonus.
-                                         Packages are promoted by Counsellors
-                                         and CO_DIRs only — per business rule
-                                         locked Phase 14c.)
+  case_officer with CO_SUB role     → NOT eligible (Phase 14c business rule:
+                                        packages are promoted by Counsellors
+                                        and CO_DIRs only; CO_SUB staff work
+                                        with sub-agents and do not earn the
+                                        package signing bonus.)
   presales / vp                     → not eligible (always 0)
 
 Payment timing:
@@ -95,7 +94,7 @@ def calc_package_bonus(
       - the row's category != 'PACKAGE' (it's a SERVICE_FEE / ADDON /
         CONTRACT row — handled by other calcs)
       - slot is presales or vp
-      - slot is case_officer AND staff is CO_SUB (Phase 14c business rule)
+      - slot is case_officer AND staff role is CO_SUB (Phase 14c rule)
       - the matched amount column is 0
 
     Raises:
