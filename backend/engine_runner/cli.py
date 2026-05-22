@@ -348,6 +348,49 @@ def load_prior_priority_withholdings(cursor: Any) -> dict[tuple[str, int], int]:
     }
 
 
+def load_case_overrides(
+    cursor: Any,
+) -> dict[tuple[int, int], tuple[int, str]]:
+    """
+    Phase 14b: Load management overrides from tx_case_override, keyed by
+    (case_id, staff_id).
+
+    Returns:
+        {(case_id, staff_id): (total_amount, joined_reasons)}
+
+    Multiple override rows for the same (case, staff) are SUMMED.
+    Reasons are ' | '-joined in created_at order so the UI can show
+    the manager's full rationale.
+
+    Override sticks to the (case, staff) pair regardless of run period:
+    if a case is re-calculated in any period, the same override applies.
+    Override is a decision about a case, not about a calendar month.
+
+    Per Chính_sách §I.5.3, CLAWBACK is a SEPARATE mechanism with its own
+    table (tx_clawback_balance) and engine path. tx_case_override is for
+    positive-only discretionary overrides; the CHECK constraint
+    chk_tx_case_override_amount_positive enforces amount > 0.
+
+    Returns empty dict if no rows exist — engine treats every payment as
+    override_applied = 0.
+    """
+    cursor.execute(
+        """
+        SELECT case_id,
+               staff_id,
+               SUM(amount) AS total_amount,
+               string_agg(reason, ' | ' ORDER BY created_at) AS joined_reasons
+          FROM tx_case_override
+         GROUP BY case_id, staff_id
+        """
+    )
+    return {
+        (row["case_id"], row["staff_id"]):
+            (int(row["total_amount"]), row["joined_reasons"])
+        for row in cursor.fetchall()
+    }
+
+
 def load_enrolments_by_staff_office(
     cursor: Any,
     year: int,
@@ -427,6 +470,7 @@ def build_run_context(
     month: int,
     priority_quota_tracker: dict[int, dict] | None = None,
     prior_priority_withholdings: dict[tuple[str, int], int] | None = None,
+    case_overrides: dict[tuple[int, int], tuple[int, str]] | None = None,
 ) -> RunContext:
     """
     Construct the RunContext for this period.
@@ -467,6 +511,13 @@ def build_run_context(
     RunContext (default factory) — it accumulates during the run to
     dedup multi-slot cases.
 
+    Phase 14b addition:
+      case_overrides — keyed by (case_id, staff_id), value is
+        (total_amount, joined_reasons). Loaded from tx_case_override via
+        load_case_overrides. Applied as a final additive step in
+        payment_timing. Distinct from clawback (tx_clawback_balance) per
+        Chính_sách §I.5.3.
+
     One field remains stubbed empty pending follow-up:
 
       * clawback_balances_by_staff — from tx_clawback_balance.
@@ -487,6 +538,7 @@ def build_run_context(
         prior_withholdings_by_contract_staff=prior_withholdings,
         priority_quota_state=priority_quota_tracker or {},
         prior_priority_withholdings_by_contract_staff=prior_priority_withholdings or {},
+        overrides_by_case_staff=case_overrides or {},
         # seen_priority_case_ids defaults to empty set in the dataclass
     )
 
@@ -789,7 +841,7 @@ def persist_payments(
         # Split pct from timing audit (stored as string)
         split_pct_str = timing.get("split_pct", "1.0")
 
-        # INSERT tx_bonus_payment (Phase 12b: 3 new columns appended)
+        # INSERT tx_bonus_payment (Phase 12b: 3 priority columns; Phase 14b: 2 override columns)
         cursor.execute(
             """INSERT INTO tx_bonus_payment (
                     case_id, slot, staff_id, role_id, office_id,
@@ -799,6 +851,7 @@ def persist_payments(
                     advance_offset, gross_bonus, net_payable,
                     priority_withheld_amount, priority_unlocked_amount,
                     priority_schedule_type,
+                    override_applied, override_reason,
                     calc_notes, audit_json,
                     run_year, run_month,
                     calculated_at, created_at
@@ -812,6 +865,7 @@ def persist_payments(
                     %s,
                     %s, %s,
                     %s, %s,
+                    %s, %s,
                     NOW(), NOW()
                 )""",
             (
@@ -822,6 +876,7 @@ def persist_payments(
                 p.advance_offset, p.gross_bonus, p.net_payable,
                 p.priority_withheld_amount, p.priority_unlocked_amount,
                 p.priority_schedule_type,
+                p.override_applied, p.override_reason,
                 p.calc_notes, Json(_to_jsonable(audit)),
                 year, month,
             ),
@@ -1026,6 +1081,14 @@ def main(argv: list[str] | None = None) -> int:
                   f"{len(prior_priority_withholdings)} (contract, staff) "
                   f"pairs with unreleased priority withholds.")
 
+            # Phase 14b: Management overrides keyed by (case_id, staff_id).
+            # Read from tx_case_override; SUMmed per (case, staff). Applied
+            # as final additive step in payment_timing. Distinct from
+            # clawback (tx_clawback_balance) — see §I.5.3.
+            case_overrides = load_case_overrides(cursor)
+            print(f"Case overrides loaded: {len(case_overrides)} "
+                  f"(case, staff) pair(s) with management overrides.")
+
             # Current-month enrolment counts → enrolments_by_staff_office.
             # Wired (was previously stubbed). Drives UNDER/TARGET/OVER tier
             # selection in classify_tier.
@@ -1041,6 +1104,7 @@ def main(argv: list[str] | None = None) -> int:
                 year=args.year, month=args.month,
                 priority_quota_tracker=priority_quota_tracker,
                 prior_priority_withholdings=prior_priority_withholdings,
+                case_overrides=case_overrides,
             )
 
             # Load cases (Phase 13b: staff_id filter applied if --staff-id given)
@@ -1063,11 +1127,6 @@ def main(argv: list[str] | None = None) -> int:
                 r["id"]: r["contract_id"] for r in case_rows
             }
 
-            case_service_map = load_case_services(
-                            cursor,
-                            case_ids=[r["id"] for r in case_rows],
-                        )
-
             # Adapt + run engine
             skipped: list[tuple[dict, str]] = []
             errored: list[tuple[dict, BaseException]] = []
@@ -1078,11 +1137,7 @@ def main(argv: list[str] | None = None) -> int:
                 contract_id = case_row.get("contract_id", "<no-id>")
 
                 try:
-                    case_input = adapt_case(
-                       case_row,
-                       ref,
-                       addon_items=case_service_map.get(case_row["id"], []),
-                   )
+                    case_input = adapt_case(case_row, ref)
                 except CaseNotAdaptableError as e:
                     skipped.append((case_row, e.reason))
                     continue

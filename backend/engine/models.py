@@ -55,6 +55,23 @@ CHANGES:
                   exception to the otherwise-immutable RunContext, mirroring
                   the existing pattern where dict contents (not the dict
                   reference) are mutable inside a frozen dataclass.
+
+  Phase 14b — management override mechanism:
+    - RunContext: added overrides_by_case_staff. Keyed by
+      (case_id, staff_id), value is (total_amount, joined_reasons).
+      Loaded from tx_case_override by the data layer. Override sticks
+      to the (case, staff) pair regardless of run period — if the case
+      is re-calculated in any period, the same override applies.
+    - BonusPayment: added override_applied, override_reason. Default
+      zero / None so every existing constructor still works. Surfaced
+      in tx_bonus_payment so the UI can show "Δ Override" alongside
+      the underlying calculation.
+
+    Per Chính_sách_chỉ_tiêu__bonus__final_1_6_24.pdf §I.5.3, CLAWBACK
+    is a separate concept (policy-driven reversal of prior payment, with
+    its own running-balance accounting in tx_clawback_balance). Overrides
+    in tx_case_override are positive-only and discretionary; clawback
+    has its own table and engine path. Do not conflate them.
 """
 
 from __future__ import annotations
@@ -225,6 +242,28 @@ class RunContext:
         had their priority quota incremented. Prevents double-counting
         across multiple slot rows for the same case (counsellor +
         case_officer + presales). Mutated in place. Reset per run.
+
+    Phase 14b — management overrides:
+      overrides_by_case_staff: discretionary management overrides from
+        tx_case_override, applied as a final additive step to net_payable
+        (and to the addon-bypass path inside _zeroed_payment).
+
+        Key: (case_id, staff_id).
+        Value: (total_amount, joined_reasons).
+          - total_amount: SUM of all tx_case_override.amount rows for
+            this (case, staff). Always > 0 by CHECK constraint.
+            Multiple rows are allowed (e.g. an initial 500k override
+            in one month, plus another 200k later — they sum to 700k).
+          - joined_reasons: ' | '-joined tx_case_override.reason values
+            for surfacing in BonusPayment.calc_notes / audit_json.
+
+        Sticks to the (case, staff) pair regardless of run period —
+        if the case is re-calculated in any period, the same override
+        applies. (Override is a decision about a case, not a period.)
+
+        Per Chính_sách §I.5.3, CLAWBACK is a SEPARATE mechanism with
+        its own table (tx_clawback_balance) and engine path. Overrides
+        are positive-only; do not conflate the two.
     """
     year: int
     month: int
@@ -244,6 +283,9 @@ class RunContext:
     prior_priority_withholdings_by_contract_staff: dict[tuple[str, int], int] = field(default_factory=dict)
     priority_quota_state: dict[int, dict] = field(default_factory=dict)
     seen_priority_case_ids: set[int] = field(default_factory=set)
+
+    # Phase 14b additions — management overrides (per (case, staff))
+    overrides_by_case_staff: dict[tuple[int, int], tuple[int, str]] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -327,6 +369,7 @@ class BonusPayment:
                   + unlocked_amount        (released from prior runs)
                   - clawback_applied
                   - advance_offset         (D1.R12 prior payment)
+                  + override_applied       (Phase 14b mgmt override)
 
     Phase 12b — priority 25/25/50 split rule additions:
       priority_withheld_amount: the portion of the at-enrolment priority
@@ -339,6 +382,20 @@ class BonusPayment:
       priority_schedule_type: 'STANDARD' (default) or 'SPLIT_25_25_50'.
         Locked at first-pay; not re-evaluated if quota state changes
         between enrolment and visa.
+
+    Phase 14b — management override fields:
+      override_applied: sum of tx_case_override.amount rows matching
+        this payment's (case_id, staff_id). Always >= 0 (per CHECK
+        constraint on tx_case_override). Added as the final step to
+        net_payable. Zero when no override exists for this (case, staff).
+      override_reason: ' | '-joined tx_case_override.reason values when
+        an override is applied, else None. Surfaced so the UI's
+        "Overrides" pill and "Δ Override" column can render the manager's
+        rationale alongside the engine's calculation.
+
+      Override is a SEPARATE concept from clawback (§I.5.3). Clawback
+      lives in tx_clawback_balance with its own per-staff running balance.
+      Do not store clawback amounts here.
 
     calc_notes: human-readable explanation of how this row was built.
     audit_json: full lookup trace (which rate row, which split row,
@@ -382,3 +439,10 @@ class BonusPayment:
     priority_withheld_amount: int = 0
     priority_unlocked_amount: int = 0
     priority_schedule_type: str = 'STANDARD'
+
+    # Phase 14b additions — management override.
+    # Defaults provided so every existing constructor still works.
+    # See class docstring above for semantics; see tx_case_override
+    # table and CHECK constraint chk_tx_case_override_amount_positive.
+    override_applied: int = 0
+    override_reason: str | None = None

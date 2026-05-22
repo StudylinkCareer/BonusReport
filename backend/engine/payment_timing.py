@@ -424,7 +424,7 @@ def apply_payment_timing(
             timing_audit['outcome'] = 'is_zero_bonus_no_payment'
             return _zeroed_payment(payment_in, timing_audit, calc_notes_extra=(
                 f"Zero bonus per ref_status_split (status={case.status_code})."
-            ))
+            ), ctx=ctx)
 
     # 2. Resolve role + apply split percentage --------------------------------
     role_row = ref.roles.get(payment_in.role_id)
@@ -465,32 +465,23 @@ def apply_payment_timing(
 
     # Reading Y: priority is exempt from status splits. It has its own
     # payment-timing structure (50% at enrolment / 50% post-KPI), independent
-    # of visa-contingent §3 splits. The addon (service fee) is ALSO exempt
-    # from status splits — service fees are payment for work completed
-    # (visa renewal, guardian change, etc.) and have no deferred portion
-    # per §I.6 and the service_fee catalog ("fire at Step 2.8 and EXIT").
-    #
-    # Apply split_pct only to the truly splittable portion
-    # (tier + package + flat_local - presales_share);
-    # priority and addon both pass through at full value here. Step 3.5
-    # may later halve the priority portion under the SPLIT_25_25_50 rule.
+    # of visa-contingent §3 splits. Apply split_pct only to the splittable
+    # portion (tier + package + addon + flat_local - presales_share);
+    # priority passes through at full value here. Step 3.5 may later halve
+    # the priority portion under the SPLIT_25_25_50 rule.
     #
     # gross_bonus already accounts for presales_share (it was subtracted in
     # calc.py when constructing pre_timing). So gross_bonus - priority_bonus
-    # - addon_bonus gives the splittable portion correctly.
+    # gives the splittable portion correctly.
     priority_passthrough = payment_in.priority_bonus
-    addon_passthrough = payment_in.addon_bonus
-    splittable_gross = (
-        payment_in.gross_bonus - priority_passthrough - addon_passthrough
-    )
+    splittable_gross = payment_in.gross_bonus - priority_passthrough
     splittable_payable = int(Decimal(splittable_gross) * split_pct)
-    base_payable = splittable_payable + priority_passthrough + addon_passthrough
+    base_payable = splittable_payable + priority_passthrough
     withheld_from_split = splittable_gross - splittable_payable
 
     timing_audit['split_pct'] = str(split_pct)
     timing_audit['role_code'] = role_code
     timing_audit['priority_passthrough'] = priority_passthrough
-    timing_audit['addon_passthrough'] = addon_passthrough
     timing_audit['splittable_gross'] = splittable_gross
     timing_audit['splittable_payable'] = splittable_payable
     timing_audit['base_payable_after_split'] = base_payable
@@ -581,8 +572,8 @@ def apply_payment_timing(
                 priority_withheld = priority_passthrough - priority_now
                 priority_schedule_type = 'SPLIT_25_25_50'
                 # Replace the full priority in base_payable with just the
-                # half being paid now. addon_passthrough still flows at 100%.
-                base_payable = splittable_payable + priority_now + addon_passthrough
+                # half being paid now.
+                base_payable = splittable_payable + priority_now
                 priority_quota_audit['split_applied'] = True
                 priority_quota_audit['priority_full'] = priority_passthrough
                 priority_quota_audit['priority_now'] = priority_now
@@ -651,17 +642,14 @@ def apply_payment_timing(
                 timing_audit['priority_unlocked_from_prior'] = priority_unlocked
         elif _is_same_month_enrol_visa(case, ctx.year, ctx.month):
             # (b) Same-month enrol+visa — pay full splittable + full priority
-            #     + full addon
             #
             # Override the split_pct factor that step 2 applied. The
             # case is paying its entire 100% in this single month
             # (carry-over component = 100% - 100% = 0%).
-            base_payable = (
-                splittable_gross + priority_passthrough + addon_passthrough
-            )
+            base_payable = splittable_gross + priority_passthrough
             same_month_full_payment = True
             timing_audit['carry_over'] = (
-                'same_month_enrol_visa: full payment (splittable+priority+addon), '
+                'same_month_enrol_visa: full payment (splittable+priority), '
                 'split_pct override'
             )
             timing_audit['split_pct_override'] = '1.0'
@@ -836,6 +824,22 @@ def apply_payment_timing(
             f"(quota not yet met for institution)"
         )
 
+    # ─── Phase 14b: Management override (final additive step) ────────────────
+    # Applied AFTER all timing math (split, withhold, carry-over, deferral,
+    # clawback). An override is a discretionary mgmt decision to pay an
+    # additional amount for this (case, staff). Per Chính_sách §I.5.3,
+    # clawback is a SEPARATE concept — clawback already lives in
+    # tx_clawback_balance and was applied above; overrides come from
+    # tx_case_override and are positive-only by CHECK constraint.
+    override_total, override_reason = ctx.overrides_by_case_staff.get(
+        (payment_in.case_id, payment_in.staff_id), (0, None)
+    )
+    if override_total > 0:
+        net_payable += override_total
+        notes_extras.append(
+            f"Mgmt override applied: +{override_total:,} đ ({override_reason})"
+        )
+
     extra_note = " | ".join(notes_extras)
     new_calc_notes = (
         f"{payment_in.calc_notes} | {extra_note}" if extra_note
@@ -869,6 +873,9 @@ def apply_payment_timing(
         priority_withheld_amount=priority_withheld,
         priority_unlocked_amount=priority_unlocked,
         priority_schedule_type=priority_schedule_type,
+        # Phase 14b — management override
+        override_applied=override_total,
+        override_reason=override_reason,
     )
 
 
@@ -876,10 +883,31 @@ def _zeroed_payment(
     payment_in: BonusPayment,
     timing_audit: dict,
     calc_notes_extra: str,
+    ctx: RunContext,
 ) -> BonusPayment:
-    """Return a BonusPayment with all amounts zero — used for is_zero_bonus."""
+    """
+    Return a BonusPayment with all amounts zero — used for is_zero_bonus.
+
+    Phase 14b: Even zero-bonus cases honour management overrides. If
+    ctx.overrides_by_case_staff has a row for (case_id, staff_id), the
+    override is applied as the net_payable (since all other components
+    are zero).
+    """
     new_audit = dict(payment_in.audit_json)
     new_audit['payment_timing'] = timing_audit
+
+    # Phase 14b: zero-bonus cases can still receive a mgmt override
+    override_total, override_reason = ctx.overrides_by_case_staff.get(
+        (payment_in.case_id, payment_in.staff_id), (0, None)
+    )
+    if override_total > 0:
+        final_extra = (
+            f"{calc_notes_extra} | Mgmt override applied: "
+            f"+{override_total:,} đ ({override_reason})"
+        )
+    else:
+        final_extra = calc_notes_extra
+
     return BonusPayment(
         case_id=payment_in.case_id,
         staff_id=payment_in.staff_id,
@@ -898,12 +926,15 @@ def _zeroed_payment(
         unlocked_amount=0,
         clawback_applied=0,
         bank_transfer_required=False,
-        net_payable=0,
-        calc_notes=f"{payment_in.calc_notes} | {calc_notes_extra}",
+        net_payable=override_total,         # the only non-zero amount
+        calc_notes=f"{payment_in.calc_notes} | {final_extra}",
         audit_json=new_audit,
         # Phase 12b — defaults already zero/STANDARD on the dataclass,
         # but explicit for clarity.
         priority_withheld_amount=0,
         priority_unlocked_amount=0,
         priority_schedule_type='STANDARD',
+        # Phase 14b — management override
+        override_applied=override_total,
+        override_reason=override_reason,
     )
