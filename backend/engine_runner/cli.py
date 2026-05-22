@@ -121,6 +121,12 @@ from backend.engine_runner.ytd_aggregator import (
     aggregate_ytd,
 )
 
+from backend.engine_runner.engine_audit import (
+    begin_engine_run,
+    capture_pre_writes,
+    record_post_writes,
+    finalize_engine_run,
+)
 
 # ---------------------------------------------------------------------------
 # CLI
@@ -665,8 +671,7 @@ def _to_jsonable(obj: Any) -> Any:
     if isinstance(obj, (datetime, date)):
         return obj.isoformat()
     return obj
-
-
+    
 def persist_payments(
     cursor: Any,
     *,
@@ -676,7 +681,12 @@ def persist_payments(
     case_office_id_map: dict[int, int],
     case_contract_id_map: dict[int, str],
     staff_id: int | None = None,
+    # ---- Phase 15c forensic audit (optional; safe default) ----
+    audit_run_type: str = "ORIGINAL",
+    audit_trigger_reason: str = "persist_payments (no caller context)",
+    audit_triggered_by_user_id: int | None = None,
 ) -> None:
+
     """
     Write payments to tx_bonus_payment AND manage tx_carry_over_balance.
 
