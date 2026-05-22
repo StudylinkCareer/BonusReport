@@ -16,9 +16,15 @@ Lookup table: ref_service_fee.
   effective_from / _to       → must cover the case's effective date
 
 Slot eligibility:
-  counsellor    → eligible (gets counsellor_signing_bonus)
-  case_officer  → eligible (gets co_signing_bonus)
-  presales / vp → not eligible (always 0)
+  counsellor (any role)             → eligible (gets counsellor_signing_bonus)
+  case_officer with CO_DIR role     → eligible (gets co_signing_bonus)
+  case_officer with CO_SUB role     → NOT eligible
+                                        (CO_SUB staff work with sub-agents,
+                                         do not earn package signing bonus.
+                                         Packages are promoted by Counsellors
+                                         and CO_DIRs only — per business rule
+                                         locked Phase 14c.)
+  presales / vp                     → not eligible (always 0)
 
 Payment timing:
   Counsellor's amount is "at signing", CO's is "at enrolment". Both
@@ -34,6 +40,13 @@ from __future__ import annotations
 from datetime import date
 
 from .models import CaseInput, ReferenceData, Slot
+
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+ROLE_ID_CO_SUB = 18  # dim_role.id for CO_SUB — locked
 
 
 # ---------------------------------------------------------------------------
@@ -82,6 +95,7 @@ def calc_package_bonus(
       - the row's category != 'PACKAGE' (it's a SERVICE_FEE / ADDON /
         CONTRACT row — handled by other calcs)
       - slot is presales or vp
+      - slot is case_officer AND staff is CO_SUB (Phase 14c business rule)
       - the matched amount column is 0
 
     Raises:
@@ -96,6 +110,16 @@ def calc_package_bonus(
     # Only counsellor/CO earn from this column.
     if slot_label not in ('counsellor', 'case_officer'):
         return 0, {'applied': False, 'reason': f'slot_{slot_label}_ineligible'}
+
+    # CO_SUB exclusion (Phase 14c): packages are promoted by Counsellors
+    # and CO_DIRs only; CO_SUB staff work with sub-agents and do not earn
+    # the package signing bonus.
+    if slot_label == 'case_officer' and slot.role_id == ROLE_ID_CO_SUB:
+        return 0, {
+            'applied': False,
+            'reason': 'co_sub_ineligible_for_package',
+            'role_id': slot.role_id,
+        }
 
     # Resolve the row.
     row = ref.service_fees.get(case.package_service_fee_id)
@@ -136,7 +160,7 @@ def calc_package_bonus(
     # Pick the right amount column for this slot.
     if slot_label == 'counsellor':
         amount = row.get('counsellor_signing_bonus', 0)
-    else:  # case_officer
+    else:  # case_officer (CO_DIR — CO_SUB already filtered above)
         amount = row.get('co_signing_bonus', 0)
 
     audit = {
