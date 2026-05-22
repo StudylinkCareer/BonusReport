@@ -92,6 +92,7 @@ from __future__ import annotations
 import argparse
 import sys
 import traceback
+from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal
 from typing import Any
@@ -127,6 +128,217 @@ from backend.engine_runner.engine_audit import (
     record_post_writes,
     finalize_engine_run,
 )
+
+# ---------------------------------------------------------------------------
+# Case-scoped trigger set (Phase 16 — workflow refactor)
+# ---------------------------------------------------------------------------
+#
+# When a user clicks Calculate on a selection of cases, the engine no
+# longer wipes the whole period. Instead the trigger set (the selected
+# cases) drives a staff-period fan-out: we identify the staff occupying
+# slots on those cases, then bound the recalc to ALL of those staff's
+# cases in that (year, month). Closed cases are immutable — engine
+# refuses if any trigger case is Closed (caller must reverse first).
+#
+# CRM bundles are single-period by construction, so the resolver asserts
+# single-period as a defensive guard. If it ever fires, something is
+# wrong upstream.
+# ---------------------------------------------------------------------------
+
+class ClosedCasesInTriggerSet(Exception):
+    """Raised when at least one case in a trigger set has workflow_state =
+    'closed'. Closed cases are immutable per spec §6.4 — to redo a closed
+    case the caller must reverse it first via the formal reversal flow.
+
+    Attributes
+    ----------
+    case_ids : list[int] of closed case_ids found in the trigger set
+    """
+    def __init__(self, case_ids: list[int]) -> None:
+        self.case_ids = case_ids
+        ids_str = ", ".join(str(c) for c in case_ids)
+        super().__init__(
+            f"Refusing to recalculate: trigger set contains closed case(s) "
+            f"[{ids_str}]. Closed cases are immutable. To redo one, reverse "
+            f"it first via POST /api/bonus/reverse-only or "
+            f"reverse-and-rerun-cascade."
+        )
+
+
+@dataclass(frozen=True)
+class TriggerSetResolution:
+    """Result of resolving a trigger-case selection into the bounded recalc
+    set that the engine will actually process.
+
+    Attributes
+    ----------
+    year, month : the single period the trigger set belongs to
+    trigger_case_ids : the original selection the caller passed in
+    staff_ids : staff occupying any of the four payment slots on the
+        trigger cases (sorted ascending)
+    bounded_case_ids : the fanned-out recalc set — all cases in (year,
+        month) where any of the above staff occupy any slot. Includes
+        the trigger cases. Sorted ascending.
+    """
+    year: int
+    month: int
+    trigger_case_ids: list[int]
+    staff_ids: list[int]
+    bounded_case_ids: list[int]
+
+
+def resolve_trigger_set(
+    cursor: Any,
+    case_ids: list[int],
+) -> TriggerSetResolution:
+    """Resolve a list of trigger case_ids into a TriggerSetResolution.
+
+    Steps:
+      1. Look up (run_year, run_month, slot staff_ids) for each trigger case.
+      2. Assert single period (CRM-bundled-by-period invariant; defensive).
+      3. Assert no trigger case is closed (spec §6.4).
+      4. Collect distinct staff_ids from the four payment slots.
+      5. Fan out: find ALL cases for those staff in (year, month).
+
+    Parameters
+    ----------
+    cursor : psycopg cursor (row_factory=dict_row expected)
+    case_ids : non-empty list of tx_case.id values
+
+    Raises
+    ------
+    ValueError              — empty input, multi-period, or unknown case_ids
+    ClosedCasesInTriggerSet — at least one trigger case is closed
+    """
+    if not case_ids:
+        raise ValueError("trigger set is empty")
+
+    # Step 1: look up trigger cases
+    cursor.execute(
+        """
+        SELECT id, run_year, run_month, workflow_state,
+               counsellor_staff_id, case_officer_staff_id,
+               presales_staff_id, vp_staff_id
+          FROM tx_case
+         WHERE id = ANY(%s)
+        """,
+        (case_ids,),
+    )
+    rows = list(cursor.fetchall())
+
+    if len(rows) != len(case_ids):
+        found = {r["id"] for r in rows}
+        missing = sorted(set(case_ids) - found)
+        raise ValueError(f"unknown case_ids: {missing}")
+
+    # Step 3 (early): closed-case guard
+    closed = [r["id"] for r in rows if (r["workflow_state"] or "").lower() == "closed"]
+    if closed:
+        raise ClosedCasesInTriggerSet(sorted(closed))
+
+    # Step 2: single-period assertion
+    periods = {(r["run_year"], r["run_month"]) for r in rows}
+    if len(periods) != 1:
+        raise ValueError(
+            f"trigger set spans multiple periods: {sorted(periods)}"
+        )
+    year, month = periods.pop()
+
+    # Step 4: collect staff_ids from the four payment slots
+    staff_ids: set[int] = set()
+    for r in rows:
+        for col in (
+            "counsellor_staff_id",
+            "case_officer_staff_id",
+            "presales_staff_id",
+            "vp_staff_id",
+        ):
+            v = r.get(col)
+            if v is not None:
+                staff_ids.add(int(v))
+
+    if not staff_ids:
+        # Edge case: trigger cases have no staff in any slot. Bounded
+        # recalc set degenerates to the trigger cases themselves.
+        bounded = sorted(case_ids)
+        return TriggerSetResolution(
+            year=year, month=month,
+            trigger_case_ids=list(case_ids),
+            staff_ids=[],
+            bounded_case_ids=bounded,
+        )
+
+    staff_id_list = sorted(staff_ids)
+
+    # Step 5: fan out — all cases for those staff in this period
+    cursor.execute(
+        """
+        SELECT id
+          FROM tx_case
+         WHERE run_year  = %s
+           AND run_month = %s
+           AND (   counsellor_staff_id    = ANY(%s)
+                OR case_officer_staff_id  = ANY(%s)
+                OR presales_staff_id      = ANY(%s)
+                OR vp_staff_id            = ANY(%s)
+               )
+         ORDER BY id
+        """,
+        (year, month, staff_id_list, staff_id_list, staff_id_list, staff_id_list),
+    )
+    bounded = [r["id"] for r in cursor.fetchall()]
+
+    return TriggerSetResolution(
+        year=year,
+        month=month,
+        trigger_case_ids=list(case_ids),
+        staff_ids=staff_id_list,
+        bounded_case_ids=bounded,
+    )
+
+
+def check_no_live_payments_for_cases(
+    conn: Any,
+    case_ids: list[int],
+) -> None:
+    """Case-scoped equivalent of check_no_live_payments.
+
+    Refuses if any PUBLISHED, non-reversed tx_bonus_payment rows exist for
+    any of the given case_ids. Draft rows (published_at IS NULL) do not
+    block re-runs — they are wiped and rewritten by persist_payments.
+
+    Raises
+    ------
+    LivePaymentRowsExistError — same exception type as the period-wide
+        check; conflicts list carries (staff_id, count) pairs aggregated
+        across the case_ids passed in. year/month on the exception are
+        taken from the first conflicting row.
+    """
+    if not case_ids:
+        return
+
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            """
+            SELECT run_year, run_month, staff_id, COUNT(*)::int AS live_count
+              FROM tx_bonus_payment
+             WHERE case_id = ANY(%s)
+               AND reversal_id IS NULL
+               AND published_at IS NOT NULL
+             GROUP BY run_year, run_month, staff_id
+             ORDER BY run_year, run_month, staff_id
+            """,
+            (case_ids,),
+        )
+        rows = list(cur.fetchall())
+
+    if rows:
+        # Single-period invariant: all rows should share (year, month).
+        year = int(rows[0]["run_year"])
+        month = int(rows[0]["run_month"])
+        conflicts = [(int(r["staff_id"]), int(r["live_count"])) for r in rows]
+        raise LivePaymentRowsExistError(year, month, conflicts)
+
 
 # ---------------------------------------------------------------------------
 # CLI
@@ -182,6 +394,7 @@ def load_cases(
     month: int,
     contract_id: str | None = None,
     staff_id: int | None = None,
+    case_ids: list[int] | None = None,
     limit: int | None = None,
 ) -> list[dict]:
     """Load tx_case rows for the run period as a list of dicts.
@@ -191,7 +404,18 @@ def load_cases(
     presales, vp. Note: target_owner_staff_id and pre_sales_staff_id are
     NOT part of the filter — those are separate concepts (KPI ownership
     and a legacy column, respectively).
+
+    Phase 16 (workflow refactor): when case_ids is given, restricts the
+    load to exactly those case_ids. year/month still apply (defensive —
+    cases outside the period are filtered out by the WHERE). Used by the
+    case-scoped engine entry to load the bounded recalc set produced by
+    resolve_trigger_set.
     """
+    # Phase 16: empty case_ids filter == empty result. Don't run
+    # `id = ANY('{}')` which would return zero rows after a full table scan.
+    if case_ids is not None and not case_ids:
+        return []
+
     sql = """
         SELECT *
           FROM tx_case
@@ -213,6 +437,12 @@ def load_cases(
                )
         """
         params.extend([staff_id, staff_id, staff_id, staff_id])
+
+    if case_ids is not None:
+        # Phase 16: case-scoped load. Empty filter was handled at the
+        # top of the function with an early return.
+        sql += " AND id = ANY(%s)"
+        params.append(case_ids)
 
     sql += " ORDER BY id"
 
@@ -681,6 +911,7 @@ def persist_payments(
     case_office_id_map: dict[int, int],
     case_contract_id_map: dict[int, str],
     staff_id: int | None = None,
+    case_ids: list[int] | None = None,
     # ---- Phase 15c forensic audit (optional; safe default) ----
     audit_run_type: str = "ORIGINAL",
     audit_trigger_reason: str = "persist_payments (no caller context)",
@@ -689,6 +920,8 @@ def persist_payments(
 
     """
     Write payments to tx_bonus_payment AND manage tx_carry_over_balance.
+
+    Scope precedence: case_ids > staff_id > period-wide.
 
     Phase 13b changes:
       * Pre-flight: calls check_no_live_payments. If staff_id is given,
@@ -701,6 +934,13 @@ def persist_payments(
         tx_bonus_payment AND tx_carry_over_balance are scoped to that
         staff. Other staff's payments and carry-over balances are
         untouched.
+
+    Phase 16 (workflow refactor): when case_ids is given, all DELETE/UPDATE
+        operations are scoped to those case_ids — the bounded recalc set
+        produced by resolve_trigger_set. This is now the user-facing path:
+        Calculate-from-the-UI triggers a case-scoped run, not a period-wide
+        one. staff_id is ignored when case_ids is given. The precheck uses
+        check_no_live_payments_for_cases (case-scoped equivalent).
 
     Idempotent for full-period re-runs:
       * tx_bonus_payment LIVE rows for (year, month, optional staff_id)
@@ -740,10 +980,16 @@ def persist_payments(
         case_office_id_map:   {tx_case.id → office_id} for the period.
         case_contract_id_map: {tx_case.id → contract_id} for the period.
         staff_id:             Phase 13b — optional staff-scoped re-run filter.
+        case_ids:             Phase 16 — optional case-scoped re-run filter
+                              (the bounded recalc set). Takes precedence
+                              over staff_id when both are given.
     """
-    # ----- Phase 13b: Pre-flight check ----------------------------------
+    # ----- Pre-flight check ---------------------------------------------
     conn = cursor.connection
-    if staff_id is not None:
+    if case_ids is not None:
+        # Phase 16: case-scoped path (takes precedence over staff_id)
+        check_no_live_payments_for_cases(conn, case_ids)
+    elif staff_id is not None:
         check_no_live_payments(conn, year, month, [staff_id])
     else:
         check_no_live_payments(conn, year, month, None)  # period-wide
@@ -752,7 +998,40 @@ def persist_payments(
     # Phase 13b: preserve reversed rows (audit trail). When staff_id is
     # given, scope to that staff; otherwise the precheck above already
     # guaranteed no live rows exist anywhere in the period.
-    if staff_id is not None:
+    # Phase 16: case_ids takes precedence — scope all wipes to those cases.
+    if case_ids is not None:
+        if not case_ids:
+            # Defensive: empty list means no work to do. Skip the rest of
+            # idempotency cleanup so we don't accidentally wipe anything.
+            pass
+        else:
+            cursor.execute(
+                """DELETE FROM tx_bonus_payment
+                    WHERE case_id = ANY(%s)
+                      AND reversal_id IS NULL""",
+                (case_ids,),
+            )
+            cursor.execute(
+                """DELETE FROM tx_carry_over_balance
+                    WHERE case_id = ANY(%s)
+                      AND withheld_run_year = %s
+                      AND withheld_run_month = %s""",
+                (case_ids, year, month),
+            )
+            cursor.execute(
+                """UPDATE tx_carry_over_balance
+                      SET is_open              = TRUE,
+                          released_amount      = NULL,
+                          released_run_year    = NULL,
+                          released_run_month   = NULL,
+                          released_status_code = NULL,
+                          updated_at           = NOW()
+                    WHERE released_run_year  = %s
+                      AND released_run_month = %s
+                      AND case_id = ANY(%s)""",
+                (year, month, case_ids),
+            )
+    elif staff_id is not None:
         cursor.execute(
             """DELETE FROM tx_bonus_payment
                 WHERE run_year = %s

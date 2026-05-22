@@ -33,7 +33,13 @@ from backend.engine_runner.api_runner import (
     reverse_only_api,
     run_engine_api,
     run_engine_cascade_api,
+    run_engine_for_cases_api,
 )
+from backend.engine_runner.cli import (
+    ClosedCasesInTriggerSet,
+    resolve_trigger_set,
+)
+from backend.engine.reversal_check import LivePaymentRowsExistError
 from backend.engine_runner.simulator import (
     CaseNotFoundError,
     CaseNotInReviewError,
@@ -2001,6 +2007,189 @@ def run_engine_endpoint(body: dict = Body(default_factory=dict)) -> dict:
             status_code=500,
             detail=f"Engine run failed: {type(exc).__name__}: {exc}",
         )
+
+
+# ===========================================================================
+# Phase 16 (workflow refactor) — case-scoped engine endpoints
+# ===========================================================================
+#
+# /api/engine/run_cases supersedes /api/engine/run for user-facing recalc.
+# The legacy /api/engine/run remains for cron / admin "recalculate whole
+# period" workflows; user UI should NOT call it.
+#
+# Two routes:
+#   POST /api/engine/preview_scope — read-only. Given a list of case_ids,
+#       resolves the bounded recalc set and returns the staff names + period
+#       for dialog copy. No DB writes.
+#   POST /api/engine/run_cases — the case-scoped engine entry. Same body
+#       shape as preview_scope. Writes if persist=true (default).
+# ===========================================================================
+
+def _stamp_calculated_at_for_cases(case_ids: list[int]) -> None:
+    """Phase 16 case-scoped version of _stamp_calculated_at_for_period.
+
+    Sets calculated_at = NOW() for cases in `case_ids` that have at least one
+    tx_bonus_payment row, clears it for cases that don't. Scoped exactly
+    to the bounded recalc set — other cases (in or out of period) untouched.
+    """
+    if not case_ids:
+        return
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE tx_case c
+                SET calculated_at = CASE
+                    WHEN EXISTS (
+                        SELECT 1 FROM tx_bonus_payment p WHERE p.case_id = c.id
+                    ) THEN NOW()
+                    ELSE NULL
+                END
+                WHERE c.id = ANY(%s)
+                """,
+                (case_ids,),
+            )
+            conn.commit()
+
+
+@app.post(
+    "/api/engine/preview_scope",
+    dependencies=[Depends(require_role(["FO", "ADMIN", "DIRECTOR"]))],
+)
+def preview_engine_scope_endpoint(body: dict = Body(default_factory=dict)) -> dict:
+    """
+    Resolve a trigger set of case_ids into the bounded recalc set, returning
+    the staff and period that would be touched if the engine ran. Read-only
+    — no DB writes. Used by the UI to populate the "Recalculate N cases?"
+    dialog before the user confirms.
+
+    Request body (JSON):
+        {
+            "case_ids": [123, 456, 789]
+        }
+
+    Response:
+        {
+            "year": 2024,
+            "month": 1,
+            "trigger_case_ids": [123, 456, 789],
+            "bounded_case_ids": [120, 121, 122, 123, 456, 789, 800],
+            "staff_ids": [3, 9],
+            "staff_names": ["Phạm Thị Lợi", "Quan Hoàng Yến"]
+        }
+
+    Errors:
+        400 — empty / multi-period / unknown case_ids
+        409 — at least one trigger case is closed
+    """
+    raw_ids = body.get("case_ids")
+    if not isinstance(raw_ids, list) or not raw_ids:
+        raise HTTPException(400, "case_ids must be a non-empty list of integers")
+    try:
+        case_ids = [int(x) for x in raw_ids]
+    except (TypeError, ValueError):
+        raise HTTPException(400, "case_ids must contain integers only")
+
+    try:
+        with get_connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                resolution = resolve_trigger_set(cur, case_ids)
+
+                # Look up staff names for dialog copy (read-only).
+                cur.execute(
+                    "SELECT id, full_name FROM ref_staff WHERE id = ANY(%s)",
+                    (resolution.staff_ids,),
+                )
+                name_by_id = {
+                    row["id"]: row["full_name"] for row in cur.fetchall()
+                }
+    except ClosedCasesInTriggerSet as exc:
+        raise HTTPException(409, str(exc))
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+
+    return {
+        "year": resolution.year,
+        "month": resolution.month,
+        "trigger_case_ids": resolution.trigger_case_ids,
+        "bounded_case_ids": resolution.bounded_case_ids,
+        "staff_ids": resolution.staff_ids,
+        "staff_names": [
+            name_by_id.get(sid, f"<staff #{sid}>") for sid in resolution.staff_ids
+        ],
+    }
+
+
+@app.post(
+    "/api/engine/run_cases",
+    dependencies=[Depends(require_role(["FO", "ADMIN"]))],
+)
+def run_engine_cases_endpoint(body: dict = Body(default_factory=dict)) -> dict:
+    """
+    Case-scoped engine run — Phase 16 workflow refactor.
+
+    Resolves the trigger set into a bounded recalc set (single-period
+    assertion + staff-period fan-out + closed-case guard), then runs the
+    engine scoped to those cases. Other staff's payments in the same
+    period are NOT touched. Calculated_at is refreshed on the bounded set.
+
+    Request body (JSON):
+        {
+            "case_ids": [123, 456, 789],
+            "persist":  true              // optional, default true
+        }
+
+    Response:
+        Same shape as POST /api/engine/run plus:
+          "trigger_case_ids": [int],
+          "bounded_case_ids": [int],
+          "staff_ids":        [int]
+
+    Errors:
+        400 — empty / multi-period / unknown case_ids
+        409 — closed case in trigger set OR live published rows on bounded
+              cases (reverse first)
+        500 — engine raised mid-run (DB rolled back)
+    """
+    raw_ids = body.get("case_ids")
+    persist = bool(body.get("persist", True))
+
+    if not isinstance(raw_ids, list) or not raw_ids:
+        raise HTTPException(400, "case_ids must be a non-empty list of integers")
+    try:
+        case_ids = [int(x) for x in raw_ids]
+    except (TypeError, ValueError):
+        raise HTTPException(400, "case_ids must contain integers only")
+
+    try:
+        result = run_engine_for_cases_api(case_ids=case_ids, persist=persist)
+    except ClosedCasesInTriggerSet as exc:
+        raise HTTPException(409, str(exc))
+    except LivePaymentRowsExistError as exc:
+        raise HTTPException(409, str(exc))
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    except Exception as exc:
+        # Same logging discipline as /api/engine/run.
+        print("=" * 60, flush=True)
+        print(
+            f"ENGINE RUN_CASES FAILED — case_ids={case_ids!r} persist={persist}",
+            flush=True,
+        )
+        print(traceback.format_exc(), flush=True)
+        print("=" * 60, flush=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Engine case-scoped run failed: {type(exc).__name__}: {exc}",
+        )
+
+    # Stamp calculated_at on the bounded set when we persisted. Other cases
+    # in the period are untouched — their calculated_at stays as-is.
+    if persist:
+        _stamp_calculated_at_for_cases(result.get("bounded_case_ids", []))
+
+    return result
 
 
 # ===========================================================================

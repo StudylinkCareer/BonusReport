@@ -53,6 +53,8 @@ from backend.engine_runner.adapter import (
     adapt_case,
 )
 from backend.engine_runner.cli import (
+    ClosedCasesInTriggerSet,
+    TriggerSetResolution,
     build_run_context,
     load_case_overrides,
     load_case_services,
@@ -62,6 +64,7 @@ from backend.engine_runner.cli import (
     load_prior_priority_withholdings,
     persist_payments,
     persist_priority_quota_tracker,
+    resolve_trigger_set,
 )
 from backend.engine_runner.ytd_aggregator import aggregate_ytd
 
@@ -351,12 +354,19 @@ def _run_engine_within_connection(
     limit: int | None,
     contract_id: str | None,
     pre_tracker_snapshot: dict[int, dict[str, int]] | None,
+    case_ids: list[int] | None = None,
 ) -> dict[str, Any]:
-    """Run the engine for one (year, month, optional staff_id) using an
-    existing connection. Does NOT commit — caller is responsible.
+    """Run the engine for one (year, month, optional staff_id or case_ids)
+    using an existing connection. Does NOT commit — caller is responsible.
 
     When persist=True and pre_tracker_snapshot is provided, computes priority
     impact warnings against the post-state and includes them in the result.
+
+    Phase 16 (workflow refactor): when case_ids is given (the bounded recalc
+    set produced by resolve_trigger_set), the load and persist scope is
+    case-scoped instead of staff-scoped. staff_id is ignored in this case.
+    For priority impact warnings, the function loops compute_priority_impact_
+    warnings across the distinct staff_ids found in the loaded cases.
 
     Returns the same dict shape as run_engine_api's documented response.
     """
@@ -394,6 +404,7 @@ def _run_engine_within_connection(
             year=year, month=month,
             contract_id=contract_id,
             staff_id=staff_id,
+            case_ids=case_ids,
             limit=limit,
         )
         total_cases = len(case_rows)
@@ -457,6 +468,7 @@ def _run_engine_within_connection(
                 case_office_id_map=case_office_id_map,
                 case_contract_id_map=case_contract_id_map,
                 staff_id=staff_id,
+                case_ids=case_ids,
             )
             persist_priority_quota_tracker(
                 cursor,
@@ -466,17 +478,56 @@ def _run_engine_within_connection(
 
             # Phase 13b: compute priority impact warnings if this was a
             # staff-scoped re-run and a pre-snapshot was supplied.
-            if staff_id is not None and pre_tracker_snapshot is not None:
+            # Phase 16: case-scoped runs aggregate warnings across all
+            # staff in the bounded recalc set.
+            if pre_tracker_snapshot is not None:
                 post_snapshot = snapshot_priority_quota_tracker(conn)
-                warnings = compute_priority_impact_warnings(
-                    conn,
-                    run_year=year,
-                    run_month=month,
-                    staff_id_rerun=staff_id,
-                    old_tracker_snapshot=pre_tracker_snapshot,
-                    new_tracker_state=post_snapshot,
-                )
-                warnings_payload = [_warning_to_dict(w, ref) for w in warnings]
+
+                # Determine which staff to compute warnings for
+                if case_ids is not None:
+                    # Case-scoped path: collect distinct staff_ids touching
+                    # the loaded cases (from the four payment slots) and
+                    # loop the warnings query, deduping by PLI.
+                    rerun_staff_ids: set[int] = set()
+                    for r in case_rows:
+                        for col in (
+                            "counsellor_staff_id",
+                            "case_officer_staff_id",
+                            "presales_staff_id",
+                            "vp_staff_id",
+                        ):
+                            v = r.get(col)
+                            if v is not None:
+                                rerun_staff_ids.add(int(v))
+                    all_warnings: dict[int, Any] = {}  # pli_id → warning
+                    for sid in sorted(rerun_staff_ids):
+                        warnings = compute_priority_impact_warnings(
+                            conn,
+                            run_year=year,
+                            run_month=month,
+                            staff_id_rerun=sid,
+                            old_tracker_snapshot=pre_tracker_snapshot,
+                            new_tracker_state=post_snapshot,
+                        )
+                        for w in warnings:
+                            # Dedupe by PLI — later staff iterations may
+                            # produce the same warning. First write wins
+                            # (deltas are PLI-wide; affected list is too).
+                            if w.priority_list_institution_id not in all_warnings:
+                                all_warnings[w.priority_list_institution_id] = w
+                    warnings_payload = [
+                        _warning_to_dict(w, ref) for w in all_warnings.values()
+                    ]
+                elif staff_id is not None:
+                    warnings = compute_priority_impact_warnings(
+                        conn,
+                        run_year=year,
+                        run_month=month,
+                        staff_id_rerun=staff_id,
+                        old_tracker_snapshot=pre_tracker_snapshot,
+                        new_tracker_state=post_snapshot,
+                    )
+                    warnings_payload = [_warning_to_dict(w, ref) for w in warnings]
 
     return {
         "year": year,
@@ -585,6 +636,89 @@ def run_engine_api(
         if persist:
             conn.commit()
 
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Public: run_engine_for_cases_api (Phase 16 — workflow refactor)
+# ---------------------------------------------------------------------------
+
+def run_engine_for_cases_api(
+    *,
+    case_ids: list[int],
+    persist: bool = True,
+) -> dict[str, Any]:
+    """
+    Case-scoped engine entry — Phase 16 workflow refactor.
+
+    Resolves a trigger set of case_ids into a bounded recalc set via
+    resolve_trigger_set (single-period assertion + staff-period fan-out +
+    closed-case guard), then runs the existing pipeline scoped to that
+    bounded set. Other staff's payments in the same period are NOT touched.
+
+    This supersedes run_engine_api(year, month) for user-facing Calculate
+    actions. run_engine_api remains the period-wide entry for cron / admin
+    workflows.
+
+    Args:
+        case_ids: non-empty list of tx_case.id values. Typically the cases
+                  selected in the UI when Calculate is clicked.
+        persist:  if True, write to tx_bonus_payment + manage
+                  tx_carry_over_balance + tx_priority_quota_tracker.
+                  If False, dry run with no DB writes.
+
+    Returns:
+        Same dict shape as run_engine_api, plus three new fields:
+          "trigger_case_ids":  the original selection
+          "bounded_case_ids":  the fanned-out recalc set
+          "staff_ids":         distinct staff whose cases were touched
+
+    Raises:
+        ValueError                — empty / multi-period / unknown ids
+        ClosedCasesInTriggerSet   — at least one trigger case is closed
+        LivePaymentRowsExistError — live (non-reversed) PUBLISHED rows
+                                    exist for any bounded case (reverse first)
+        Any exception from the engine itself (caller layer turns into 500).
+    """
+    if not case_ids:
+        raise ValueError("case_ids must be a non-empty list")
+
+    with get_connection() as conn:
+        ref = load_reference_data(conn)
+
+        # Resolve trigger set inside the same connection. resolve_trigger_set
+        # raises ValueError / ClosedCasesInTriggerSet — propagate to caller
+        # (route layer maps to HTTP 400 / 409).
+        with conn.cursor(row_factory=dict_row) as cursor:
+            resolution = resolve_trigger_set(cursor, case_ids)
+
+        # Snapshot tracker before persist so we can compute priority impact
+        # warnings post-run. Always snapshot for case-scoped runs (we may
+        # touch priority partners through any of the bounded staff).
+        pre_tracker_snapshot: dict[int, dict[str, int]] | None = None
+        if persist:
+            pre_tracker_snapshot = snapshot_priority_quota_tracker(conn)
+
+        result = _run_engine_within_connection(
+            conn, ref,
+            year=resolution.year,
+            month=resolution.month,
+            persist=persist,
+            staff_id=None,                                # ignored when case_ids given
+            limit=None,
+            contract_id=None,
+            pre_tracker_snapshot=pre_tracker_snapshot,
+            case_ids=resolution.bounded_case_ids,
+        )
+
+        if persist:
+            conn.commit()
+
+    # Attach resolution context to the response so the caller (and the UI)
+    # can render "X cases recalculated for staff Y in period Z".
+    result["trigger_case_ids"] = resolution.trigger_case_ids
+    result["bounded_case_ids"] = resolution.bounded_case_ids
+    result["staff_ids"] = resolution.staff_ids
     return result
 
 
