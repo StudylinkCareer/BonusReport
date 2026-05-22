@@ -297,6 +297,47 @@ def resolve_package_fee_by_alias(
     return row["service_fee_id"] if row else None
 
 
+def resolve_client_type(cursor, raw: Optional[str]) -> Optional[str]:
+    """Client type text -> ref_client_type.code (the canonical string).
+
+    Returns the canonical code (e.g. 'DU_HOC_FULL'), not the integer id —
+    because tx_case.client_type_code stores the code string and has a
+    CHECK constraint against the 10 valid codes:
+      DU_HOC_FULL, DU_HOC_ENROL_ONLY, SUMMER_STUDY, VIETNAM_DOMESTIC,
+      GUARDIAN_VISA, TOURIST_VISA, MIGRATION_VISA, DEPENDANT_VISA,
+      VISA_ONLY_SERVICE, UNRESOLVED.
+
+    Returns None if input is blank/missing. Caller distinguishes that
+    from "text present but unresolved" (which should be stamped as
+    'UNRESOLVED' on the record so the CHECK constraint accepts it and
+    DQO can review).
+
+    Alias-first lookup mirrors all other resolvers. Falls back to a
+    direct code match (defensive — in case CRM ever sends the canonical
+    code itself like 'DU_HOC_FULL').
+    """
+    text = _normalize(raw)
+    if not text:
+        return None
+    cursor.execute(
+        """SELECT ct.code
+             FROM ref_client_type_alias a
+             JOIN ref_client_type ct ON ct.id = a.client_type_id
+            WHERE LOWER(a.alias_text) = LOWER(%s)""",
+        (text,),
+    )
+    row = cursor.fetchone()
+    if row:
+        return row["code"]
+    # Fallback: direct code match on ref_client_type
+    cursor.execute(
+        "SELECT code FROM ref_client_type WHERE code = %s",
+        (text,),
+    )
+    row = cursor.fetchone()
+    return row["code"] if row else None
+
+
 # Note: lookup_partner_institution_links() was removed as part of
 # Phase7prep_v2_extension. Partner derivation from institution is now an
 # engine-runtime concern using ref_institution_agreement; the importer

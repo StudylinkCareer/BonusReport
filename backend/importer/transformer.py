@@ -79,6 +79,7 @@ from typing import Any, Optional
 
 from backend.importer.reader import RawRow
 from backend.importer.resolvers import (
+    resolve_client_type,
     resolve_country,
     resolve_institution,
     resolve_office,
@@ -829,6 +830,26 @@ def transform_row(
     if package_warning:
         flags.add(package_warning, STATUS_UNRESOLVED)
 
+    # ---- Client type — canonical resolution -----------------------------
+    # Source is raw Vietnamese text from the CRM 'Client Type' column.
+    # Resolve via ref_client_type_alias → ref_client_type.code. The DB
+    # column tx_case.client_type_code has a CHECK constraint against the
+    # 10 canonical codes (the 9 real types + 'UNRESOLVED' sentinel).
+    # Behaviour:
+    #   - Blank source             → None (constraint allows NULL)
+    #   - Resolved                 → canonical code (e.g. 'DU_HOC_FULL')
+    #   - Text present, no match   → 'UNRESOLVED' + import flag, so the
+    #                                row still writes for DQO review.
+    client_type_raw = _string_or_none(data.get(COL_CLIENT_TYPE))
+    client_type_code = resolve_client_type(cursor, client_type_raw)
+    if client_type_raw and client_type_code is None:
+        flags.add(
+            f"UNRESOLVED_CLIENT_TYPE: {client_type_raw!r} not in "
+            f"ref_client_type / ref_client_type_alias",
+            STATUS_UNRESOLVED,
+        )
+        client_type_code = "UNRESOLVED"
+
     # ---- Build the record ------------------------------------------------
     return CaseRecord(
         contract_id=contract_id,
@@ -845,7 +866,7 @@ def transform_row(
         referring_office_id=referring_office_id,
         institution_text_raw=institution_raw,
         referring_agent_text_raw=refer_text,
-        client_type_code=_string_or_none(data.get(COL_CLIENT_TYPE)),
+        client_type_code=client_type_code,
         package_fee_id=package_fee_id,
         application_status=application_status_text,
         application_status_id=application_status_id,
